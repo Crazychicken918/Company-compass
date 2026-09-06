@@ -275,26 +275,8 @@ async function loadCompany(){
     .select('*').eq('user_id', state.user.id).eq('status', 'active').limit(1);
 
   if(!memberships || memberships.length === 0){
-    document.getElementById('main').innerHTML = `
-      <div class="panel" style="max-width:420px;">
-        <h2 style="margin-top:0;">Set up your company</h2>
-        <p style="color:var(--muted);font-size:.88rem;">We couldn't find a company on your account yet. If you were invited by someone, ask them to check they invited <strong>${state.user.email}</strong>. Otherwise, create your company below to get started.</p>
-        <form id="setup-company-form">
-          <div class="field" style="margin-bottom:10px;"><label>Company name</label><input type="text" id="setup-company-name" required style="width:100%;"></div>
-          <div class="field" style="margin-bottom:14px;"><label>VAT number (optional)</label><input type="text" id="setup-vat-number" style="width:100%;"></div>
-          <button type="submit" class="btn">Create Company</button>
-        </form>
-      </div>`;
-    document.getElementById('setup-company-form').addEventListener('submit', async (e)=>{
-      e.preventDefault();
-      const name = document.getElementById('setup-company-name').value.trim();
-      const vat = document.getElementById('setup-vat-number').value.trim();
-      if(!name) return;
-      try{
-        await createCompanyForUser(name, vat);
-        await loadCompany();
-      }catch(err){ toast(err.message); }
-    });
+    document.getElementById('main').innerHTML = `<div class="panel"><h2>No company found</h2>
+      <p class="empty">Your account isn't linked to a company yet. If you were invited, ask the company owner to check the email address used to invite you (${state.user.email}). If you signed up directly, try logging out and back in.</p></div>`;
     return;
   }
   state.membership = memberships[0];
@@ -404,13 +386,19 @@ function renderDashboard(){
       </tbody></table>` : `<div class="empty">No entries yet.</div>`}
     </div>
     <div class="panel">
-      <h3 style="margin-top:0;">Team &amp; current tasks</h3>
+      <h3 style="margin-top:0;">Payroll staff &amp; current tasks</h3>
       ${state.employees.length ? `<table><thead><tr><th>Employee</th><th>Role</th><th>Working on</th></tr></thead><tbody>
         ${state.employees.filter(e=>e.active).map(e=>{
           const openTasks = state.employeeTasks.filter(t=>t.employee_id===e.id && t.status!=='done');
           return `<tr><td>${e.name}</td><td>${e.role_title||'—'}</td><td>${openTasks.length ? openTasks.map(t=>`<span class="tag-pill" title="${t.status}">${t.description}</span>`).join(' ') : '<span style="color:var(--muted);">No active task</span>'}</td></tr>`;
         }).join('')}
       </tbody></table>` : `<div class="empty">No employees yet. Add your team under Payroll.</div>`}
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Team (app access)</h3>
+      ${state.members.length ? `<table><thead><tr><th>Email</th><th>Role</th><th>Status</th></tr></thead><tbody>
+        ${state.members.map(m=>`<tr><td>${m.email}</td><td><span class="role-badge">${m.role}</span></td><td>${m.status}</td></tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No team members yet.</div>`}
     </div>
   `;
 }
@@ -1024,10 +1012,21 @@ function renderTeam(){
   return `
     <div class="section-header"><h1>Team</h1>${isAdmin() ? `<button class="btn" id="add-member-btn">+ Invite Member</button>` : ''}</div>
     <div class="panel">
+      <h3 style="margin-top:0;">App access</h3>
       <table><thead><tr><th>Email</th><th>Role</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
         ${state.members.map(m=>`<tr><td>${m.email}</td><td><span class="role-badge">${m.role}</span></td><td>${m.status}</td>
         ${isAdmin() && m.role!=='owner' ? `<td><button class="btn small danger" data-del-member="${m.id}">Remove</button></td>` : (isAdmin()?'<td></td>':'')}</tr>`).join('')}
       </tbody></table>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Payroll staff &amp; tasks</h3>
+      ${state.employees.length ? `<table><thead><tr><th>Employee</th><th>Role</th><th>Tasks</th></tr></thead><tbody>
+        ${state.employees.map(e=>{
+          const tasks = state.employeeTasks.filter(t=>t.employee_id===e.id);
+          return `<tr><td>${e.name}${e.active?'':' (inactive)'}</td><td>${e.role_title||'—'}</td><td>${tasks.length ? tasks.map(t=>`<span class="tag-pill" title="${t.status}">${t.status==='done'?'✓ ':''}${t.description}</span>`).join(' ') : '<span style="color:var(--muted);">No tasks yet</span>'}</td></tr>`;
+        }).join('')}
+      </tbody></table>` : `<div class="empty">No payroll staff yet. Add them under Payroll.</div>`}
+      <p style="font-size:.78rem;color:var(--muted);margin-top:10px;margin-bottom:0;">Assign or complete tasks from the Payroll page.</p>
     </div>
     ${isAdmin() ? `
     <div class="modal-backdrop hidden" id="member-modal-backdrop"><div class="modal">
