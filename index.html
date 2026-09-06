@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Company Compass</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel2:#1e2230; --border:#2a2f3d;
+    --text:#e9ebf1; --muted:#8a90a3; --accent:#4f8cff; --accent2:#6fd3a0;
+    --danger:#ff6b6b; --warn:#ffb020; --radius:12px;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  a{color:var(--accent);}
+  button{font-family:inherit;cursor:pointer;}
+  input,select,textarea{font-family:inherit;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px;}
+  input:focus,select:focus,textarea:focus{outline:1px solid var(--accent);}
+  .btn{background:var(--accent);border:none;color:#fff;padding:9px 16px;border-radius:8px;font-weight:600;}
+  .btn:hover{opacity:.9;}
+  .btn.secondary{background:var(--panel2);color:var(--text);border:1px solid var(--border);}
+  .btn.danger{background:var(--danger);color:#fff;}
+  .btn.small{padding:5px 10px;font-size:.8rem;}
+  .hidden{display:none !important;}
+
+  /* Auth screen */
+  #auth-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
+  .auth-box{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:32px;width:100%;max-width:380px;}
+  .auth-box h1{font-size:1.4rem;margin-bottom:4px;}
+  .auth-box p.tagline{color:var(--muted);margin-top:0;margin-bottom:20px;font-size:.9rem;}
+  .auth-box form{display:flex;flex-direction:column;gap:10px;}
+  .auth-box input{width:100%;}
+  .auth-toggle{text-align:center;margin-top:14px;font-size:.85rem;color:var(--muted);}
+  .auth-error{color:var(--danger);font-size:.85rem;min-height:18px;}
+
+  /* App shell */
+  #app-shell{display:none;min-height:100vh;}
+  #app-shell.active{display:flex;}
+  #sidebar{width:220px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--border);padding:18px 12px;display:flex;flex-direction:column;}
+  #sidebar h2{font-size:1.1rem;margin:4px 8px 2px;}
+  #sidebar .company-name{font-size:.78rem;color:var(--muted);margin:0 8px 18px;}
+  #sidebar nav{display:flex;flex-direction:column;gap:2px;flex:1;}
+  #sidebar nav button{text-align:left;background:none;border:none;color:var(--text);padding:9px 10px;border-radius:8px;font-size:.9rem;}
+  #sidebar nav button:hover{background:var(--panel2);}
+  #sidebar nav button.active{background:var(--accent);color:#fff;}
+  #sidebar .logout{margin-top:10px;font-size:.8rem;color:var(--muted);background:none;border:none;text-align:left;padding:9px 10px;}
+
+  #main{flex:1;padding:26px 32px;max-width:1100px;}
+  #main h1{margin-top:0;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:24px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px;}
+  .card h3{margin:0 0 6px;font-size:.8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;}
+  .card .value{font-size:1.6rem;font-weight:700;}
+  .card .sub{font-size:.8rem;color:var(--muted);margin-top:4px;}
+  .value.positive{color:var(--accent2);}
+  .value.negative{color:var(--danger);}
+
+  table{width:100%;border-collapse:collapse;font-size:.88rem;}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);}
+  th{color:var(--muted);font-weight:600;font-size:.78rem;text-transform:uppercase;}
+  tr:last-child td{border-bottom:none;}
+  .section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:20px;}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;}
+  .field{display:flex;flex-direction:column;gap:4px;font-size:.8rem;color:var(--muted);}
+  .field input,.field select{min-width:140px;}
+  .tag-pill{display:inline-block;background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:.72rem;margin-right:4px;}
+  .status-pill{display:inline-block;border-radius:999px;padding:2px 10px;font-size:.72rem;font-weight:600;}
+  .status-draft{background:#2a2f3d;color:var(--muted);}
+  .status-sent{background:#2a3a5c;color:#8fb4ff;}
+  .status-paid{background:#1e3a2c;color:var(--accent2);}
+  .status-overdue{background:#3a1e1e;color:var(--danger);}
+  .empty{color:var(--muted);font-size:.88rem;padding:16px 0;text-align:center;}
+  .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:50;padding:20px;}
+  .modal{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:100%;max-width:480px;max-height:88vh;overflow-y:auto;}
+  .modal h2{margin-top:0;font-size:1.1rem;}
+  .modal .field{width:100%;}
+  .modal input,.modal select,.modal textarea{width:100%;}
+  .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px;}
+  .close-x{float:right;background:none;border:none;color:var(--muted);font-size:1.1rem;}
+  .role-badge{font-size:.72rem;padding:2px 8px;border-radius:999px;background:var(--panel2);border:1px solid var(--border);}
+  .invoice-items-table input{width:100%;}
+  #toast{position:fixed;bottom:20px;right:20px;background:var(--panel2);border:1px solid var(--border);padding:10px 16px;border-radius:8px;font-size:.85rem;z-index:99;display:none;}
+  .muted-link{color:var(--muted);text-decoration:underline;cursor:pointer;font-size:.8rem;}
+</style>
+</head>
+<body>
+
+<div id="auth-screen">
+  <div class="auth-box">
+    <h1>Company Compass</h1>
+    <p class="tagline">Business finances, invoicing, payroll &amp; VAT in one place.</p>
+    <form id="auth-form">
+      <input type="email" id="auth-email" placeholder="Email" required>
+      <input type="password" id="auth-password" placeholder="Password (min 8 characters)" minlength="8" required>
+      <div id="signup-fields" class="hidden" style="display:flex;flex-direction:column;gap:10px;">
+        <input type="text" id="auth-company-name" placeholder="Company name">
+        <input type="text" id="auth-vat-number" placeholder="VAT number (optional)">
+      </div>
+      <div class="auth-error" id="auth-error"></div>
+      <button type="submit" class="btn" id="auth-submit">Log In</button>
+    </form>
+    <div class="auth-toggle">
+      <span id="auth-toggle-text">Don't have an account?</span>
+      <a href="#" id="auth-toggle-link">Sign up</a>
+    </div>
+  </div>
+</div>
+
+<div id="app-shell">
+  <div id="sidebar">
+    <h2>Company Compass</h2>
+    <div class="company-name" id="sidebar-company-name">Loading…</div>
+    <nav id="nav">
+      <button data-view="dashboard" class="active">Dashboard</button>
+      <button data-view="revenue">Revenue</button>
+      <button data-view="expenses">Expenses</button>
+      <button data-view="assets">Assets</button>
+      <button data-view="liabilities">Liabilities</button>
+      <button data-view="clients">Clients</button>
+      <button data-view="invoices">Invoices</button>
+      <button data-view="payroll">Payroll</button>
+      <button data-view="vat">VAT</button>
+      <button data-view="team">Team</button>
+    </nav>
+    <button class="logout" id="logout-btn">Log out</button>
+  </div>
+  <div id="main"></div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+/* ========================= CONFIG ========================= */
+const SUPABASE_URL = 'YOUR_SUPABASE_URL';
+const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
+const VAT_RATE = 0.15; // South Africa standard VAT rate
+
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+/* ========================= STATE ========================= */
+let state = {
+  user: null,
+  company: null,      // {id, name, vat_number, registration_number, owner_id}
+  membership: null,   // {role, status}
+  members: [],
+  accounts: [],
+  entries: [],
+  assets: [],
+  liabilities: [],
+  clients: [],
+  invoices: [],
+  invoiceItems: {},   // invoiceId -> items[]
+  employees: [],
+  payrollPayments: [],
+  view: 'dashboard'
+};
+
+function fmt(n){
+  n = Number(n)||0;
+  return 'R' + n.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(t._timer);
+  t._timer = setTimeout(()=>{ t.style.display='none'; }, 3000);
+}
+function isAdmin(){
+  return state.membership && (state.membership.role === 'owner' || state.membership.role === 'admin');
+}
+
+/* ========================= AUTH ========================= */
+let authMode = 'login';
+
+document.getElementById('auth-toggle-link').addEventListener('click', (e)=>{
+  e.preventDefault();
+  authMode = authMode === 'login' ? 'signup' : 'login';
+  document.getElementById('signup-fields').classList.toggle('hidden', authMode === 'login');
+  document.getElementById('auth-submit').textContent = authMode === 'login' ? 'Log In' : 'Sign Up';
+  document.getElementById('auth-toggle-text').textContent = authMode === 'login' ? "Don't have an account?" : 'Already have an account?';
+  document.getElementById('auth-toggle-link').textContent = authMode === 'login' ? 'Sign up' : 'Log in';
+  document.getElementById('auth-error').textContent = '';
+});
+
+document.getElementById('auth-form').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const email = document.getElementById('auth-email').value.trim();
+  const password = document.getElementById('auth-password').value;
+  const errEl = document.getElementById('auth-error');
+  errEl.textContent = '';
+  try{
+    if(authMode === 'login'){
+      const {error} = await sb.auth.signInWithPassword({email, password});
+      if(error) throw error;
+    } else {
+      const companyName = document.getElementById('auth-company-name').value.trim();
+      const vatNumber = document.getElementById('auth-vat-number').value.trim();
+      if(!companyName){ errEl.textContent = 'Company name is required.'; return; }
+      const {data, error} = await sb.auth.signUp({email, password});
+      if(error) throw error;
+      // Company + membership are created once the session is confirmed (see onAuthReady)
+      pendingSignup = {companyName, vatNumber};
+    }
+  } catch(err){
+    errEl.textContent = err.message || 'Something went wrong.';
+  }
+});
+
+let pendingSignup = null;
+
+document.getElementById('logout-btn').addEventListener('click', async ()=>{
+  await sb.auth.signOut();
+  window.location.reload();
+});
+
+sb.auth.onAuthStateChange((event, session)=>{
+  if(session && session.user){
+    onAuthReady(session.user);
+  } else {
+    document.getElementById('auth-screen').style.display = 'flex';
+    document.getElementById('app-shell').classList.remove('active');
+  }
+});
+
+async function onAuthReady(user){
+  state.user = user;
+  document.getElementById('auth-screen').style.display = 'none';
+  document.getElementById('app-shell').classList.add('active');
+
+  // Handle brand-new signup: create company + owner membership
+  if(pendingSignup){
+    const {companyName, vatNumber} = pendingSignup;
+    pendingSignup = null;
+    const {data: company, error: cErr} = await sb.from('cc_companies').insert({
+      owner_id: user.id, name: companyName, vat_number: vatNumber || null
+    }).select().single();
+    if(!cErr && company){
+      await sb.from('cc_company_members').insert({
+        company_id: company.id, user_id: user.id, email: user.email, role: 'owner', status: 'active'
+      });
+    }
+  }
+
+  // Link any pending invite for this email
+  await sb.from('cc_company_members')
+    .update({user_id: user.id, status: 'active'})
+    .eq('email', user.email)
+    .eq('status', 'pending');
+
+  await loadCompany();
+}
+
+/* ========================= DATA LOADING ========================= */
+async function loadCompany(){
+  const {data: memberships} = await sb.from('cc_company_members')
+    .select('*').eq('user_id', state.user.id).eq('status', 'active').limit(1);
+
+  if(!memberships || memberships.length === 0){
+    document.getElementById('main').innerHTML = `<div class="panel"><h2>No company found</h2>
+      <p class="empty">Your account isn't linked to a company yet. If you were invited, ask the company owner to check the email address used to invite you (${state.user.email}).</p></div>`;
+    return;
+  }
+  state.membership = memberships[0];
+  const {data: company} = await sb.from('cc_companies').select('*').eq('id', state.membership.company_id).single();
+  state.company = company;
+  document.getElementById('sidebar-company-name').textContent = company.name + (isAdmin() ? '' : ' (viewer)');
+
+  await refreshAll();
+  render();
+}
+
+async function refreshAll(){
+  const cid = state.company.id;
+  const [members, accounts, entries, assets, liabilities, clients, invoices, employees, payments] = await Promise.all([
+    sb.from('cc_company_members').select('*').eq('company_id', cid),
+    sb.from('cc_accounts').select('*').eq('company_id', cid),
+    sb.from('cc_entries').select('*').eq('company_id', cid).order('entry_date', {ascending:false}),
+    sb.from('cc_assets').select('*').eq('company_id', cid),
+    sb.from('cc_liabilities').select('*').eq('company_id', cid),
+    sb.from('cc_clients').select('*').eq('company_id', cid),
+    sb.from('cc_invoices').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
+    sb.from('cc_employees').select('*').eq('company_id', cid),
+    sb.from('cc_payroll_payments').select('*').eq('company_id', cid).order('pay_date', {ascending:false})
+  ]);
+  state.members = members.data || [];
+  state.accounts = accounts.data || [];
+  state.entries = entries.data || [];
+  state.assets = assets.data || [];
+  state.liabilities = liabilities.data || [];
+  state.clients = clients.data || [];
+  state.invoices = invoices.data || [];
+  state.employees = employees.data || [];
+  state.payrollPayments = payments.data || [];
+}
+
+/* ========================= NAV / RENDER ========================= */
+document.getElementById('nav').addEventListener('click', (e)=>{
+  const btn = e.target.closest('button[data-view]');
+  if(!btn) return;
+  state.view = btn.dataset.view;
+  document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active', b===btn));
+  render();
+});
+
+function render(){
+  const main = document.getElementById('main');
+  switch(state.view){
+    case 'dashboard': main.innerHTML = renderDashboard(); break;
+    case 'revenue': main.innerHTML = renderEntries('revenue'); attachEntryHandlers('revenue'); break;
+    case 'expenses': main.innerHTML = renderEntries('expense'); attachEntryHandlers('expense'); break;
+    case 'assets': main.innerHTML = renderAssets(); attachAssetHandlers(); break;
+    case 'liabilities': main.innerHTML = renderLiabilities(); attachLiabilityHandlers(); break;
+    case 'clients': main.innerHTML = renderClients(); attachClientHandlers(); break;
+    case 'invoices': main.innerHTML = renderInvoices(); attachInvoiceHandlers(); break;
+    case 'payroll': main.innerHTML = renderPayroll(); attachPayrollHandlers(); break;
+    case 'vat': main.innerHTML = renderVat(); break;
+    case 'team': main.innerHTML = renderTeam(); attachTeamHandlers(); break;
+  }
+}
+
+/* ========================= CALCULATIONS ========================= */
+function totalsFor(){
+  const revenue = state.entries.filter(e=>e.type==='revenue').reduce((s,e)=>s+Number(e.amount),0);
+  const expenses = state.entries.filter(e=>e.type==='expense').reduce((s,e)=>s+Number(e.amount),0);
+  const startingBalance = state.accounts.reduce((s,a)=>s+Number(a.starting_balance||0),0);
+  const payrollPaid = state.payrollPayments.filter(p=>p.paid).reduce((s,p)=>s+Number(p.net),0);
+  const predictedBalance = startingBalance + revenue - expenses - payrollPaid;
+  const totalAssets = state.assets.reduce((s,a)=>s+Number(a.value),0);
+  const totalLiabilities = state.liabilities.reduce((s,l)=>s+Number(l.amount),0);
+  const netWorth = totalAssets + predictedBalance - totalLiabilities;
+  return {revenue, expenses, predictedBalance, totalAssets, totalLiabilities, netWorth, payrollPaid};
+}
+
+function vatFor(){
+  const vatCollected = state.entries.filter(e=>e.type==='revenue' && e.vat_applicable)
+    .reduce((s,e)=> s + Number(e.amount) - Number(e.amount)/(1+VAT_RATE), 0);
+  const vatPaid = state.entries.filter(e=>e.type==='expense' && e.vat_applicable)
+    .reduce((s,e)=> s + Number(e.amount) - Number(e.amount)/(1+VAT_RATE), 0);
+  return {vatCollected, vatPaid, vatPayable: vatCollected - vatPaid};
+}
+
+/* ========================= DASHBOARD ========================= */
+function renderDashboard(){
+  const t = totalsFor();
+  const v = vatFor();
+  const outstandingInvoices = state.invoices.filter(i=>i.status==='sent'||i.status==='overdue');
+  return `
+    <h1>Dashboard</h1>
+    <div class="grid">
+      <div class="card"><h3>Predicted Balance</h3><div class="value ${t.predictedBalance<0?'negative':'positive'}">${fmt(t.predictedBalance)}</div><div class="sub">Starting balance + revenue − expenses − payroll</div></div>
+      <div class="card"><h3>Revenue vs Expenses</h3><div class="value">${fmt(t.revenue - t.expenses)}</div><div class="sub">${fmt(t.revenue)} revenue, ${fmt(t.expenses)} expenses</div></div>
+      <div class="card"><h3>Net Worth</h3><div class="value ${t.netWorth<0?'negative':'positive'}">${fmt(t.netWorth)}</div><div class="sub">Assets + balance − liabilities</div></div>
+      <div class="card"><h3>VAT Payable (current)</h3><div class="value">${fmt(v.vatPayable)}</div><div class="sub">Collected ${fmt(v.vatCollected)} − paid ${fmt(v.vatPaid)}</div></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Outstanding invoices</h3>
+      ${outstandingInvoices.length ? `<table><thead><tr><th>Invoice</th><th>Client</th><th>Due</th><th>Status</th></tr></thead><tbody>
+        ${outstandingInvoices.map(i=>`<tr><td>${i.invoice_number}</td><td>${clientName(i.client_id)}</td><td>${i.due_date||'—'}</td><td><span class="status-pill status-${i.status}">${i.status}</span></td></tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No outstanding invoices.</div>`}
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Recent activity</h3>
+      ${state.entries.slice(0,8).length ? `<table><thead><tr><th>Date</th><th>Type</th><th>Description</th><th>Amount</th></tr></thead><tbody>
+        ${state.entries.slice(0,8).map(e=>`<tr><td>${e.entry_date}</td><td>${e.type}</td><td>${e.description}</td><td>${fmt(e.amount)}</td></tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No entries yet.</div>`}
+    </div>
+  `;
+}
+
+function clientName(id){
+  const c = state.clients.find(c=>c.id===id);
+  return c ? c.name : '—';
+}
+
+/* ========================= REVENUE / EXPENSES ========================= */
+function renderEntries(type){
+  const label = type === 'revenue' ? 'Revenue' : 'Expenses';
+  const rows = state.entries.filter(e=>e.type===type);
+  const total = rows.reduce((s,e)=>s+Number(e.amount),0);
+  return `
+    <div class="section-header"><h1>${label}</h1>${isAdmin() ? `<button class="btn" id="add-entry-btn">+ Add ${type==='revenue'?'Revenue':'Expense'}</button>` : ''}</div>
+    <div class="grid"><div class="card"><h3>Total ${label}</h3><div class="value">${fmt(total)}</div></div></div>
+    <div class="panel">
+      ${rows.length ? `<table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Tags</th><th>VAT</th><th>Recurring</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+        ${rows.map(e=>`<tr>
+          <td>${e.entry_date}</td>
+          <td>${e.description}</td>
+          <td>${fmt(e.amount)}</td>
+          <td>${(e.tags||[]).map(t=>`<span class="tag-pill">${t}</span>`).join('')}</td>
+          <td>${e.vat_applicable?'Yes':'No'}</td>
+          <td>${e.is_recurring ? (e.recurrence_frequency||'yes') : '—'}</td>
+          ${isAdmin()?`<td><button class="btn small danger" data-del-entry="${e.id}">Delete</button></td>`:''}
+        </tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No ${label.toLowerCase()} recorded yet.</div>`}
+    </div>
+    ${isAdmin() ? entryModal(type) : ''}
+  `;
+}
+
+function entryModal(type){
+  return `
+  <div class="modal-backdrop hidden" id="entry-modal-backdrop">
+    <div class="modal">
+      <button class="close-x" id="entry-modal-close">✕</button>
+      <h2>Add ${type==='revenue'?'Revenue':'Expense'}</h2>
+      <form id="entry-form">
+        <div class="field"><label>Description</label><input type="text" id="entry-description" required></div>
+        <div class="field"><label>Amount (R)</label><input type="number" step="0.01" id="entry-amount" required></div>
+        <div class="field"><label>Date</label><input type="date" id="entry-date" required></div>
+        <div class="field"><label>Tags (comma separated)</label><input type="text" id="entry-tags" placeholder="e.g. office, marketing"></div>
+        ${type==='revenue' ? `<div class="field"><label>Client (optional)</label><select id="entry-client"><option value="">—</option>${state.clients.map(c=>`<option value="${c.id}">${c.name}</option>`).join('')}</select></div>` : ''}
+        <div class="field"><label><input type="checkbox" id="entry-vat" style="width:auto;"> Includes VAT (15%)</label></div>
+        <div class="field"><label><input type="checkbox" id="entry-recurring" style="width:auto;"> Recurring</label></div>
+        <div class="field hidden" id="entry-recurrence-field"><label>Frequency</label>
+          <select id="entry-recurrence-frequency"><option value="weekly">Weekly</option><option value="monthly" selected>Monthly</option><option value="annually">Annually</option></select>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn secondary" id="entry-cancel">Cancel</button>
+          <button type="submit" class="btn">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+
+function attachEntryHandlers(type){
+  const addBtn = document.getElementById('add-entry-btn');
+  const backdrop = document.getElementById('entry-modal-backdrop');
+  if(addBtn){
+    addBtn.addEventListener('click', ()=>{
+      document.getElementById('entry-date').value = new Date().toISOString().slice(0,10);
+      backdrop.classList.remove('hidden');
+    });
+  }
+  document.getElementById('entry-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('entry-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('entry-recurring')?.addEventListener('change', (e)=>{
+    document.getElementById('entry-recurrence-field').classList.toggle('hidden', !e.target.checked);
+  });
+  document.getElementById('entry-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const tags = document.getElementById('entry-tags').value.split(',').map(t=>t.trim()).filter(Boolean);
+    const isRecurring = document.getElementById('entry-recurring').checked;
+    const payload = {
+      company_id: state.company.id,
+      type,
+      description: document.getElementById('entry-description').value.trim(),
+      amount: parseFloat(document.getElementById('entry-amount').value),
+      entry_date: document.getElementById('entry-date').value,
+      tags,
+      vat_applicable: document.getElementById('entry-vat').checked,
+      is_recurring: isRecurring,
+      recurrence_frequency: isRecurring ? document.getElementById('entry-recurrence-frequency').value : null,
+      created_by: state.user.id
+    };
+    if(type==='revenue'){
+      const clientId = document.getElementById('entry-client').value;
+      if(clientId) payload.client_id = clientId;
+    }
+    const {error} = await sb.from('cc_entries').insert(payload);
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Saved.');
+  });
+  document.querySelectorAll('[data-del-entry]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this entry?')) return;
+      await sb.from('cc_entries').delete().eq('id', btn.dataset.delEntry);
+      await refreshAll(); render();
+    });
+  });
+}
+
+/* ========================= ASSETS ========================= */
+function renderAssets(){
+  const total = state.assets.reduce((s,a)=>s+Number(a.value),0);
+  return `
+    <div class="section-header"><h1>Assets</h1>${isAdmin() ? `<button class="btn" id="add-asset-btn">+ Add Asset</button>` : ''}</div>
+    <div class="grid"><div class="card"><h3>Total Assets</h3><div class="value">${fmt(total)}</div></div></div>
+    <div class="panel">
+      ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+        ${state.assets.map(a=>`<tr><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td>${isAdmin()?`<td><button class="btn small danger" data-del-asset="${a.id}">Delete</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No assets recorded yet.</div>`}
+    </div>
+    ${isAdmin() ? `
+    <div class="modal-backdrop hidden" id="asset-modal-backdrop"><div class="modal">
+      <button class="close-x" id="asset-modal-close">✕</button>
+      <h2>Add Asset</h2>
+      <form id="asset-form">
+        <div class="field"><label>Description</label><input type="text" id="asset-description" required></div>
+        <div class="field"><label>Category</label><input type="text" id="asset-category" placeholder="e.g. equipment, property, vehicle"></div>
+        <div class="field"><label>Value (R)</label><input type="number" step="0.01" id="asset-value" required></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="asset-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
+      </form>
+    </div></div>` : ''}
+  `;
+}
+function attachAssetHandlers(){
+  const backdrop = document.getElementById('asset-modal-backdrop');
+  document.getElementById('add-asset-btn')?.addEventListener('click', ()=>backdrop.classList.remove('hidden'));
+  document.getElementById('asset-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('asset-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('asset-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const {error} = await sb.from('cc_assets').insert({
+      company_id: state.company.id,
+      description: document.getElementById('asset-description').value.trim(),
+      category: document.getElementById('asset-category').value.trim() || null,
+      value: parseFloat(document.getElementById('asset-value').value)
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Saved.');
+  });
+  document.querySelectorAll('[data-del-asset]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this asset?')) return;
+      await sb.from('cc_assets').delete().eq('id', btn.dataset.delAsset);
+      await refreshAll(); render();
+    });
+  });
+}
+
+/* ========================= LIABILITIES ========================= */
+function renderLiabilities(){
+  const total = state.liabilities.reduce((s,l)=>s+Number(l.amount),0);
+  return `
+    <div class="section-header"><h1>Liabilities</h1>${isAdmin() ? `<button class="btn" id="add-liability-btn">+ Add Liability</button>` : ''}</div>
+    <div class="grid"><div class="card"><h3>Total Liabilities</h3><div class="value negative">${fmt(total)}</div></div></div>
+    <div class="panel">
+      ${state.liabilities.length ? `<table><thead><tr><th>Description</th><th>Type</th><th>Amount</th><th>Rate</th><th>Term</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+        ${state.liabilities.map(l=>`<tr><td>${l.description}</td><td>${l.type}</td><td>${fmt(l.amount)}</td><td>${l.interest_rate?l.interest_rate+'%':'—'}</td><td>${l.term_months?l.term_months+' mo':'—'}</td>${isAdmin()?`<td><button class="btn small danger" data-del-liability="${l.id}">Delete</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No liabilities recorded yet.</div>`}
+    </div>
+    ${isAdmin() ? `
+    <div class="modal-backdrop hidden" id="liability-modal-backdrop"><div class="modal">
+      <button class="close-x" id="liability-modal-close">✕</button>
+      <h2>Add Liability</h2>
+      <form id="liability-form">
+        <div class="field"><label>Description</label><input type="text" id="liability-description" required></div>
+        <div class="field"><label>Type</label><select id="liability-type"><option value="loan">Loan</option><option value="creditor">Creditor</option><option value="other">Other</option></select></div>
+        <div class="field"><label>Amount owed (R)</label><input type="number" step="0.01" id="liability-amount" required></div>
+        <div class="field"><label>Interest rate (%, optional)</label><input type="number" step="0.01" id="liability-rate"></div>
+        <div class="field"><label>Term (months, optional)</label><input type="number" id="liability-term"></div>
+        <div class="field"><label>Start date (optional)</label><input type="date" id="liability-start"></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="liability-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
+      </form>
+    </div></div>` : ''}
+  `;
+}
+function attachLiabilityHandlers(){
+  const backdrop = document.getElementById('liability-modal-backdrop');
+  document.getElementById('add-liability-btn')?.addEventListener('click', ()=>backdrop.classList.remove('hidden'));
+  document.getElementById('liability-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('liability-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('liability-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const {error} = await sb.from('cc_liabilities').insert({
+      company_id: state.company.id,
+      description: document.getElementById('liability-description').value.trim(),
+      type: document.getElementById('liability-type').value,
+      amount: parseFloat(document.getElementById('liability-amount').value),
+      interest_rate: parseFloat(document.getElementById('liability-rate').value) || null,
+      term_months: parseInt(document.getElementById('liability-term').value) || null,
+      start_date: document.getElementById('liability-start').value || null
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Saved.');
+  });
+  document.querySelectorAll('[data-del-liability]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this liability?')) return;
+      await sb.from('cc_liabilities').delete().eq('id', btn.dataset.delLiability);
+      await refreshAll(); render();
+    });
+  });
+}
+
+/* ========================= CLIENTS ========================= */
+function renderClients(){
+  return `
+    <div class="section-header"><h1>Clients</h1>${isAdmin() ? `<button class="btn" id="add-client-btn">+ Add Client</button>` : ''}</div>
+    <div class="panel">
+      ${state.clients.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+        ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td>${isAdmin()?`<td><button class="btn small danger" data-del-client="${c.id}">Delete</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No clients yet.</div>`}
+    </div>
+    ${isAdmin() ? `
+    <div class="modal-backdrop hidden" id="client-modal-backdrop"><div class="modal">
+      <button class="close-x" id="client-modal-close">✕</button>
+      <h2>Add Client</h2>
+      <form id="client-form">
+        <div class="field"><label>Name</label><input type="text" id="client-name" required></div>
+        <div class="field"><label>Email</label><input type="email" id="client-email"></div>
+        <div class="field"><label>Phone</label><input type="text" id="client-phone"></div>
+        <div class="field"><label>Address</label><textarea id="client-address" rows="2"></textarea></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="client-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
+      </form>
+    </div></div>` : ''}
+  `;
+}
+function attachClientHandlers(){
+  const backdrop = document.getElementById('client-modal-backdrop');
+  document.getElementById('add-client-btn')?.addEventListener('click', ()=>backdrop.classList.remove('hidden'));
+  document.getElementById('client-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('client-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('client-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const {error} = await sb.from('cc_clients').insert({
+      company_id: state.company.id,
+      name: document.getElementById('client-name').value.trim(),
+      email: document.getElementById('client-email').value.trim() || null,
+      phone: document.getElementById('client-phone').value.trim() || null,
+      address: document.getElementById('client-address').value.trim() || null
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Saved.');
+  });
+  document.querySelectorAll('[data-del-client]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this client?')) return;
+      await sb.from('cc_clients').delete().eq('id', btn.dataset.delClient);
+      await refreshAll(); render();
+    });
+  });
+}
+
+/* ========================= INVOICES ========================= */
+function nextInvoiceNumber(){
+  const year = new Date().getFullYear();
+  const nums = state.invoices
+    .map(i=>i.invoice_number)
+    .filter(n=>n && n.startsWith('INV-'+year))
+    .map(n=>parseInt(n.split('-').pop())||0);
+  const next = (nums.length ? Math.max(...nums) : 0) + 1;
+  return `INV-${year}-${String(next).padStart(3,'0')}`;
+}
+
+function renderInvoices(){
+  return `
+    <div class="section-header"><h1>Invoices</h1>${isAdmin() ? `<button class="btn" id="add-invoice-btn">+ New Invoice</button>` : ''}</div>
+    <div class="panel">
+      ${state.invoices.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Due</th><th>Status</th><th>Total</th><th></th></tr></thead><tbody>
+        ${state.invoices.map(i=>`<tr>
+          <td>${i.invoice_number}</td><td>${clientName(i.client_id)}</td><td>${i.issue_date}</td><td>${i.due_date||'—'}</td>
+          <td><span class="status-pill status-${i.status}">${i.status}</span></td>
+          <td id="inv-total-${i.id}">…</td>
+          <td>
+            <button class="btn small secondary" data-view-invoice="${i.id}">View</button>
+            ${isAdmin()?`<button class="btn small danger" data-del-invoice="${i.id}">Delete</button>`:''}
+          </td>
+        </tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No invoices yet.</div>`}
+    </div>
+    ${isAdmin() ? invoiceModal() : ''}
+    <div class="modal-backdrop hidden" id="invoice-view-backdrop"><div class="modal" id="invoice-view-content"></div></div>
+  `;
+}
+
+function invoiceModal(){
+  return `
+  <div class="modal-backdrop hidden" id="invoice-modal-backdrop">
+    <div class="modal" style="max-width:600px;">
+      <button class="close-x" id="invoice-modal-close">✕</button>
+      <h2>New Invoice</h2>
+      <form id="invoice-form">
+        <div class="row">
+          <div class="field"><label>Invoice #</label><input type="text" id="invoice-number" required></div>
+          <div class="field"><label>Client</label><select id="invoice-client">${state.clients.map(c=>`<option value="${c.id}">${c.name}</option>`).join('') || '<option value="">Add a client first</option>'}</select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Issue date</label><input type="date" id="invoice-issue-date" required></div>
+          <div class="field"><label>Due date</label><input type="date" id="invoice-due-date"></div>
+        </div>
+        <h3 style="margin-bottom:6px;">Line items</h3>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:70px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+          <tbody id="invoice-items-body"></tbody>
+        </table>
+        <button type="button" class="btn secondary small" id="invoice-add-item" style="margin-top:8px;">+ Add line</button>
+        <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="invoice-notes" rows="2"></textarea></div>
+        <div class="modal-actions">
+          <button type="button" class="btn secondary" id="invoice-cancel">Cancel</button>
+          <button type="submit" class="btn">Save Invoice</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+
+function invoiceItemRow(){
+  return `<tr>
+    <td><input type="text" class="ii-desc" required></td>
+    <td><input type="number" class="ii-qty" value="1" step="0.01"></td>
+    <td><input type="number" class="ii-price" value="0" step="0.01"></td>
+    <td style="text-align:center;"><input type="checkbox" class="ii-vat" checked style="width:auto;"></td>
+    <td><button type="button" class="btn small danger ii-remove">✕</button></td>
+  </tr>`;
+}
+
+function attachInvoiceHandlers(){
+  const backdrop = document.getElementById('invoice-modal-backdrop');
+  document.getElementById('add-invoice-btn')?.addEventListener('click', ()=>{
+    document.getElementById('invoice-number').value = nextInvoiceNumber();
+    document.getElementById('invoice-issue-date').value = new Date().toISOString().slice(0,10);
+    document.getElementById('invoice-items-body').innerHTML = invoiceItemRow();
+    backdrop.classList.remove('hidden');
+  });
+  document.getElementById('invoice-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('invoice-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('invoice-add-item')?.addEventListener('click', ()=>{
+    document.getElementById('invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRow());
+  });
+  document.getElementById('invoice-items-body')?.addEventListener('click', (e)=>{
+    if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
+  });
+  document.getElementById('invoice-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const clientId = document.getElementById('invoice-client').value;
+    if(!clientId){ toast('Add a client first.'); return; }
+    const {data: invoice, error} = await sb.from('cc_invoices').insert({
+      company_id: state.company.id,
+      client_id: clientId,
+      invoice_number: document.getElementById('invoice-number').value.trim(),
+      issue_date: document.getElementById('invoice-issue-date').value,
+      due_date: document.getElementById('invoice-due-date').value || null,
+      status: 'draft',
+      notes: document.getElementById('invoice-notes').value.trim() || null
+    }).select().single();
+    if(error){ toast(error.message); return; }
+    const rows = [...document.querySelectorAll('#invoice-items-body tr')].map(tr=>({
+      invoice_id: invoice.id,
+      description: tr.querySelector('.ii-desc').value.trim(),
+      quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
+      unit_price: parseFloat(tr.querySelector('.ii-price').value)||0,
+      vat_applicable: tr.querySelector('.ii-vat').checked
+    })).filter(r=>r.description);
+    if(rows.length) await sb.from('cc_invoice_items').insert(rows);
+    await refreshAll(); render(); toast('Invoice created.');
+  });
+  document.querySelectorAll('[data-del-invoice]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this invoice?')) return;
+      await sb.from('cc_invoices').delete().eq('id', btn.dataset.delInvoice);
+      await refreshAll(); render();
+    });
+  });
+  document.querySelectorAll('[data-view-invoice]').forEach(btn=>{
+    btn.addEventListener('click', ()=>openInvoiceView(btn.dataset.viewInvoice));
+  });
+  // fill totals async
+  state.invoices.forEach(async (inv)=>{
+    const {data: items} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', inv.id);
+    state.invoiceItems[inv.id] = items || [];
+    const total = (items||[]).reduce((s,it)=>s+it.quantity*it.unit_price,0);
+    const el = document.getElementById('inv-total-'+inv.id);
+    if(el) el.textContent = fmt(total);
+  });
+}
+
+async function openInvoiceView(invoiceId){
+  const inv = state.invoices.find(i=>i.id===invoiceId);
+  const {data: items} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', invoiceId);
+  const client = state.clients.find(c=>c.id===inv.client_id);
+  const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
+  const vatTotal = items.reduce((s,it)=> s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
+  const total = items.reduce((s,it)=>s+it.quantity*it.unit_price,0);
+  const backdrop = document.getElementById('invoice-view-backdrop');
+  document.getElementById('invoice-view-content').innerHTML = `
+    <button class="close-x" id="invoice-view-close">✕</button>
+    <h2>${inv.invoice_number}</h2>
+    <p style="color:var(--muted);margin-top:-8px;">${state.company.name}${state.company.vat_number?' · VAT '+state.company.vat_number:''}</p>
+    <p><strong>Bill to:</strong> ${client ? client.name : '—'}${client && client.email ? ' ('+client.email+')' : ''}</p>
+    <p style="font-size:.85rem;color:var(--muted);">Issued ${inv.issue_date}${inv.due_date?' · Due '+inv.due_date:''}</p>
+    <table><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr></thead><tbody>
+      ${items.map(it=>`<tr><td>${it.description}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
+    </tbody></table>
+    <div style="text-align:right;margin-top:10px;font-size:.9rem;">
+      <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
+      <div>VAT (15%): ${fmt(vatTotal)}</div>
+      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmt(total)}</div>
+    </div>
+    ${inv.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${inv.notes}</p>` : ''}
+    ${isAdmin() ? `
+    <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
+      <span style="font-size:.8rem;color:var(--muted);align-self:center;">Mark as:</span>
+      <button class="btn small secondary" data-set-status="draft">Draft</button>
+      <button class="btn small secondary" data-set-status="sent">Sent</button>
+      <button class="btn small secondary" data-set-status="paid">Paid</button>
+      <button class="btn small secondary" data-set-status="overdue">Overdue</button>
+    </div>` : ''}
+    <div class="modal-actions"><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
+  `;
+  backdrop.classList.remove('hidden');
+  document.getElementById('invoice-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.querySelectorAll('[data-set-status]').forEach(b=>{
+    b.addEventListener('click', async ()=>{
+      await sb.from('cc_invoices').update({status:b.dataset.setStatus}).eq('id', inv.id);
+      backdrop.classList.add('hidden');
+      await refreshAll(); render();
+      toast('Invoice updated.');
+    });
+  });
+}
+
+/* ========================= PAYROLL ========================= */
+function renderPayroll(){
+  const totalPayroll = state.employees.filter(e=>e.active).reduce((s,e)=>s+Number(e.salary),0);
+  return `
+    <div class="section-header"><h1>Payroll</h1>${isAdmin() ? `<button class="btn" id="add-employee-btn">+ Add Employee</button>` : ''}</div>
+    <div class="grid"><div class="card"><h3>Monthly Payroll (active)</h3><div class="value">${fmt(totalPayroll)}</div></div></div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Employees</h3>
+      ${state.employees.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Salary</th><th>Frequency</th><th>Active</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+        ${state.employees.map(e=>`<tr><td>${e.name}</td><td>${e.role_title||'—'}</td><td>${fmt(e.salary)}</td><td>${e.pay_frequency}</td><td>${e.active?'Yes':'No'}</td>
+        ${isAdmin()?`<td><button class="btn small secondary" data-pay-employee="${e.id}">Record Payment</button> <button class="btn small danger" data-del-employee="${e.id}">Delete</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No employees yet.</div>`}
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Recent payments</h3>
+      ${state.payrollPayments.length ? `<table><thead><tr><th>Date</th><th>Employee</th><th>Gross</th><th>Deductions</th><th>Net</th><th>Paid</th></tr></thead><tbody>
+        ${state.payrollPayments.slice(0,10).map(p=>`<tr><td>${p.pay_date}</td><td>${state.employees.find(e=>e.id===p.employee_id)?.name||'—'}</td><td>${fmt(p.gross)}</td><td>${fmt(p.deductions)}</td><td>${fmt(p.net)}</td><td>${p.paid?'Yes':'No'}</td></tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
+    </div>
+    ${isAdmin() ? `
+    <div class="modal-backdrop hidden" id="employee-modal-backdrop"><div class="modal">
+      <button class="close-x" id="employee-modal-close">✕</button>
+      <h2>Add Employee</h2>
+      <form id="employee-form">
+        <div class="field"><label>Name</label><input type="text" id="employee-name" required></div>
+        <div class="field"><label>Role</label><input type="text" id="employee-role"></div>
+        <div class="field"><label>Salary (R, per pay period)</label><input type="number" step="0.01" id="employee-salary" required></div>
+        <div class="field"><label>Pay frequency</label><select id="employee-frequency"><option value="monthly">Monthly</option><option value="weekly">Weekly</option><option value="biweekly">Biweekly</option></select></div>
+        <div class="field"><label>Start date</label><input type="date" id="employee-start"></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="employee-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
+      </form>
+    </div></div>
+    <div class="modal-backdrop hidden" id="payment-modal-backdrop"><div class="modal">
+      <button class="close-x" id="payment-modal-close">✕</button>
+      <h2>Record Payment</h2>
+      <form id="payment-form">
+        <input type="hidden" id="payment-employee-id">
+        <div class="field"><label>Pay date</label><input type="date" id="payment-date" required></div>
+        <div class="field"><label>Gross (R)</label><input type="number" step="0.01" id="payment-gross" required></div>
+        <div class="field"><label>Deductions (R)</label><input type="number" step="0.01" id="payment-deductions" value="0"></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="payment-cancel">Cancel</button><button type="submit" class="btn">Save Payment</button></div>
+      </form>
+    </div></div>` : ''}
+  `;
+}
+function attachPayrollHandlers(){
+  const empBackdrop = document.getElementById('employee-modal-backdrop');
+  document.getElementById('add-employee-btn')?.addEventListener('click', ()=>empBackdrop.classList.remove('hidden'));
+  document.getElementById('employee-cancel')?.addEventListener('click', ()=>empBackdrop.classList.add('hidden'));
+  document.getElementById('employee-modal-close')?.addEventListener('click', ()=>empBackdrop.classList.add('hidden'));
+  document.getElementById('employee-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const {error} = await sb.from('cc_employees').insert({
+      company_id: state.company.id,
+      name: document.getElementById('employee-name').value.trim(),
+      role_title: document.getElementById('employee-role').value.trim() || null,
+      salary: parseFloat(document.getElementById('employee-salary').value),
+      pay_frequency: document.getElementById('employee-frequency').value,
+      start_date: document.getElementById('employee-start').value || null
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Saved.');
+  });
+  document.querySelectorAll('[data-del-employee]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this employee?')) return;
+      await sb.from('cc_employees').delete().eq('id', btn.dataset.delEmployee);
+      await refreshAll(); render();
+    });
+  });
+  const payBackdrop = document.getElementById('payment-modal-backdrop');
+  document.querySelectorAll('[data-pay-employee]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const emp = state.employees.find(e=>e.id===btn.dataset.payEmployee);
+      document.getElementById('payment-employee-id').value = emp.id;
+      document.getElementById('payment-date').value = new Date().toISOString().slice(0,10);
+      document.getElementById('payment-gross').value = emp.salary;
+      document.getElementById('payment-deductions').value = 0;
+      payBackdrop.classList.remove('hidden');
+    });
+  });
+  document.getElementById('payment-cancel')?.addEventListener('click', ()=>payBackdrop.classList.add('hidden'));
+  document.getElementById('payment-modal-close')?.addEventListener('click', ()=>payBackdrop.classList.add('hidden'));
+  document.getElementById('payment-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const gross = parseFloat(document.getElementById('payment-gross').value);
+    const deductions = parseFloat(document.getElementById('payment-deductions').value)||0;
+    const {error} = await sb.from('cc_payroll_payments').insert({
+      employee_id: document.getElementById('payment-employee-id').value,
+      company_id: state.company.id,
+      pay_date: document.getElementById('payment-date').value,
+      gross, deductions, net: gross - deductions, paid: true
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Payment recorded.');
+  });
+}
+
+/* ========================= VAT ========================= */
+function renderVat(){
+  const v = vatFor();
+  return `
+    <h1>VAT</h1>
+    <div class="grid">
+      <div class="card"><h3>VAT Collected</h3><div class="value">${fmt(v.vatCollected)}</div><div class="sub">From revenue marked VAT-inclusive</div></div>
+      <div class="card"><h3>VAT Paid</h3><div class="value">${fmt(v.vatPaid)}</div><div class="sub">From expenses marked VAT-inclusive</div></div>
+      <div class="card"><h3>VAT Payable</h3><div class="value ${v.vatPayable<0?'negative':''}">${fmt(v.vatPayable)}</div><div class="sub">Collected − paid. Negative = refund due to you.</div></div>
+    </div>
+    <div class="panel">
+      <p style="color:var(--muted);font-size:.85rem;">Standard South African VAT rate of ${(VAT_RATE*100).toFixed(0)}% is used to back out VAT from amounts you've marked as VAT-inclusive on Revenue and Expense entries. This is a running total across all entries — not scoped to a specific 2-month VAT201 period yet. This is not tax advice; confirm figures with your accountant or SARS eFiling before submitting a return.</p>
+      ${state.company.vat_number ? `<p style="font-size:.85rem;">Registered VAT number: <strong>${state.company.vat_number}</strong></p>` : `<p style="font-size:.85rem;color:var(--muted);">No VAT number on file for this company yet.</p>`}
+    </div>
+  `;
+}
+
+/* ========================= TEAM ========================= */
+function renderTeam(){
+  return `
+    <div class="section-header"><h1>Team</h1>${isAdmin() ? `<button class="btn" id="add-member-btn">+ Invite Member</button>` : ''}</div>
+    <div class="panel">
+      <table><thead><tr><th>Email</th><th>Role</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+        ${state.members.map(m=>`<tr><td>${m.email}</td><td><span class="role-badge">${m.role}</span></td><td>${m.status}</td>
+        ${isAdmin() && m.role!=='owner' ? `<td><button class="btn small danger" data-del-member="${m.id}">Remove</button></td>` : (isAdmin()?'<td></td>':'')}</tr>`).join('')}
+      </tbody></table>
+    </div>
+    ${isAdmin() ? `
+    <div class="modal-backdrop hidden" id="member-modal-backdrop"><div class="modal">
+      <button class="close-x" id="member-modal-close">✕</button>
+      <h2>Invite Member</h2>
+      <p style="font-size:.8rem;color:var(--muted);">Enter the email they'll sign up (or already have an account) with. They'll get access automatically next time they log in.</p>
+      <form id="member-form">
+        <div class="field"><label>Email</label><input type="email" id="member-email" required></div>
+        <div class="field"><label>Role</label><select id="member-role"><option value="viewer">Viewer (read-only)</option><option value="admin">Admin (full access)</option></select></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="member-cancel">Cancel</button><button type="submit" class="btn">Invite</button></div>
+      </form>
+    </div></div>` : ''}
+  `;
+}
+function attachTeamHandlers(){
+  const backdrop = document.getElementById('member-modal-backdrop');
+  document.getElementById('add-member-btn')?.addEventListener('click', ()=>backdrop.classList.remove('hidden'));
+  document.getElementById('member-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('member-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('member-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const {error} = await sb.from('cc_company_members').insert({
+      company_id: state.company.id,
+      email: document.getElementById('member-email').value.trim().toLowerCase(),
+      role: document.getElementById('member-role').value,
+      status: 'pending'
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Invited.');
+  });
+  document.querySelectorAll('[data-del-member]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Remove this team member?')) return;
+      await sb.from('cc_company_members').delete().eq('id', btn.dataset.delMember);
+      await refreshAll(); render();
+    });
+  });
+}
+</script>
+</body>
+</html>
