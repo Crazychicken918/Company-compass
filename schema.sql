@@ -257,3 +257,21 @@ create policy "members select payroll" on cc_payroll_payments for select using (
 create policy "admin write payroll" on cc_payroll_payments for insert with check (cc_is_admin(company_id));
 create policy "admin update payroll" on cc_payroll_payments for update using (cc_is_admin(company_id));
 create policy "admin delete payroll" on cc_payroll_payments for delete using (cc_is_admin(company_id));
+
+-- ============ EMPLOYEE TASKS (added 2026-09-06) ============
+
+create table if not exists cc_employee_tasks (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  employee_id uuid not null references cc_employees(id) on delete cascade,
+  description text not null,
+  status text not null default 'in_progress' check (status in ('todo','in_progress','done')),
+  created_at timestamptz default now()
+);
+
+alter table cc_employee_tasks enable row level security;
+
+create policy "members select employee tasks" on cc_employee_tasks for select using (cc_is_member(company_id));
+create policy "admin write employee tasks" on cc_employee_tasks for insert with check (cc_is_admin(company_id));
+create policy "admin update employee tasks" on cc_employee_tasks for update using (cc_is_admin(company_id));
+create policy "admin delete employee tasks" on cc_employee_tasks for delete using (cc_is_admin(company_id));

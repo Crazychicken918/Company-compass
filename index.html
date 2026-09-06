@@ -154,6 +154,7 @@ let state = {
   invoiceItems: {},   // invoiceId -> items[]
   employees: [],
   payrollPayments: [],
+  employeeTasks: [],
   view: 'dashboard'
 };
 
@@ -199,6 +200,7 @@ document.getElementById('auth-form').addEventListener('submit', async (e)=>{
       const companyName = document.getElementById('auth-company-name').value.trim();
       const vatNumber = document.getElementById('auth-vat-number').value.trim();
       if(!companyName){ errEl.textContent = 'Company name is required.'; return; }
+      localStorage.setItem('cc_pending_signup_'+email, JSON.stringify({companyName, vatNumber}));
       const {data, error} = await sb.auth.signUp({email, password});
       if(error) throw error;
       // Company + membership are created once the session is confirmed (see onAuthReady)
@@ -225,22 +227,36 @@ sb.auth.onAuthStateChange((event, session)=>{
   }
 });
 
+async function createCompanyForUser(companyName, vatNumber){
+  const {data: company, error: cErr} = await sb.from('cc_companies').insert({
+    owner_id: state.user.id, name: companyName, vat_number: vatNumber || null
+  }).select().single();
+  if(cErr) throw cErr;
+  await sb.from('cc_company_members').insert({
+    company_id: company.id, user_id: state.user.id, email: state.user.email, role: 'owner', status: 'active'
+  });
+  return company;
+}
+
 async function onAuthReady(user){
   state.user = user;
   document.getElementById('auth-screen').style.display = 'none';
   document.getElementById('app-shell').classList.add('active');
 
-  // Handle brand-new signup: create company + owner membership
-  if(pendingSignup){
-    const {companyName, vatNumber} = pendingSignup;
+  // Handle brand-new signup: create company + owner membership.
+  // Falls back to localStorage in case email confirmation caused a reload
+  // between signup and the first authenticated session.
+  let signupInfo = pendingSignup;
+  if(!signupInfo){
+    const stored = localStorage.getItem('cc_pending_signup_'+user.email);
+    if(stored){ try{ signupInfo = JSON.parse(stored); }catch(e){} }
+  }
+  if(signupInfo){
     pendingSignup = null;
-    const {data: company, error: cErr} = await sb.from('cc_companies').insert({
-      owner_id: user.id, name: companyName, vat_number: vatNumber || null
-    }).select().single();
-    if(!cErr && company){
-      await sb.from('cc_company_members').insert({
-        company_id: company.id, user_id: user.id, email: user.email, role: 'owner', status: 'active'
-      });
+    localStorage.removeItem('cc_pending_signup_'+user.email);
+    const {data: existing} = await sb.from('cc_company_members').select('id').eq('user_id', user.id).limit(1);
+    if(!existing || existing.length === 0){
+      try{ await createCompanyForUser(signupInfo.companyName, signupInfo.vatNumber); }catch(e){ console.error(e); }
     }
   }
 
@@ -259,8 +275,26 @@ async function loadCompany(){
     .select('*').eq('user_id', state.user.id).eq('status', 'active').limit(1);
 
   if(!memberships || memberships.length === 0){
-    document.getElementById('main').innerHTML = `<div class="panel"><h2>No company found</h2>
-      <p class="empty">Your account isn't linked to a company yet. If you were invited, ask the company owner to check the email address used to invite you (${state.user.email}).</p></div>`;
+    document.getElementById('main').innerHTML = `
+      <div class="panel" style="max-width:420px;">
+        <h2 style="margin-top:0;">Set up your company</h2>
+        <p style="color:var(--muted);font-size:.88rem;">We couldn't find a company on your account yet. If you were invited by someone, ask them to check they invited <strong>${state.user.email}</strong>. Otherwise, create your company below to get started.</p>
+        <form id="setup-company-form">
+          <div class="field" style="margin-bottom:10px;"><label>Company name</label><input type="text" id="setup-company-name" required style="width:100%;"></div>
+          <div class="field" style="margin-bottom:14px;"><label>VAT number (optional)</label><input type="text" id="setup-vat-number" style="width:100%;"></div>
+          <button type="submit" class="btn">Create Company</button>
+        </form>
+      </div>`;
+    document.getElementById('setup-company-form').addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const name = document.getElementById('setup-company-name').value.trim();
+      const vat = document.getElementById('setup-vat-number').value.trim();
+      if(!name) return;
+      try{
+        await createCompanyForUser(name, vat);
+        await loadCompany();
+      }catch(err){ toast(err.message); }
+    });
     return;
   }
   state.membership = memberships[0];
@@ -274,7 +308,7 @@ async function loadCompany(){
 
 async function refreshAll(){
   const cid = state.company.id;
-  const [members, accounts, entries, assets, liabilities, clients, invoices, employees, payments] = await Promise.all([
+  const [members, accounts, entries, assets, liabilities, clients, invoices, employees, payments, tasks] = await Promise.all([
     sb.from('cc_company_members').select('*').eq('company_id', cid),
     sb.from('cc_accounts').select('*').eq('company_id', cid),
     sb.from('cc_entries').select('*').eq('company_id', cid).order('entry_date', {ascending:false}),
@@ -283,7 +317,8 @@ async function refreshAll(){
     sb.from('cc_clients').select('*').eq('company_id', cid),
     sb.from('cc_invoices').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
     sb.from('cc_employees').select('*').eq('company_id', cid),
-    sb.from('cc_payroll_payments').select('*').eq('company_id', cid).order('pay_date', {ascending:false})
+    sb.from('cc_payroll_payments').select('*').eq('company_id', cid).order('pay_date', {ascending:false}),
+    sb.from('cc_employee_tasks').select('*').eq('company_id', cid).order('created_at', {ascending:false})
   ]);
   state.members = members.data || [];
   state.accounts = accounts.data || [];
@@ -294,6 +329,7 @@ async function refreshAll(){
   state.invoices = invoices.data || [];
   state.employees = employees.data || [];
   state.payrollPayments = payments.data || [];
+  state.employeeTasks = tasks.data || [];
 }
 
 /* ========================= NAV / RENDER ========================= */
@@ -366,6 +402,15 @@ function renderDashboard(){
       ${state.entries.slice(0,8).length ? `<table><thead><tr><th>Date</th><th>Type</th><th>Description</th><th>Amount</th></tr></thead><tbody>
         ${state.entries.slice(0,8).map(e=>`<tr><td>${e.entry_date}</td><td>${e.type}</td><td>${e.description}</td><td>${fmt(e.amount)}</td></tr>`).join('')}
       </tbody></table>` : `<div class="empty">No entries yet.</div>`}
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Team &amp; current tasks</h3>
+      ${state.employees.length ? `<table><thead><tr><th>Employee</th><th>Role</th><th>Working on</th></tr></thead><tbody>
+        ${state.employees.filter(e=>e.active).map(e=>{
+          const openTasks = state.employeeTasks.filter(t=>t.employee_id===e.id && t.status!=='done');
+          return `<tr><td>${e.name}</td><td>${e.role_title||'—'}</td><td>${openTasks.length ? openTasks.map(t=>`<span class="tag-pill" title="${t.status}">${t.description}</span>`).join(' ') : '<span style="color:var(--muted);">No active task</span>'}</td></tr>`;
+        }).join('')}
+      </tbody></table>` : `<div class="empty">No employees yet. Add your team under Payroll.</div>`}
     </div>
   `;
 }
@@ -813,8 +858,18 @@ function renderPayroll(){
       <h3 style="margin-top:0;">Employees</h3>
       ${state.employees.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Salary</th><th>Frequency</th><th>Active</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
         ${state.employees.map(e=>`<tr><td>${e.name}</td><td>${e.role_title||'—'}</td><td>${fmt(e.salary)}</td><td>${e.pay_frequency}</td><td>${e.active?'Yes':'No'}</td>
-        ${isAdmin()?`<td><button class="btn small secondary" data-pay-employee="${e.id}">Record Payment</button> <button class="btn small danger" data-del-employee="${e.id}">Delete</button></td>`:''}</tr>`).join('')}
+        ${isAdmin()?`<td><button class="btn small secondary" data-pay-employee="${e.id}">Record Payment</button> <button class="btn small secondary" data-task-employee="${e.id}">Assign Task</button> <button class="btn small danger" data-del-employee="${e.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No employees yet.</div>`}
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Tasks</h3>
+      ${state.employeeTasks.length ? `<table><thead><tr><th>Employee</th><th>Task</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+        ${state.employeeTasks.map(t=>`<tr><td>${state.employees.find(e=>e.id===t.employee_id)?.name||'—'}</td><td>${t.description}</td><td><span class="status-pill status-${t.status==='done'?'paid':(t.status==='in_progress'?'sent':'draft')}">${t.status.replace('_',' ')}</span></td>
+        ${isAdmin()?`<td>
+          ${t.status!=='done'?`<button class="btn small secondary" data-complete-task="${t.id}">Mark Done</button>`:''}
+          <button class="btn small danger" data-del-task="${t.id}">Delete</button>
+        </td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No tasks assigned yet.</div>`}
     </div>
     <div class="panel">
       <h3 style="margin-top:0;">Recent payments</h3>
@@ -844,6 +899,16 @@ function renderPayroll(){
         <div class="field"><label>Gross (R)</label><input type="number" step="0.01" id="payment-gross" required></div>
         <div class="field"><label>Deductions (R)</label><input type="number" step="0.01" id="payment-deductions" value="0"></div>
         <div class="modal-actions"><button type="button" class="btn secondary" id="payment-cancel">Cancel</button><button type="submit" class="btn">Save Payment</button></div>
+      </form>
+    </div></div>
+    <div class="modal-backdrop hidden" id="task-modal-backdrop"><div class="modal">
+      <button class="close-x" id="task-modal-close">✕</button>
+      <h2>Assign Task</h2>
+      <form id="task-form">
+        <input type="hidden" id="task-employee-id">
+        <div class="field"><label>What are they working on?</label><textarea id="task-description" rows="2" required style="width:100%;"></textarea></div>
+        <div class="field"><label>Status</label><select id="task-status"><option value="todo">To do</option><option value="in_progress" selected>In progress</option><option value="done">Done</option></select></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="task-cancel">Cancel</button><button type="submit" class="btn">Save Task</button></div>
       </form>
     </div></div>` : ''}
   `;
@@ -898,6 +963,42 @@ function attachPayrollHandlers(){
     });
     if(error){ toast(error.message); return; }
     await refreshAll(); render(); toast('Payment recorded.');
+  });
+
+  const taskBackdrop = document.getElementById('task-modal-backdrop');
+  document.querySelectorAll('[data-task-employee]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      document.getElementById('task-employee-id').value = btn.dataset.taskEmployee;
+      document.getElementById('task-description').value = '';
+      document.getElementById('task-status').value = 'in_progress';
+      taskBackdrop.classList.remove('hidden');
+    });
+  });
+  document.getElementById('task-cancel')?.addEventListener('click', ()=>taskBackdrop.classList.add('hidden'));
+  document.getElementById('task-modal-close')?.addEventListener('click', ()=>taskBackdrop.classList.add('hidden'));
+  document.getElementById('task-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const {error} = await sb.from('cc_employee_tasks').insert({
+      company_id: state.company.id,
+      employee_id: document.getElementById('task-employee-id').value,
+      description: document.getElementById('task-description').value.trim(),
+      status: document.getElementById('task-status').value
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Task assigned.');
+  });
+  document.querySelectorAll('[data-complete-task]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      await sb.from('cc_employee_tasks').update({status:'done'}).eq('id', btn.dataset.completeTask);
+      await refreshAll(); render();
+    });
+  });
+  document.querySelectorAll('[data-del-task]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this task?')) return;
+      await sb.from('cc_employee_tasks').delete().eq('id', btn.dataset.delTask);
+      await refreshAll(); render();
+    });
   });
 }
 
