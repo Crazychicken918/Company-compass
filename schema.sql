@@ -198,7 +198,7 @@ create policy "admin can update company" on cc_companies for update
 create policy "members can view membership" on cc_company_members for select
   using (cc_is_member(company_id) or email = auth.jwt() ->> 'email');
 create policy "admin can manage members insert" on cc_company_members for insert
-  with check (cc_is_admin(company_id) or not exists (select 1 from cc_company_members where company_id = cc_company_members.company_id));
+  with check (cc_is_admin(company_id) or not exists (select 1 from cc_company_members m where m.company_id = cc_company_members.company_id));
 create policy "admin can manage members update" on cc_company_members for update
   using (cc_is_admin(company_id) or user_id = auth.uid());
 create policy "admin can manage members delete" on cc_company_members for delete
