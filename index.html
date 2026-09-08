@@ -7,49 +7,89 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root{
-    --bg:#0f1117; --panel:#171a23; --panel2:#1e2230; --border:#2a2f3d;
-    --text:#e9ebf1; --muted:#8a90a3; --accent:#4f8cff; --accent2:#6fd3a0;
-    --danger:#ff6b6b; --warn:#ffb020; --radius:12px;
+    color-scheme: light;
+    --bg:#fbfbfe; --bg-elev:#ffffff; --panel:#ffffff; --panel2:#f5f4ff; --border:#edecf5;
+    --text:#191a23; --muted:#797e91; --accent:#7c5cff; --accent-dim:#ece7ff; --accent2:#0fb981;
+    --danger:#f4406a; --warn:#f5a524; --radius:14px;
+    --shadow:0 1px 2px rgba(30,20,60,.03), 0 6px 18px rgba(30,20,60,.04);
+    --c-dashboard:#7c5cff; --c-revenue:#0fb981; --c-expenses:#f4406a; --c-assets:#06b6d4;
+    --c-liabilities:#f5a524; --c-clients:#a855f7; --c-invoices:#6366f1; --c-creditnotes:#ec4899;
+    --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b;
   }
   *{box-sizing:border-box;}
   body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
   a{color:var(--accent);}
-  button{font-family:inherit;cursor:pointer;}
-  input,select,textarea{font-family:inherit;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px;}
-  input:focus,select:focus,textarea:focus{outline:1px solid var(--accent);}
-  .btn{background:var(--accent);border:none;color:#fff;padding:9px 16px;border-radius:8px;font-weight:600;}
+  button{font-family:inherit;cursor:pointer;transition:opacity .15s ease, transform .1s ease;}
+  button:active{transform:scale(.98);}
+  input,select,textarea{font-family:inherit;background:var(--bg-elev);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:8px 10px;}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);}
+  .btn{background:var(--accent);border:none;color:#fff;padding:9px 16px;border-radius:10px;font-weight:600;box-shadow:0 4px 12px -4px rgba(124,92,255,.5);}
   .btn:hover{opacity:.9;}
-  .btn.secondary{background:var(--panel2);color:var(--text);border:1px solid var(--border);}
-  .btn.danger{background:var(--danger);color:#fff;}
+  .btn.secondary{background:var(--bg-elev);color:var(--text);border:1px solid var(--border);box-shadow:none;}
+  .btn.secondary:hover{background:var(--panel2);}
+  .btn.danger{background:var(--danger);color:#fff;box-shadow:0 4px 12px -4px rgba(244,64,106,.5);}
   .btn.small{padding:5px 10px;font-size:.8rem;}
   .hidden{display:none !important;}
 
   /* Auth screen */
-  #auth-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
-  .auth-box{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:32px;width:100%;max-width:380px;}
-  .auth-box h1{font-size:1.4rem;margin-bottom:4px;}
-  .auth-box p.tagline{color:var(--muted);margin-top:0;margin-bottom:20px;font-size:.9rem;}
+  #auth-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;position:relative;overflow:hidden;
+    background:
+      radial-gradient(600px circle at 12% 15%, rgba(124,92,255,.16), transparent 60%),
+      radial-gradient(600px circle at 88% 20%, rgba(15,185,129,.14), transparent 60%),
+      radial-gradient(600px circle at 50% 95%, rgba(244,64,106,.10), transparent 55%),
+      var(--bg);
+  }
+  #auth-screen::before{content:'';position:absolute;inset:0;background-image:
+      linear-gradient(rgba(25,26,35,.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(25,26,35,.03) 1px, transparent 1px);
+    background-size:36px 36px;mask-image:radial-gradient(circle at 50% 40%, #000 0%, transparent 75%);pointer-events:none;}
+  .auth-wrap{position:relative;z-index:1;width:100%;max-width:380px;display:flex;flex-direction:column;align-items:center;}
+  .auth-badge{width:60px;height:60px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.7rem;
+    background:linear-gradient(135deg, var(--accent), var(--accent2));box-shadow:0 6px 20px rgba(124,92,255,.35);margin-bottom:18px;}
+  .auth-box{background:var(--card,var(--panel));border:1px solid var(--border);border-top:3px solid var(--accent);
+    border-radius:20px;padding:34px 28px;width:100%;box-shadow:0 4px 12px rgba(30,20,60,.05), 0 16px 40px rgba(30,20,60,.08);}
+  .auth-box h1{font-size:1.4rem;margin-bottom:4px;text-align:center;}
+  .auth-box p.tagline{color:var(--muted);margin-top:0;margin-bottom:22px;font-size:.9rem;text-align:center;line-height:1.5;}
   .auth-box form{display:flex;flex-direction:column;gap:10px;}
   .auth-box input{width:100%;}
-  .auth-toggle{text-align:center;margin-top:14px;font-size:.85rem;color:var(--muted);}
+  .auth-field{position:relative;}
+  .auth-field input{width:100%;}
+  .auth-field.has-toggle input{padding-right:38px;}
+  .pw-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);
+    font-size:.72rem;font-weight:600;letter-spacing:.02em;padding:6px 8px;border-radius:6px;}
+  .pw-toggle:hover{color:var(--text);background:var(--panel2);}
+  .auth-box .btn{width:100%;padding:11px 16px;font-size:.95rem;}
+  .auth-toggle{text-align:center;margin-top:18px;font-size:.85rem;color:var(--muted);}
   .auth-error{color:var(--danger);font-size:.85rem;min-height:18px;}
 
   /* App shell */
   #app-shell{display:none;min-height:100vh;}
   #app-shell.active{display:flex;}
-  #sidebar{width:220px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--border);padding:18px 12px;display:flex;flex-direction:column;}
+  #sidebar{width:220px;flex-shrink:0;background:var(--bg-elev);border-right:1px solid var(--border);padding:18px 12px;display:flex;flex-direction:column;}
   #sidebar h2{font-size:1.1rem;margin:4px 8px 2px;}
   #sidebar .company-name{font-size:.78rem;color:var(--muted);margin:0 8px 18px;}
   #sidebar nav{display:flex;flex-direction:column;gap:2px;flex:1;}
-  #sidebar nav button{text-align:left;background:none;border:none;color:var(--text);padding:9px 10px;border-radius:8px;font-size:.9rem;}
+  #sidebar nav button{text-align:left;background:none;border:none;color:var(--text);padding:9px 10px;border-radius:10px;font-size:.9rem;display:flex;align-items:center;gap:9px;}
   #sidebar nav button:hover{background:var(--panel2);}
-  #sidebar nav button.active{background:var(--accent);color:#fff;}
+  #sidebar nav button.active{background:var(--panel2);color:var(--dot,var(--accent));font-weight:600;box-shadow:inset 3px 0 0 0 var(--dot);}
+  #sidebar nav button .dot{width:8px;height:8px;min-width:8px;border-radius:50%;background:var(--dot,var(--muted));}
+  #sidebar nav button[data-view="dashboard"]{--dot:var(--c-dashboard);}
+  #sidebar nav button[data-view="revenue"]{--dot:var(--c-revenue);}
+  #sidebar nav button[data-view="expenses"]{--dot:var(--c-expenses);}
+  #sidebar nav button[data-view="assets"]{--dot:var(--c-assets);}
+  #sidebar nav button[data-view="liabilities"]{--dot:var(--c-liabilities);}
+  #sidebar nav button[data-view="clients"]{--dot:var(--c-clients);}
+  #sidebar nav button[data-view="invoices"]{--dot:var(--c-invoices);}
+  #sidebar nav button[data-view="creditnotes"]{--dot:var(--c-creditnotes);}
+  #sidebar nav button[data-view="payroll"]{--dot:var(--c-payroll);}
+  #sidebar nav button[data-view="vat"]{--dot:var(--c-vat);}
+  #sidebar nav button[data-view="team"]{--dot:var(--c-team);}
   #sidebar .logout{margin-top:10px;font-size:.8rem;color:var(--muted);background:none;border:none;text-align:left;padding:9px 10px;}
 
   #main{flex:1;padding:26px 32px;max-width:1100px;}
   #main h1{margin-top:0;}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:24px;}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-top:3px solid var(--accent-c,var(--border));border-radius:var(--radius);padding:18px;box-shadow:var(--shadow);}
   .card h3{margin:0 0 6px;font-size:.8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;}
   .card .value{font-size:1.6rem;font-weight:700;}
   .card .sub{font-size:.8rem;color:var(--muted);margin-top:4px;}
@@ -61,19 +101,28 @@
   th{color:var(--muted);font-weight:600;font-size:.78rem;text-transform:uppercase;}
   tr:last-child td{border-bottom:none;}
   .section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
-  .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:20px;}
+  .section-header h1{display:flex;align-items:center;gap:10px;}
+  .section-header h1::before{content:'';display:inline-block;width:11px;height:11px;border-radius:3px;background:var(--accent-c,var(--accent));}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:20px;box-shadow:var(--shadow);}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;}
   .field{display:flex;flex-direction:column;gap:4px;font-size:.8rem;color:var(--muted);}
   .field input,.field select{min-width:140px;}
   .tag-pill{display:inline-block;background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:.72rem;margin-right:4px;}
   .status-pill{display:inline-block;border-radius:999px;padding:2px 10px;font-size:.72rem;font-weight:600;}
-  .status-draft{background:#2a2f3d;color:var(--muted);}
-  .status-sent{background:#2a3a5c;color:#8fb4ff;}
-  .status-paid{background:#1e3a2c;color:var(--accent2);}
-  .status-overdue{background:#3a1e1e;color:var(--danger);}
+  .status-draft{background:var(--panel2);color:var(--muted);}
+  .status-sent{background:#e6edff;color:#3757d6;}
+  .status-paid{background:#e3faf1;color:#0fb981;}
+  .status-overdue{background:#fee9ee;color:var(--danger);}
+  .status-pending{background:#fef3de;color:#c9860b;}
+  .status-rejected{background:#fee9ee;color:var(--danger);}
+  .status-issued{background:#e3faf1;color:#0fb981;}
+  .perm-box{border:1px solid var(--border);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:6px;margin-top:4px;background:var(--panel2);}
+  .perm-box label{display:flex;align-items:center;gap:8px;font-size:.85rem;color:var(--text);font-weight:400;}
+  .perm-box input[type="checkbox"]{width:auto;}
+  .perm-box hr{width:100%;border:none;border-top:1px solid var(--border);margin:2px 0;}
   .empty{color:var(--muted);font-size:.88rem;padding:16px 0;text-align:center;}
-  .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:50;padding:20px;}
-  .modal{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:100%;max-width:480px;max-height:88vh;overflow-y:auto;}
+  .modal-backdrop{position:fixed;inset:0;background:rgba(25,26,35,.4);display:flex;align-items:center;justify-content:center;z-index:50;padding:20px;}
+  .modal{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:100%;max-width:480px;max-height:88vh;overflow-y:auto;box-shadow:0 20px 60px -20px rgba(30,20,60,.35);}
   .modal h2{margin-top:0;font-size:1.1rem;}
   .modal .field{width:100%;}
   .modal input,.modal select,.modal textarea{width:100%;}
@@ -81,29 +130,35 @@
   .close-x{float:right;background:none;border:none;color:var(--muted);font-size:1.1rem;}
   .role-badge{font-size:.72rem;padding:2px 8px;border-radius:999px;background:var(--panel2);border:1px solid var(--border);}
   .invoice-items-table input{width:100%;}
-  #toast{position:fixed;bottom:20px;right:20px;background:var(--panel2);border:1px solid var(--border);padding:10px 16px;border-radius:8px;font-size:.85rem;z-index:99;display:none;}
+  #toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:#fff;padding:10px 16px;border-radius:10px;font-size:.85rem;z-index:99;display:none;box-shadow:0 8px 24px -8px rgba(30,20,60,.4);}
   .muted-link{color:var(--muted);text-decoration:underline;cursor:pointer;font-size:.8rem;}
 </style>
 </head>
 <body>
 
 <div id="auth-screen">
-  <div class="auth-box">
-    <h1>Company Compass</h1>
-    <p class="tagline">Business finances, invoicing, payroll &amp; VAT in one place.</p>
-    <form id="auth-form">
-      <input type="email" id="auth-email" placeholder="Email" required>
-      <input type="password" id="auth-password" placeholder="Password (min 8 characters)" minlength="8" required>
-      <div id="signup-fields" class="hidden" style="display:flex;flex-direction:column;gap:10px;">
-        <input type="text" id="auth-company-name" placeholder="Company name">
-        <input type="text" id="auth-vat-number" placeholder="VAT number (optional)">
+  <div class="auth-wrap">
+    <div class="auth-badge">🧭</div>
+    <div class="auth-box">
+      <h1 id="auth-heading">Welcome back</h1>
+      <p class="tagline" id="auth-tagline">Good to see you — let's get your numbers sorted.</p>
+      <form id="auth-form">
+        <input type="email" id="auth-email" placeholder="Email" required>
+        <div class="auth-field has-toggle">
+          <input type="password" id="auth-password" placeholder="Password (min 8 characters)" minlength="8" required>
+          <button type="button" class="pw-toggle" id="auth-pw-toggle">SHOW</button>
+        </div>
+        <div id="signup-fields" class="hidden" style="display:flex;flex-direction:column;gap:10px;">
+          <input type="text" id="auth-company-name" placeholder="Company name">
+          <input type="text" id="auth-vat-number" placeholder="VAT number (optional)">
+        </div>
+        <div class="auth-error" id="auth-error"></div>
+        <button type="submit" class="btn" id="auth-submit">Log In</button>
+      </form>
+      <div class="auth-toggle">
+        <span id="auth-toggle-text">Don't have an account?</span>
+        <a href="#" id="auth-toggle-link">Sign up</a>
       </div>
-      <div class="auth-error" id="auth-error"></div>
-      <button type="submit" class="btn" id="auth-submit">Log In</button>
-    </form>
-    <div class="auth-toggle">
-      <span id="auth-toggle-text">Don't have an account?</span>
-      <a href="#" id="auth-toggle-link">Sign up</a>
     </div>
   </div>
 </div>
@@ -113,16 +168,17 @@
     <h2>Company Compass</h2>
     <div class="company-name" id="sidebar-company-name">Loading…</div>
     <nav id="nav">
-      <button data-view="dashboard" class="active">Dashboard</button>
-      <button data-view="revenue">Revenue</button>
-      <button data-view="expenses">Expenses</button>
-      <button data-view="assets">Assets</button>
-      <button data-view="liabilities">Liabilities</button>
-      <button data-view="clients">Clients</button>
-      <button data-view="invoices">Invoices</button>
-      <button data-view="payroll">Payroll</button>
-      <button data-view="vat">VAT</button>
-      <button data-view="team">Team</button>
+      <button data-view="dashboard" class="active"><span class="dot"></span>Dashboard</button>
+      <button data-view="revenue"><span class="dot"></span>Revenue</button>
+      <button data-view="expenses"><span class="dot"></span>Expenses</button>
+      <button data-view="assets"><span class="dot"></span>Assets</button>
+      <button data-view="liabilities"><span class="dot"></span>Liabilities</button>
+      <button data-view="clients"><span class="dot"></span>Clients</button>
+      <button data-view="invoices"><span class="dot"></span>Invoices</button>
+      <button data-view="creditnotes"><span class="dot"></span>Credit Notes</button>
+      <button data-view="payroll"><span class="dot"></span>Payroll</button>
+      <button data-view="vat"><span class="dot"></span>VAT</button>
+      <button data-view="team"><span class="dot"></span>Team</button>
     </nav>
     <button class="logout" id="logout-btn">Log out</button>
   </div>
@@ -152,6 +208,8 @@ let state = {
   clients: [],
   invoices: [],
   invoiceItems: {},   // invoiceId -> items[]
+  creditNotes: [],
+  creditNoteItems: {}, // creditNoteId -> items[]
   employees: [],
   payrollPayments: [],
   employeeTasks: [],
@@ -172,6 +230,36 @@ function toast(msg){
 function isAdmin(){
   return state.membership && (state.membership.role === 'owner' || state.membership.role === 'admin');
 }
+function isStaff(){
+  return state.membership && state.membership.role === 'staff';
+}
+function hasModule(mod){
+  const m = state.membership;
+  if(!m) return false;
+  if(m.role === 'owner' || m.role === 'admin') return true;
+  if(m.role === 'staff') return Array.isArray(m.permissions && m.permissions.modules) && m.permissions.modules.includes(mod);
+  return false;
+}
+function canApprove(){
+  const m = state.membership;
+  if(!m) return false;
+  if(m.role === 'owner' || m.role === 'admin') return true;
+  if(m.role === 'staff') return !!(m.permissions && m.permissions.can_approve);
+  return false;
+}
+function roleLabel(m){
+  if(m.role === 'owner') return 'Owner';
+  if(m.role === 'admin') return 'Management';
+  if(m.role === 'viewer') return 'Viewer';
+  if(m.role === 'staff'){
+    const mods = (m.permissions && m.permissions.modules) || [];
+    const approve = m.permissions && m.permissions.can_approve;
+    return 'Staff' + (mods.length ? ' · ' + mods.map(moduleLabel).join(', ') : '') + (approve ? ' · can approve' : '');
+  }
+  return m.role;
+}
+const MODULE_LABELS = {revenue:'Revenue', expenses:'Expenses', assets:'Assets', liabilities:'Liabilities', clients:'Clients', invoices:'Invoices', credit_notes:'Credit Notes', payroll:'Payroll'};
+function moduleLabel(k){ return MODULE_LABELS[k] || k; }
 
 /* ========================= AUTH ========================= */
 let authMode = 'login';
@@ -181,9 +269,19 @@ document.getElementById('auth-toggle-link').addEventListener('click', (e)=>{
   authMode = authMode === 'login' ? 'signup' : 'login';
   document.getElementById('signup-fields').classList.toggle('hidden', authMode === 'login');
   document.getElementById('auth-submit').textContent = authMode === 'login' ? 'Log In' : 'Sign Up';
+  document.getElementById('auth-heading').textContent = authMode === 'login' ? 'Welcome back' : 'Let\'s get set up';
+  document.getElementById('auth-tagline').textContent = authMode === 'login' ? 'Good to see you — let\'s get your numbers sorted.' : 'A couple of details and your dashboard is ready.';
   document.getElementById('auth-toggle-text').textContent = authMode === 'login' ? "Don't have an account?" : 'Already have an account?';
   document.getElementById('auth-toggle-link').textContent = authMode === 'login' ? 'Sign up' : 'Log in';
   document.getElementById('auth-error').textContent = '';
+});
+
+document.getElementById('auth-pw-toggle').addEventListener('click', ()=>{
+  const pwInput = document.getElementById('auth-password');
+  const btn = document.getElementById('auth-pw-toggle');
+  const show = pwInput.type === 'password';
+  pwInput.type = show ? 'text' : 'password';
+  btn.textContent = show ? 'HIDE' : 'SHOW';
 });
 
 document.getElementById('auth-form').addEventListener('submit', async (e)=>{
@@ -282,7 +380,7 @@ async function loadCompany(){
   state.membership = memberships[0];
   const {data: company} = await sb.from('cc_companies').select('*').eq('id', state.membership.company_id).single();
   state.company = company;
-  document.getElementById('sidebar-company-name').textContent = company.name + (isAdmin() ? '' : ' (viewer)');
+  document.getElementById('sidebar-company-name').textContent = company.name + (isAdmin() ? '' : ' (' + roleLabel(state.membership).toLowerCase() + ')');
 
   await refreshAll();
   render();
@@ -290,7 +388,7 @@ async function loadCompany(){
 
 async function refreshAll(){
   const cid = state.company.id;
-  const [members, accounts, entries, assets, liabilities, clients, invoices, employees, payments, tasks] = await Promise.all([
+  const [members, accounts, entries, assets, liabilities, clients, invoices, creditNotes, employees, payments, tasks] = await Promise.all([
     sb.from('cc_company_members').select('*').eq('company_id', cid),
     sb.from('cc_accounts').select('*').eq('company_id', cid),
     sb.from('cc_entries').select('*').eq('company_id', cid).order('entry_date', {ascending:false}),
@@ -298,6 +396,7 @@ async function refreshAll(){
     sb.from('cc_liabilities').select('*').eq('company_id', cid),
     sb.from('cc_clients').select('*').eq('company_id', cid),
     sb.from('cc_invoices').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
+    sb.from('cc_credit_notes').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
     sb.from('cc_employees').select('*').eq('company_id', cid),
     sb.from('cc_payroll_payments').select('*').eq('company_id', cid).order('pay_date', {ascending:false}),
     sb.from('cc_employee_tasks').select('*').eq('company_id', cid).order('created_at', {ascending:false})
@@ -309,6 +408,7 @@ async function refreshAll(){
   state.liabilities = liabilities.data || [];
   state.clients = clients.data || [];
   state.invoices = invoices.data || [];
+  state.creditNotes = creditNotes.data || [];
   state.employees = employees.data || [];
   state.payrollPayments = payments.data || [];
   state.employeeTasks = tasks.data || [];
@@ -333,6 +433,7 @@ function render(){
     case 'liabilities': main.innerHTML = renderLiabilities(); attachLiabilityHandlers(); break;
     case 'clients': main.innerHTML = renderClients(); attachClientHandlers(); break;
     case 'invoices': main.innerHTML = renderInvoices(); attachInvoiceHandlers(); break;
+    case 'creditnotes': main.innerHTML = renderCreditNotes(); attachCreditNoteHandlers(); break;
     case 'payroll': main.innerHTML = renderPayroll(); attachPayrollHandlers(); break;
     case 'vat': main.innerHTML = renderVat(); break;
     case 'team': main.innerHTML = renderTeam(); attachTeamHandlers(); break;
@@ -366,12 +467,12 @@ function renderDashboard(){
   const v = vatFor();
   const outstandingInvoices = state.invoices.filter(i=>i.status==='sent'||i.status==='overdue');
   return `
-    <h1>Dashboard</h1>
+    <h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-dashboard);display:inline-block;"></span>Dashboard</h1>
     <div class="grid">
-      <div class="card"><h3>Predicted Balance</h3><div class="value ${t.predictedBalance<0?'negative':'positive'}">${fmt(t.predictedBalance)}</div><div class="sub">Starting balance + revenue − expenses − payroll</div></div>
-      <div class="card"><h3>Revenue vs Expenses</h3><div class="value">${fmt(t.revenue - t.expenses)}</div><div class="sub">${fmt(t.revenue)} revenue, ${fmt(t.expenses)} expenses</div></div>
-      <div class="card"><h3>Net Worth</h3><div class="value ${t.netWorth<0?'negative':'positive'}">${fmt(t.netWorth)}</div><div class="sub">Assets + balance − liabilities</div></div>
-      <div class="card"><h3>VAT Payable (current)</h3><div class="value">${fmt(v.vatPayable)}</div><div class="sub">Collected ${fmt(v.vatCollected)} − paid ${fmt(v.vatPaid)}</div></div>
+      <div class="card" style="--accent-c:var(--c-dashboard);"><h3>Predicted Balance</h3><div class="value ${t.predictedBalance<0?'negative':'positive'}">${fmt(t.predictedBalance)}</div><div class="sub">Starting balance + revenue − expenses − payroll</div></div>
+      <div class="card" style="--accent-c:var(--c-revenue);"><h3>Revenue vs Expenses</h3><div class="value">${fmt(t.revenue - t.expenses)}</div><div class="sub">${fmt(t.revenue)} revenue, ${fmt(t.expenses)} expenses</div></div>
+      <div class="card" style="--accent-c:var(--c-assets);"><h3>Net Worth</h3><div class="value ${t.netWorth<0?'negative':'positive'}">${fmt(t.netWorth)}</div><div class="sub">Assets + balance − liabilities</div></div>
+      <div class="card" style="--accent-c:var(--c-vat);"><h3>VAT Payable (current)</h3><div class="value">${fmt(v.vatPayable)}</div><div class="sub">Collected ${fmt(v.vatCollected)} − paid ${fmt(v.vatPaid)}</div></div>
     </div>
     <div class="panel">
       <h3 style="margin-top:0;">Outstanding invoices</h3>
@@ -385,7 +486,7 @@ function renderDashboard(){
         ${state.entries.slice(0,8).map(e=>`<tr><td>${e.entry_date}</td><td>${e.type}</td><td>${e.description}</td><td>${fmt(e.amount)}</td></tr>`).join('')}
       </tbody></table>` : `<div class="empty">No entries yet.</div>`}
     </div>
-    <div class="panel">
+    <div class="panel" style="border-top:3px solid var(--c-payroll);">
       <h3 style="margin-top:0;">Payroll staff &amp; current tasks</h3>
       ${state.employees.length ? `<table><thead><tr><th>Employee</th><th>Role</th><th>Working on</th></tr></thead><tbody>
         ${state.employees.filter(e=>e.active).map(e=>{
@@ -394,7 +495,7 @@ function renderDashboard(){
         }).join('')}
       </tbody></table>` : `<div class="empty">No employees yet. Add your team under Payroll.</div>`}
     </div>
-    <div class="panel">
+    <div class="panel" style="border-top:3px solid var(--c-team);">
       <h3 style="margin-top:0;">Team (app access)</h3>
       ${state.members.length ? `<table><thead><tr><th>Email</th><th>Role</th><th>Status</th></tr></thead><tbody>
         ${state.members.map(m=>`<tr><td>${m.email}</td><td><span class="role-badge">${m.role}</span></td><td>${m.status}</td></tr>`).join('')}
@@ -411,13 +512,16 @@ function clientName(id){
 /* ========================= REVENUE / EXPENSES ========================= */
 function renderEntries(type){
   const label = type === 'revenue' ? 'Revenue' : 'Expenses';
+  const mod = type === 'revenue' ? 'revenue' : 'expenses';
+  const canEdit = hasModule(mod);
+  const accent = type === 'revenue' ? 'var(--c-revenue)' : 'var(--c-expenses)';
   const rows = state.entries.filter(e=>e.type===type);
   const total = rows.reduce((s,e)=>s+Number(e.amount),0);
   return `
-    <div class="section-header"><h1>${label}</h1>${isAdmin() ? `<button class="btn" id="add-entry-btn">+ Add ${type==='revenue'?'Revenue':'Expense'}</button>` : ''}</div>
-    <div class="grid"><div class="card"><h3>Total ${label}</h3><div class="value">${fmt(total)}</div></div></div>
+    <div class="section-header" style="--accent-c:${accent};"><h1>${label}</h1>${canEdit ? `<button class="btn" id="add-entry-btn">+ Add ${type==='revenue'?'Revenue':'Expense'}</button>` : ''}</div>
+    <div class="grid"><div class="card" style="--accent-c:${accent};"><h3>Total ${label}</h3><div class="value">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${rows.length ? `<table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Tags</th><th>VAT</th><th>Recurring</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+      ${rows.length ? `<table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Tags</th><th>VAT</th><th>Recurring</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${rows.map(e=>`<tr>
           <td>${e.entry_date}</td>
           <td>${e.description}</td>
@@ -425,11 +529,11 @@ function renderEntries(type){
           <td>${(e.tags||[]).map(t=>`<span class="tag-pill">${t}</span>`).join('')}</td>
           <td>${e.vat_applicable?'Yes':'No'}</td>
           <td>${e.is_recurring ? (e.recurrence_frequency||'yes') : '—'}</td>
-          ${isAdmin()?`<td><button class="btn small danger" data-del-entry="${e.id}">Delete</button></td>`:''}
+          ${canEdit?`<td><button class="btn small danger" data-del-entry="${e.id}">Delete</button></td>`:''}
         </tr>`).join('')}
       </tbody></table>` : `<div class="empty">No ${label.toLowerCase()} recorded yet.</div>`}
     </div>
-    ${isAdmin() ? entryModal(type) : ''}
+    ${canEdit ? entryModal(type) : ''}
   `;
 }
 
@@ -508,16 +612,17 @@ function attachEntryHandlers(type){
 
 /* ========================= ASSETS ========================= */
 function renderAssets(){
+  const canEdit = hasModule('assets');
   const total = state.assets.reduce((s,a)=>s+Number(a.value),0);
   return `
-    <div class="section-header"><h1>Assets</h1>${isAdmin() ? `<button class="btn" id="add-asset-btn">+ Add Asset</button>` : ''}</div>
-    <div class="grid"><div class="card"><h3>Total Assets</h3><div class="value">${fmt(total)}</div></div></div>
+    <div class="section-header" style="--accent-c:var(--c-assets);"><h1>Assets</h1>${canEdit ? `<button class="btn" id="add-asset-btn">+ Add Asset</button>` : ''}</div>
+    <div class="grid"><div class="card" style="--accent-c:var(--c-assets);"><h3>Total Assets</h3><div class="value">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
-        ${state.assets.map(a=>`<tr><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td>${isAdmin()?`<td><button class="btn small danger" data-del-asset="${a.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.assets.map(a=>`<tr><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td>${canEdit?`<td><button class="btn small danger" data-del-asset="${a.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No assets recorded yet.</div>`}
     </div>
-    ${isAdmin() ? `
+    ${canEdit ? `
     <div class="modal-backdrop hidden" id="asset-modal-backdrop"><div class="modal">
       <button class="close-x" id="asset-modal-close">✕</button>
       <h2>Add Asset</h2>
@@ -557,16 +662,17 @@ function attachAssetHandlers(){
 
 /* ========================= LIABILITIES ========================= */
 function renderLiabilities(){
+  const canEdit = hasModule('liabilities');
   const total = state.liabilities.reduce((s,l)=>s+Number(l.amount),0);
   return `
-    <div class="section-header"><h1>Liabilities</h1>${isAdmin() ? `<button class="btn" id="add-liability-btn">+ Add Liability</button>` : ''}</div>
-    <div class="grid"><div class="card"><h3>Total Liabilities</h3><div class="value negative">${fmt(total)}</div></div></div>
+    <div class="section-header" style="--accent-c:var(--c-liabilities);"><h1>Liabilities</h1>${canEdit ? `<button class="btn" id="add-liability-btn">+ Add Liability</button>` : ''}</div>
+    <div class="grid"><div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Liabilities</h3><div class="value negative">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${state.liabilities.length ? `<table><thead><tr><th>Description</th><th>Type</th><th>Amount</th><th>Rate</th><th>Term</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
-        ${state.liabilities.map(l=>`<tr><td>${l.description}</td><td>${l.type}</td><td>${fmt(l.amount)}</td><td>${l.interest_rate?l.interest_rate+'%':'—'}</td><td>${l.term_months?l.term_months+' mo':'—'}</td>${isAdmin()?`<td><button class="btn small danger" data-del-liability="${l.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.liabilities.length ? `<table><thead><tr><th>Description</th><th>Type</th><th>Amount</th><th>Rate</th><th>Term</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.liabilities.map(l=>`<tr><td>${l.description}</td><td>${l.type}</td><td>${fmt(l.amount)}</td><td>${l.interest_rate?l.interest_rate+'%':'—'}</td><td>${l.term_months?l.term_months+' mo':'—'}</td>${canEdit?`<td><button class="btn small danger" data-del-liability="${l.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No liabilities recorded yet.</div>`}
     </div>
-    ${isAdmin() ? `
+    ${canEdit ? `
     <div class="modal-backdrop hidden" id="liability-modal-backdrop"><div class="modal">
       <button class="close-x" id="liability-modal-close">✕</button>
       <h2>Add Liability</h2>
@@ -612,14 +718,15 @@ function attachLiabilityHandlers(){
 
 /* ========================= CLIENTS ========================= */
 function renderClients(){
+  const canEdit = hasModule('clients');
   return `
-    <div class="section-header"><h1>Clients</h1>${isAdmin() ? `<button class="btn" id="add-client-btn">+ Add Client</button>` : ''}</div>
+    <div class="section-header" style="--accent-c:var(--c-clients);"><h1>Clients</h1>${canEdit ? `<button class="btn" id="add-client-btn">+ Add Client</button>` : ''}</div>
     <div class="panel">
-      ${state.clients.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
-        ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td>${isAdmin()?`<td><button class="btn small danger" data-del-client="${c.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.clients.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td>${canEdit?`<td><button class="btn small danger" data-del-client="${c.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No clients yet.</div>`}
     </div>
-    ${isAdmin() ? `
+    ${canEdit ? `
     <div class="modal-backdrop hidden" id="client-modal-backdrop"><div class="modal">
       <button class="close-x" id="client-modal-close">✕</button>
       <h2>Add Client</h2>
@@ -670,23 +777,35 @@ function nextInvoiceNumber(){
   return `INV-${year}-${String(next).padStart(3,'0')}`;
 }
 
+function canManageDoc(doc){
+  return canApprove() || (doc.created_by === state.user.id && doc.approval_status === 'pending');
+}
+function approvalPill(doc){
+  if(doc.approval_status === 'pending') return `<span class="status-pill status-pending">pending approval</span>`;
+  if(doc.approval_status === 'rejected') return `<span class="status-pill status-rejected">rejected</span>`;
+  return '';
+}
 function renderInvoices(){
+  const canCreate = hasModule('invoices');
+  const pendingCount = state.invoices.filter(i=>i.approval_status==='pending').length;
   return `
-    <div class="section-header"><h1>Invoices</h1>${isAdmin() ? `<button class="btn" id="add-invoice-btn">+ New Invoice</button>` : ''}</div>
+    <div class="section-header" style="--accent-c:var(--c-invoices);"><h1>Invoices</h1>${canCreate ? `<button class="btn" id="add-invoice-btn">+ New Invoice</button>` : ''}</div>
+    ${pendingCount ? `<div class="panel" style="border-top:3px solid var(--warn);"><h3 style="margin-top:0;color:var(--warn);">Pending approval (${pendingCount})</h3><p style="color:var(--muted);font-size:.85rem;margin-bottom:0;">${canApprove() ? 'Open one below to approve or reject it.' : 'Waiting on management or an approver to review.'}</p></div>` : ''}
     <div class="panel">
-      ${state.invoices.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Due</th><th>Status</th><th>Total</th><th></th></tr></thead><tbody>
+      ${state.invoices.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Due</th><th>Status</th><th>Approval</th><th>Total</th><th></th></tr></thead><tbody>
         ${state.invoices.map(i=>`<tr>
           <td>${i.invoice_number}</td><td>${clientName(i.client_id)}</td><td>${i.issue_date}</td><td>${i.due_date||'—'}</td>
           <td><span class="status-pill status-${i.status}">${i.status}</span></td>
+          <td>${approvalPill(i)}</td>
           <td id="inv-total-${i.id}">…</td>
           <td>
             <button class="btn small secondary" data-view-invoice="${i.id}">View</button>
-            ${isAdmin()?`<button class="btn small danger" data-del-invoice="${i.id}">Delete</button>`:''}
+            ${canManageDoc(i)?`<button class="btn small danger" data-del-invoice="${i.id}">Delete</button>`:''}
           </td>
         </tr>`).join('')}
       </tbody></table>` : `<div class="empty">No invoices yet.</div>`}
     </div>
-    ${isAdmin() ? invoiceModal() : ''}
+    ${canCreate ? invoiceModal() : ''}
     <div class="modal-backdrop hidden" id="invoice-view-backdrop"><div class="modal" id="invoice-view-content"></div></div>
   `;
 }
@@ -751,6 +870,7 @@ function attachInvoiceHandlers(){
     e.preventDefault();
     const clientId = document.getElementById('invoice-client').value;
     if(!clientId){ toast('Add a client first.'); return; }
+    const approvalStatus = canApprove() ? 'approved' : 'pending';
     const {data: invoice, error} = await sb.from('cc_invoices').insert({
       company_id: state.company.id,
       client_id: clientId,
@@ -758,7 +878,9 @@ function attachInvoiceHandlers(){
       issue_date: document.getElementById('invoice-issue-date').value,
       due_date: document.getElementById('invoice-due-date').value || null,
       status: 'draft',
-      notes: document.getElementById('invoice-notes').value.trim() || null
+      notes: document.getElementById('invoice-notes').value.trim() || null,
+      created_by: state.user.id,
+      approval_status: approvalStatus
     }).select().single();
     if(error){ toast(error.message); return; }
     const rows = [...document.querySelectorAll('#invoice-items-body tr')].map(tr=>({
@@ -769,12 +891,14 @@ function attachInvoiceHandlers(){
       vat_applicable: tr.querySelector('.ii-vat').checked
     })).filter(r=>r.description);
     if(rows.length) await sb.from('cc_invoice_items').insert(rows);
-    await refreshAll(); render(); toast('Invoice created.');
+    await refreshAll(); render();
+    toast(approvalStatus === 'pending' ? 'Invoice submitted for approval.' : 'Invoice created.');
   });
   document.querySelectorAll('[data-del-invoice]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this invoice?')) return;
-      await sb.from('cc_invoices').delete().eq('id', btn.dataset.delInvoice);
+      const {error} = await sb.from('cc_invoices').delete().eq('id', btn.dataset.delInvoice);
+      if(error){ toast(error.message); return; }
       await refreshAll(); render();
     });
   });
@@ -801,7 +925,7 @@ async function openInvoiceView(invoiceId){
   const backdrop = document.getElementById('invoice-view-backdrop');
   document.getElementById('invoice-view-content').innerHTML = `
     <button class="close-x" id="invoice-view-close">✕</button>
-    <h2>${inv.invoice_number}</h2>
+    <h2>${inv.invoice_number} ${approvalPill(inv)}</h2>
     <p style="color:var(--muted);margin-top:-8px;">${state.company.name}${state.company.vat_number?' · VAT '+state.company.vat_number:''}</p>
     <p><strong>Bill to:</strong> ${client ? client.name : '—'}${client && client.email ? ' ('+client.email+')' : ''}</p>
     <p style="font-size:.85rem;color:var(--muted);">Issued ${inv.issue_date}${inv.due_date?' · Due '+inv.due_date:''}</p>
@@ -814,7 +938,14 @@ async function openInvoiceView(invoiceId){
       <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmt(total)}</div>
     </div>
     ${inv.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${inv.notes}</p>` : ''}
-    ${isAdmin() ? `
+    ${inv.approval_status === 'rejected' && inv.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${inv.rejection_note}</p>` : ''}
+    ${(inv.approval_status === 'pending' && canApprove()) ? `
+    <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
+      <span style="font-size:.8rem;color:var(--muted);align-self:center;">This invoice needs approval:</span>
+      <button class="btn small" data-approve-doc="invoice">Approve</button>
+      <button class="btn small danger" data-reject-doc="invoice">Reject</button>
+    </div>` : ''}
+    ${(canApprove() && inv.approval_status !== 'pending') ? `
     <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
       <span style="font-size:.8rem;color:var(--muted);align-self:center;">Mark as:</span>
       <button class="btn small secondary" data-set-status="draft">Draft</button>
@@ -828,32 +959,250 @@ async function openInvoiceView(invoiceId){
   document.getElementById('invoice-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.querySelectorAll('[data-set-status]').forEach(b=>{
     b.addEventListener('click', async ()=>{
-      await sb.from('cc_invoices').update({status:b.dataset.setStatus}).eq('id', inv.id);
+      const {error} = await sb.from('cc_invoices').update({status:b.dataset.setStatus}).eq('id', inv.id);
+      if(error){ toast(error.message); return; }
       backdrop.classList.add('hidden');
       await refreshAll(); render();
       toast('Invoice updated.');
     });
   });
+  document.querySelector('[data-approve-doc]')?.addEventListener('click', async ()=>{
+    const {error} = await sb.from('cc_invoices').update({approval_status:'approved', approved_by: state.user.id, approved_at: new Date().toISOString()}).eq('id', inv.id);
+    if(error){ toast(error.message); return; }
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Invoice approved.');
+  });
+  document.querySelector('[data-reject-doc]')?.addEventListener('click', async ()=>{
+    const note = prompt('Reason for rejecting this invoice (optional):') || null;
+    const {error} = await sb.from('cc_invoices').update({approval_status:'rejected', approved_by: state.user.id, approved_at: new Date().toISOString(), rejection_note: note}).eq('id', inv.id);
+    if(error){ toast(error.message); return; }
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Invoice rejected.');
+  });
+}
+
+
+/* ========================= CREDIT NOTES ========================= */
+function nextCreditNoteNumber(){
+  const year = new Date().getFullYear();
+  const nums = state.creditNotes
+    .map(n=>n.credit_note_number)
+    .filter(n=>n && n.startsWith('CN-'+year))
+    .map(n=>parseInt(n.split('-').pop())||0);
+  const next = (nums.length ? Math.max(...nums) : 0) + 1;
+  return `CN-${year}-${String(next).padStart(3,'0')}`;
+}
+
+function renderCreditNotes(){
+  const canCreate = hasModule('credit_notes');
+  const pendingCount = state.creditNotes.filter(n=>n.approval_status==='pending').length;
+  return `
+    <div class="section-header" style="--accent-c:var(--c-creditnotes);"><h1>Credit Notes</h1>${canCreate ? `<button class="btn" id="add-creditnote-btn">+ New Credit Note</button>` : ''}</div>
+    ${pendingCount ? `<div class="panel" style="border-top:3px solid var(--warn);"><h3 style="margin-top:0;color:var(--warn);">Pending approval (${pendingCount})</h3><p style="color:var(--muted);font-size:.85rem;margin-bottom:0;">${canApprove() ? 'Open one below to approve or reject it.' : 'Waiting on management or an approver to review.'}</p></div>` : ''}
+    <div class="panel">
+      ${state.creditNotes.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Against</th><th>Status</th><th>Approval</th><th>Total</th><th></th></tr></thead><tbody>
+        ${state.creditNotes.map(n=>`<tr>
+          <td>${n.credit_note_number}</td><td>${clientName(n.client_id)}</td><td>${n.issue_date}</td>
+          <td>${n.invoice_id ? (state.invoices.find(i=>i.id===n.invoice_id)?.invoice_number || '—') : '—'}</td>
+          <td><span class="status-pill status-${n.status==='issued'?'issued':'draft'}">${n.status}</span></td>
+          <td>${approvalPill(n)}</td>
+          <td id="cn-total-${n.id}">…</td>
+          <td>
+            <button class="btn small secondary" data-view-creditnote="${n.id}">View</button>
+            ${canManageDoc(n)?`<button class="btn small danger" data-del-creditnote="${n.id}">Delete</button>`:''}
+          </td>
+        </tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No credit notes yet.</div>`}
+    </div>
+    ${canCreate ? creditNoteModal() : ''}
+    <div class="modal-backdrop hidden" id="creditnote-view-backdrop"><div class="modal" id="creditnote-view-content"></div></div>
+  `;
+}
+
+function creditNoteModal(){
+  return `
+  <div class="modal-backdrop hidden" id="creditnote-modal-backdrop">
+    <div class="modal" style="max-width:600px;">
+      <button class="close-x" id="creditnote-modal-close">✕</button>
+      <h2>New Credit Note</h2>
+      <form id="creditnote-form">
+        <div class="row">
+          <div class="field"><label>Credit note #</label><input type="text" id="creditnote-number" required></div>
+          <div class="field"><label>Client</label><select id="creditnote-client">${state.clients.map(c=>`<option value="${c.id}">${c.name}</option>`).join('') || '<option value="">Add a client first</option>'}</select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Issue date</label><input type="date" id="creditnote-issue-date" required></div>
+          <div class="field"><label>Against invoice (optional)</label><select id="creditnote-invoice"><option value="">—</option>${state.invoices.map(i=>`<option value="${i.id}">${i.invoice_number}</option>`).join('')}</select></div>
+        </div>
+        <div class="field"><label>Reason</label><input type="text" id="creditnote-reason" placeholder="e.g. returned goods, billing correction"></div>
+        <h3 style="margin-bottom:6px;">Line items</h3>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:70px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+          <tbody id="creditnote-items-body"></tbody>
+        </table>
+        <button type="button" class="btn secondary small" id="creditnote-add-item" style="margin-top:8px;">+ Add line</button>
+        <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="creditnote-notes" rows="2"></textarea></div>
+        <div class="modal-actions">
+          <button type="button" class="btn secondary" id="creditnote-cancel">Cancel</button>
+          <button type="submit" class="btn">Save Credit Note</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+
+function attachCreditNoteHandlers(){
+  const backdrop = document.getElementById('creditnote-modal-backdrop');
+  document.getElementById('add-creditnote-btn')?.addEventListener('click', ()=>{
+    document.getElementById('creditnote-number').value = nextCreditNoteNumber();
+    document.getElementById('creditnote-issue-date').value = new Date().toISOString().slice(0,10);
+    document.getElementById('creditnote-items-body').innerHTML = invoiceItemRow();
+    backdrop.classList.remove('hidden');
+  });
+  document.getElementById('creditnote-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('creditnote-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('creditnote-add-item')?.addEventListener('click', ()=>{
+    document.getElementById('creditnote-items-body').insertAdjacentHTML('beforeend', invoiceItemRow());
+  });
+  document.getElementById('creditnote-items-body')?.addEventListener('click', (e)=>{
+    if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
+  });
+  document.getElementById('creditnote-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const clientId = document.getElementById('creditnote-client').value;
+    if(!clientId){ toast('Add a client first.'); return; }
+    const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const {data: note, error} = await sb.from('cc_credit_notes').insert({
+      company_id: state.company.id,
+      client_id: clientId,
+      invoice_id: document.getElementById('creditnote-invoice').value || null,
+      credit_note_number: document.getElementById('creditnote-number').value.trim(),
+      issue_date: document.getElementById('creditnote-issue-date').value,
+      reason: document.getElementById('creditnote-reason').value.trim() || null,
+      status: 'draft',
+      notes: document.getElementById('creditnote-notes').value.trim() || null,
+      created_by: state.user.id,
+      approval_status: approvalStatus
+    }).select().single();
+    if(error){ toast(error.message); return; }
+    const rows = [...document.querySelectorAll('#creditnote-items-body tr')].map(tr=>({
+      credit_note_id: note.id,
+      description: tr.querySelector('.ii-desc').value.trim(),
+      quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
+      unit_price: parseFloat(tr.querySelector('.ii-price').value)||0,
+      vat_applicable: tr.querySelector('.ii-vat').checked
+    })).filter(r=>r.description);
+    if(rows.length) await sb.from('cc_credit_note_items').insert(rows);
+    await refreshAll(); render();
+    toast(approvalStatus === 'pending' ? 'Credit note submitted for approval.' : 'Credit note created.');
+  });
+  document.querySelectorAll('[data-del-creditnote]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this credit note?')) return;
+      const {error} = await sb.from('cc_credit_notes').delete().eq('id', btn.dataset.delCreditnote);
+      if(error){ toast(error.message); return; }
+      await refreshAll(); render();
+    });
+  });
+  document.querySelectorAll('[data-view-creditnote]').forEach(btn=>{
+    btn.addEventListener('click', ()=>openCreditNoteView(btn.dataset.viewCreditnote));
+  });
+  state.creditNotes.forEach(async (note)=>{
+    const {data: items} = await sb.from('cc_credit_note_items').select('*').eq('credit_note_id', note.id);
+    state.creditNoteItems[note.id] = items || [];
+    const total = (items||[]).reduce((s,it)=>s+it.quantity*it.unit_price,0);
+    const el = document.getElementById('cn-total-'+note.id);
+    if(el) el.textContent = fmt(total);
+  });
+}
+
+async function openCreditNoteView(noteId){
+  const note = state.creditNotes.find(n=>n.id===noteId);
+  const {data: items} = await sb.from('cc_credit_note_items').select('*').eq('credit_note_id', noteId);
+  const client = state.clients.find(c=>c.id===note.client_id);
+  const linkedInvoice = note.invoice_id ? state.invoices.find(i=>i.id===note.invoice_id) : null;
+  const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
+  const vatTotal = items.reduce((s,it)=> s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
+  const total = items.reduce((s,it)=>s+it.quantity*it.unit_price,0);
+  const backdrop = document.getElementById('creditnote-view-backdrop');
+  document.getElementById('creditnote-view-content').innerHTML = `
+    <button class="close-x" id="creditnote-view-close">✕</button>
+    <h2>${note.credit_note_number} ${approvalPill(note)}</h2>
+    <p style="color:var(--muted);margin-top:-8px;">${state.company.name}${state.company.vat_number?' · VAT '+state.company.vat_number:''}</p>
+    <p><strong>Client:</strong> ${client ? client.name : '—'}${client && client.email ? ' ('+client.email+')' : ''}</p>
+    <p style="font-size:.85rem;color:var(--muted);">Issued ${note.issue_date}${linkedInvoice ? ' · Against '+linkedInvoice.invoice_number : ''}${note.reason ? ' · '+note.reason : ''}</p>
+    <table><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr></thead><tbody>
+      ${items.map(it=>`<tr><td>${it.description}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
+    </tbody></table>
+    <div style="text-align:right;margin-top:10px;font-size:.9rem;">
+      <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
+      <div>VAT (15%): ${fmt(vatTotal)}</div>
+      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmt(total)}</div>
+    </div>
+    ${note.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${note.notes}</p>` : ''}
+    ${note.approval_status === 'rejected' && note.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${note.rejection_note}</p>` : ''}
+    ${(note.approval_status === 'pending' && canApprove()) ? `
+    <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
+      <span style="font-size:.8rem;color:var(--muted);align-self:center;">This credit note needs approval:</span>
+      <button class="btn small" data-approve-doc="creditnote">Approve</button>
+      <button class="btn small danger" data-reject-doc="creditnote">Reject</button>
+    </div>` : ''}
+    ${(canApprove() && note.approval_status !== 'pending') ? `
+    <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
+      <span style="font-size:.8rem;color:var(--muted);align-self:center;">Mark as:</span>
+      <button class="btn small secondary" data-set-cn-status="draft">Draft</button>
+      <button class="btn small secondary" data-set-cn-status="issued">Issued</button>
+    </div>` : ''}
+    <div class="modal-actions"><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
+  `;
+  backdrop.classList.remove('hidden');
+  document.getElementById('creditnote-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.querySelectorAll('[data-set-cn-status]').forEach(b=>{
+    b.addEventListener('click', async ()=>{
+      const {error} = await sb.from('cc_credit_notes').update({status:b.dataset.setCnStatus}).eq('id', note.id);
+      if(error){ toast(error.message); return; }
+      backdrop.classList.add('hidden');
+      await refreshAll(); render();
+      toast('Credit note updated.');
+    });
+  });
+  document.querySelector('[data-approve-doc="creditnote"]')?.addEventListener('click', async ()=>{
+    const {error} = await sb.from('cc_credit_notes').update({approval_status:'approved', approved_by: state.user.id, approved_at: new Date().toISOString()}).eq('id', note.id);
+    if(error){ toast(error.message); return; }
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Credit note approved.');
+  });
+  document.querySelector('[data-reject-doc="creditnote"]')?.addEventListener('click', async ()=>{
+    const rNote = prompt('Reason for rejecting this credit note (optional):') || null;
+    const {error} = await sb.from('cc_credit_notes').update({approval_status:'rejected', approved_by: state.user.id, approved_at: new Date().toISOString(), rejection_note: rNote}).eq('id', note.id);
+    if(error){ toast(error.message); return; }
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Credit note rejected.');
+  });
 }
 
 /* ========================= PAYROLL ========================= */
 function renderPayroll(){
+  const canEdit = hasModule('payroll');
   const totalPayroll = state.employees.filter(e=>e.active).reduce((s,e)=>s+Number(e.salary),0);
   return `
-    <div class="section-header"><h1>Payroll</h1>${isAdmin() ? `<button class="btn" id="add-employee-btn">+ Add Employee</button>` : ''}</div>
-    <div class="grid"><div class="card"><h3>Monthly Payroll (active)</h3><div class="value">${fmt(totalPayroll)}</div></div></div>
+    <div class="section-header" style="--accent-c:var(--c-payroll);"><h1>Payroll</h1>${canEdit ? `<button class="btn" id="add-employee-btn">+ Add Employee</button>` : ''}</div>
+    <div class="grid"><div class="card" style="--accent-c:var(--c-payroll);"><h3>Monthly Payroll (active)</h3><div class="value">${fmt(totalPayroll)}</div></div></div>
     <div class="panel">
       <h3 style="margin-top:0;">Employees</h3>
-      ${state.employees.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Salary</th><th>Frequency</th><th>Active</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+      ${state.employees.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Salary</th><th>Frequency</th><th>Active</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${state.employees.map(e=>`<tr><td>${e.name}</td><td>${e.role_title||'—'}</td><td>${fmt(e.salary)}</td><td>${e.pay_frequency}</td><td>${e.active?'Yes':'No'}</td>
-        ${isAdmin()?`<td><button class="btn small secondary" data-pay-employee="${e.id}">Record Payment</button> <button class="btn small secondary" data-task-employee="${e.id}">Assign Task</button> <button class="btn small danger" data-del-employee="${e.id}">Delete</button></td>`:''}</tr>`).join('')}
+        ${canEdit?`<td><button class="btn small secondary" data-pay-employee="${e.id}">Record Payment</button> <button class="btn small secondary" data-task-employee="${e.id}">Assign Task</button> <button class="btn small danger" data-del-employee="${e.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No employees yet.</div>`}
     </div>
     <div class="panel">
       <h3 style="margin-top:0;">Tasks</h3>
-      ${state.employeeTasks.length ? `<table><thead><tr><th>Employee</th><th>Task</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+      ${state.employeeTasks.length ? `<table><thead><tr><th>Employee</th><th>Task</th><th>Status</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${state.employeeTasks.map(t=>`<tr><td>${state.employees.find(e=>e.id===t.employee_id)?.name||'—'}</td><td>${t.description}</td><td><span class="status-pill status-${t.status==='done'?'paid':(t.status==='in_progress'?'sent':'draft')}">${t.status.replace('_',' ')}</span></td>
-        ${isAdmin()?`<td>
+        ${canEdit?`<td>
           ${t.status!=='done'?`<button class="btn small secondary" data-complete-task="${t.id}">Mark Done</button>`:''}
           <button class="btn small danger" data-del-task="${t.id}">Delete</button>
         </td>`:''}</tr>`).join('')}
@@ -865,7 +1214,7 @@ function renderPayroll(){
         ${state.payrollPayments.slice(0,10).map(p=>`<tr><td>${p.pay_date}</td><td>${state.employees.find(e=>e.id===p.employee_id)?.name||'—'}</td><td>${fmt(p.gross)}</td><td>${fmt(p.deductions)}</td><td>${fmt(p.net)}</td><td>${p.paid?'Yes':'No'}</td></tr>`).join('')}
       </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
     </div>
-    ${isAdmin() ? `
+    ${canEdit ? `
     <div class="modal-backdrop hidden" id="employee-modal-backdrop"><div class="modal">
       <button class="close-x" id="employee-modal-close">✕</button>
       <h2>Add Employee</h2>
@@ -994,9 +1343,9 @@ function attachPayrollHandlers(){
 function renderVat(){
   const v = vatFor();
   return `
-    <h1>VAT</h1>
+    <h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-vat);display:inline-block;"></span>VAT</h1>
     <div class="grid">
-      <div class="card"><h3>VAT Collected</h3><div class="value">${fmt(v.vatCollected)}</div><div class="sub">From revenue marked VAT-inclusive</div></div>
+      <div class="card" style="--accent-c:var(--c-vat);"><h3>VAT Collected</h3><div class="value">${fmt(v.vatCollected)}</div><div class="sub">From revenue marked VAT-inclusive</div></div>
       <div class="card"><h3>VAT Paid</h3><div class="value">${fmt(v.vatPaid)}</div><div class="sub">From expenses marked VAT-inclusive</div></div>
       <div class="card"><h3>VAT Payable</h3><div class="value ${v.vatPayable<0?'negative':''}">${fmt(v.vatPayable)}</div><div class="sub">Collected − paid. Negative = refund due to you.</div></div>
     </div>
@@ -1010,12 +1359,13 @@ function renderVat(){
 /* ========================= TEAM ========================= */
 function renderTeam(){
   return `
-    <div class="section-header"><h1>Team</h1>${isAdmin() ? `<button class="btn" id="add-member-btn">+ Invite Member</button>` : ''}</div>
+    <div class="section-header" style="--accent-c:var(--c-team);"><h1>Team</h1>${isAdmin() ? `<button class="btn" id="add-member-btn">+ Invite Member</button>` : ''}</div>
+    <p style="color:var(--muted);font-size:.85rem;margin-top:-10px;">Management (owner/admin) has full access everywhere. Staff members only see and edit the modules you grant them below; invoices and credit notes they create wait for approval unless they're also marked as an approver.</p>
     <div class="panel">
       <h3 style="margin-top:0;">App access</h3>
-      <table><thead><tr><th>Email</th><th>Role</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
-        ${state.members.map(m=>`<tr><td>${m.email}</td><td><span class="role-badge">${m.role}</span></td><td>${m.status}</td>
-        ${isAdmin() && m.role!=='owner' ? `<td><button class="btn small danger" data-del-member="${m.id}">Remove</button></td>` : (isAdmin()?'<td></td>':'')}</tr>`).join('')}
+      <table><thead><tr><th>Email</th><th>Role &amp; permissions</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+        ${state.members.map(m=>`<tr><td>${m.email}</td><td><span class="role-badge">${roleLabel(m)}</span></td><td>${m.status}</td>
+        ${isAdmin() && m.role!=='owner' ? `<td><button class="btn small secondary" data-edit-member="${m.id}">Manage</button> <button class="btn small danger" data-del-member="${m.id}">Remove</button></td>` : (isAdmin()?'<td></td>':'')}</tr>`).join('')}
       </tbody></table>
     </div>
     <div class="panel">
@@ -1031,31 +1381,104 @@ function renderTeam(){
     ${isAdmin() ? `
     <div class="modal-backdrop hidden" id="member-modal-backdrop"><div class="modal">
       <button class="close-x" id="member-modal-close">✕</button>
-      <h2>Invite Member</h2>
-      <p style="font-size:.8rem;color:var(--muted);">Enter the email they'll sign up (or already have an account) with. They'll get access automatically next time they log in.</p>
+      <h2 id="member-modal-title">Invite Member</h2>
+      <p style="font-size:.8rem;color:var(--muted);" id="member-modal-hint">Enter the email they'll sign up (or already have an account) with. They'll get access automatically next time they log in.</p>
       <form id="member-form">
+        <input type="hidden" id="member-edit-id">
         <div class="field"><label>Email</label><input type="email" id="member-email" required></div>
-        <div class="field"><label>Role</label><select id="member-role"><option value="viewer">Viewer (read-only)</option><option value="admin">Admin (full access)</option></select></div>
-        <div class="modal-actions"><button type="button" class="btn secondary" id="member-cancel">Cancel</button><button type="submit" class="btn">Invite</button></div>
+        <div class="field"><label>Role</label><select id="member-role">
+          <option value="staff">Staff (limited access)</option>
+          <option value="viewer">Viewer (read-only)</option>
+          <option value="admin">Management (full access)</option>
+        </select></div>
+        <div class="field hidden" id="member-permissions-field">
+          <label>Modules this staff member can add &amp; edit</label>
+          <div class="perm-box">
+            <label><input type="checkbox" class="member-module" value="revenue"> Revenue</label>
+          <label><input type="checkbox" class="member-module" value="expenses"> Expenses</label>
+          <label><input type="checkbox" class="member-module" value="assets"> Assets</label>
+          <label><input type="checkbox" class="member-module" value="liabilities"> Liabilities</label>
+          <label><input type="checkbox" class="member-module" value="clients"> Clients</label>
+          <label><input type="checkbox" class="member-module" value="invoices"> Invoices</label>
+          <label><input type="checkbox" class="member-module" value="credit_notes"> Credit Notes</label>
+          <label><input type="checkbox" class="member-module" value="payroll"> Payroll</label>
+            <hr>
+            <label><input type="checkbox" id="member-can-approve"> Can approve invoices &amp; credit notes (e.g. an accountant)</label>
+          </div>
+        </div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="member-cancel">Cancel</button><button type="submit" class="btn" id="member-submit">Invite</button></div>
       </form>
     </div></div>` : ''}
   `;
 }
+function toggleMemberPermFields(){
+  const isStaffRole = document.getElementById('member-role').value === 'staff';
+  document.getElementById('member-permissions-field').classList.toggle('hidden', !isStaffRole);
+}
+function resetMemberForm(){
+  document.getElementById('member-edit-id').value = '';
+  document.getElementById('member-email').value = '';
+  document.getElementById('member-email').disabled = false;
+  document.getElementById('member-role').value = 'staff';
+  document.querySelectorAll('.member-module').forEach(cb=>cb.checked=false);
+  document.getElementById('member-can-approve').checked = false;
+  document.getElementById('member-modal-title').textContent = 'Invite Member';
+  document.getElementById('member-modal-hint').textContent = "Enter the email they'll sign up (or already have an account) with. They'll get access automatically next time they log in.";
+  document.getElementById('member-submit').textContent = 'Invite';
+  toggleMemberPermFields();
+}
 function attachTeamHandlers(){
   const backdrop = document.getElementById('member-modal-backdrop');
-  document.getElementById('add-member-btn')?.addEventListener('click', ()=>backdrop.classList.remove('hidden'));
+  document.getElementById('add-member-btn')?.addEventListener('click', ()=>{
+    resetMemberForm();
+    backdrop.classList.remove('hidden');
+  });
   document.getElementById('member-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('member-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('member-role')?.addEventListener('change', toggleMemberPermFields);
+  document.querySelectorAll('[data-edit-member]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const m = state.members.find(x=>x.id===btn.dataset.editMember);
+      if(!m) return;
+      resetMemberForm();
+      document.getElementById('member-edit-id').value = m.id;
+      document.getElementById('member-email').value = m.email;
+      document.getElementById('member-email').disabled = true;
+      document.getElementById('member-role').value = m.role;
+      const mods = (m.permissions && m.permissions.modules) || [];
+      document.querySelectorAll('.member-module').forEach(cb=>{ cb.checked = mods.includes(cb.value); });
+      document.getElementById('member-can-approve').checked = !!(m.permissions && m.permissions.can_approve);
+      document.getElementById('member-modal-title').textContent = 'Manage ' + m.email;
+      document.getElementById('member-modal-hint').textContent = "Update this member's role and, if they're staff, which modules they can access.";
+      document.getElementById('member-submit').textContent = 'Save Changes';
+      toggleMemberPermFields();
+      backdrop.classList.remove('hidden');
+    });
+  });
   document.getElementById('member-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
-    const {error} = await sb.from('cc_company_members').insert({
-      company_id: state.company.id,
-      email: document.getElementById('member-email').value.trim().toLowerCase(),
-      role: document.getElementById('member-role').value,
-      status: 'pending'
-    });
-    if(error){ toast(error.message); return; }
-    await refreshAll(); render(); toast('Invited.');
+    const role = document.getElementById('member-role').value;
+    const editId = document.getElementById('member-edit-id').value;
+    let permissions = {};
+    if(role === 'staff'){
+      const modules = [...document.querySelectorAll('.member-module:checked')].map(cb=>cb.value);
+      permissions = { modules, can_approve: document.getElementById('member-can-approve').checked };
+    }
+    if(editId){
+      const {error} = await sb.from('cc_company_members').update({ role, permissions }).eq('id', editId);
+      if(error){ toast(error.message); return; }
+      await refreshAll(); render(); toast('Member updated.');
+    } else {
+      const {error} = await sb.from('cc_company_members').insert({
+        company_id: state.company.id,
+        email: document.getElementById('member-email').value.trim().toLowerCase(),
+        role, permissions,
+        status: 'pending'
+      });
+      if(error){ toast(error.message); return; }
+      await refreshAll(); render(); toast('Invited.');
+    }
+    document.getElementById('member-modal-backdrop').classList.add('hidden');
   });
   document.querySelectorAll('[data-del-member]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{

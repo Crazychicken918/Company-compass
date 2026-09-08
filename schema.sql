@@ -1,6 +1,8 @@
 -- Company Compass schema
 -- Run this in the Supabase SQL Editor for the Company Compass project.
 -- Prefix: cc_
+-- Includes: RBAC (owner/admin/viewer/staff with per-module permissions),
+-- invoice + credit note approval workflow, Credit Notes module.
 
 -- ============ COMPANIES & MEMBERSHIP ============
 
@@ -18,8 +20,10 @@ create table if not exists cc_company_members (
   company_id uuid not null references cc_companies(id) on delete cascade,
   user_id uuid references auth.users(id) on delete cascade,
   email text not null,
-  role text not null default 'viewer' check (role in ('owner','admin','viewer')),
+  role text not null default 'viewer' check (role in ('owner','admin','viewer','staff')),
   status text not null default 'active' check (status in ('pending','active')),
+  -- permissions shape for role='staff': { "modules": ["invoices","credit_notes"], "can_approve": false }
+  permissions jsonb not null default '{}'::jsonb,
   invited_at timestamptz default now()
 );
 
@@ -102,12 +106,46 @@ create table if not exists cc_invoices (
   due_date date,
   status text not null default 'draft' check (status in ('draft','sent','paid','overdue')),
   notes text,
+  created_by uuid references auth.users(id),
+  approval_status text not null default 'approved' check (approval_status in ('pending','approved','rejected')),
+  approved_by uuid references auth.users(id),
+  approved_at timestamptz,
+  rejection_note text,
   created_at timestamptz default now()
 );
 
 create table if not exists cc_invoice_items (
   id uuid primary key default gen_random_uuid(),
   invoice_id uuid not null references cc_invoices(id) on delete cascade,
+  description text not null,
+  quantity numeric not null default 1,
+  unit_price numeric not null default 0,
+  vat_applicable boolean not null default true
+);
+
+-- ============ CREDIT NOTES ============
+
+create table if not exists cc_credit_notes (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  client_id uuid references cc_clients(id) on delete set null,
+  invoice_id uuid references cc_invoices(id) on delete set null,
+  credit_note_number text not null,
+  issue_date date not null default current_date,
+  reason text,
+  status text not null default 'draft' check (status in ('draft','issued')),
+  approval_status text not null default 'approved' check (approval_status in ('pending','approved','rejected')),
+  created_by uuid references auth.users(id),
+  approved_by uuid references auth.users(id),
+  approved_at timestamptz,
+  rejection_note text,
+  notes text,
+  created_at timestamptz default now()
+);
+
+create table if not exists cc_credit_note_items (
+  id uuid primary key default gen_random_uuid(),
+  credit_note_id uuid not null references cc_credit_notes(id) on delete cascade,
   description text not null,
   quantity numeric not null default 1,
   unit_price numeric not null default 0,
@@ -140,7 +178,18 @@ create table if not exists cc_payroll_payments (
   created_at timestamptz default now()
 );
 
--- ============ HELPER FUNCTION ============
+-- ============ EMPLOYEE TASKS ============
+
+create table if not exists cc_employee_tasks (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  employee_id uuid not null references cc_employees(id) on delete cascade,
+  description text not null,
+  status text not null default 'in_progress' check (status in ('todo','in_progress','done')),
+  created_at timestamptz default now()
+);
+
+-- ============ HELPER FUNCTIONS ============
 -- Returns true if the current user is an active member of the company.
 create or replace function cc_is_member(target_company_id uuid)
 returns boolean
@@ -156,7 +205,7 @@ as $$
   );
 $$;
 
--- Returns true if the current user is owner/admin of the company.
+-- Returns true if the current user is owner/admin (management) of the company.
 create or replace function cc_is_admin(target_company_id uuid)
 returns boolean
 language sql
@@ -172,6 +221,34 @@ as $$
   );
 $$;
 
+-- Returns true if the current user is management, or staff granted this module.
+create or replace function cc_has_module(target_company_id uuid, module text)
+returns boolean
+language sql security definer stable as $$
+  select exists (
+    select 1 from cc_company_members
+    where company_id = target_company_id and user_id = auth.uid() and status = 'active'
+      and (
+        role in ('owner','admin')
+        or (role = 'staff' and (permissions->'modules') ? module)
+      )
+  );
+$$;
+
+-- Returns true if the current user is management, or staff flagged as an approver.
+create or replace function cc_can_approve(target_company_id uuid)
+returns boolean
+language sql security definer stable as $$
+  select exists (
+    select 1 from cc_company_members
+    where company_id = target_company_id and user_id = auth.uid() and status = 'active'
+      and (
+        role in ('owner','admin')
+        or (role = 'staff' and coalesce((permissions->>'can_approve')::boolean, false))
+      )
+  );
+$$;
+
 -- ============ ROW LEVEL SECURITY ============
 
 alter table cc_companies enable row level security;
@@ -183,12 +260,15 @@ alter table cc_assets enable row level security;
 alter table cc_liabilities enable row level security;
 alter table cc_invoices enable row level security;
 alter table cc_invoice_items enable row level security;
+alter table cc_credit_notes enable row level security;
+alter table cc_credit_note_items enable row level security;
 alter table cc_employees enable row level security;
 alter table cc_payroll_payments enable row level security;
+alter table cc_employee_tasks enable row level security;
 
 -- cc_companies
 create policy "members can view company" on cc_companies for select
-  using (cc_is_member(id));
+  using (cc_is_member(id) or owner_id = auth.uid());
 create policy "owner can insert company" on cc_companies for insert
   with check (owner_id = auth.uid());
 create policy "admin can update company" on cc_companies for update
@@ -204,74 +284,104 @@ create policy "admin can manage members update" on cc_company_members for update
 create policy "admin can manage members delete" on cc_company_members for delete
   using (cc_is_admin(company_id));
 
--- generic per-table policies (member = read, admin = write) for financial tables
+-- accounts: management only (no module for this yet)
 create policy "members select accounts" on cc_accounts for select using (cc_is_member(company_id));
 create policy "admin write accounts" on cc_accounts for insert with check (cc_is_admin(company_id));
 create policy "admin update accounts" on cc_accounts for update using (cc_is_admin(company_id));
 create policy "admin delete accounts" on cc_accounts for delete using (cc_is_admin(company_id));
 
+-- clients: module-scoped
 create policy "members select clients" on cc_clients for select using (cc_is_member(company_id));
-create policy "admin write clients" on cc_clients for insert with check (cc_is_admin(company_id));
-create policy "admin update clients" on cc_clients for update using (cc_is_admin(company_id));
-create policy "admin delete clients" on cc_clients for delete using (cc_is_admin(company_id));
+create policy "scoped write clients" on cc_clients for insert with check (cc_has_module(company_id, 'clients'));
+create policy "scoped update clients" on cc_clients for update using (cc_has_module(company_id, 'clients'));
+create policy "scoped delete clients" on cc_clients for delete using (cc_has_module(company_id, 'clients'));
 
+-- entries (revenue/expenses): module-scoped by type
 create policy "members select entries" on cc_entries for select using (cc_is_member(company_id));
-create policy "admin write entries" on cc_entries for insert with check (cc_is_admin(company_id));
-create policy "admin update entries" on cc_entries for update using (cc_is_admin(company_id));
-create policy "admin delete entries" on cc_entries for delete using (cc_is_admin(company_id));
+create policy "scoped write entries" on cc_entries for insert with check (
+  (type = 'revenue' and cc_has_module(company_id, 'revenue')) or (type = 'expense' and cc_has_module(company_id, 'expenses'))
+);
+create policy "scoped update entries" on cc_entries for update using (
+  (type = 'revenue' and cc_has_module(company_id, 'revenue')) or (type = 'expense' and cc_has_module(company_id, 'expenses'))
+);
+create policy "scoped delete entries" on cc_entries for delete using (
+  (type = 'revenue' and cc_has_module(company_id, 'revenue')) or (type = 'expense' and cc_has_module(company_id, 'expenses'))
+);
 
+-- assets: module-scoped
 create policy "members select assets" on cc_assets for select using (cc_is_member(company_id));
-create policy "admin write assets" on cc_assets for insert with check (cc_is_admin(company_id));
-create policy "admin update assets" on cc_assets for update using (cc_is_admin(company_id));
-create policy "admin delete assets" on cc_assets for delete using (cc_is_admin(company_id));
+create policy "scoped write assets" on cc_assets for insert with check (cc_has_module(company_id, 'assets'));
+create policy "scoped update assets" on cc_assets for update using (cc_has_module(company_id, 'assets'));
+create policy "scoped delete assets" on cc_assets for delete using (cc_has_module(company_id, 'assets'));
 
+-- liabilities: module-scoped
 create policy "members select liabilities" on cc_liabilities for select using (cc_is_member(company_id));
-create policy "admin write liabilities" on cc_liabilities for insert with check (cc_is_admin(company_id));
-create policy "admin update liabilities" on cc_liabilities for update using (cc_is_admin(company_id));
-create policy "admin delete liabilities" on cc_liabilities for delete using (cc_is_admin(company_id));
+create policy "scoped write liabilities" on cc_liabilities for insert with check (cc_has_module(company_id, 'liabilities'));
+create policy "scoped update liabilities" on cc_liabilities for update using (cc_has_module(company_id, 'liabilities'));
+create policy "scoped delete liabilities" on cc_liabilities for delete using (cc_has_module(company_id, 'liabilities'));
 
+-- invoices: module-scoped create + approval workflow
 create policy "members select invoices" on cc_invoices for select using (cc_is_member(company_id));
-create policy "admin write invoices" on cc_invoices for insert with check (cc_is_admin(company_id));
-create policy "admin update invoices" on cc_invoices for update using (cc_is_admin(company_id));
-create policy "admin delete invoices" on cc_invoices for delete using (cc_is_admin(company_id));
+create policy "scoped write invoices" on cc_invoices for insert with check (cc_has_module(company_id, 'invoices'));
+create policy "management update invoices" on cc_invoices for update using (cc_can_approve(company_id));
+create policy "creator edit pending invoice" on cc_invoices for update
+  using (created_by = auth.uid() and approval_status = 'pending')
+  with check (created_by = auth.uid() and approval_status = 'pending');
+create policy "management delete invoices" on cc_invoices for delete using (cc_can_approve(company_id));
+create policy "creator delete pending invoice" on cc_invoices for delete using (created_by = auth.uid() and approval_status = 'pending');
 
 create policy "members select invoice items" on cc_invoice_items for select using (
   cc_is_member((select company_id from cc_invoices where id = invoice_id))
 );
-create policy "admin write invoice items" on cc_invoice_items for insert with check (
-  cc_is_admin((select company_id from cc_invoices where id = invoice_id))
+create policy "scoped write invoice items" on cc_invoice_items for insert with check (
+  cc_has_module((select company_id from cc_invoices where id = invoice_id), 'invoices')
 );
-create policy "admin update invoice items" on cc_invoice_items for update using (
-  cc_is_admin((select company_id from cc_invoices where id = invoice_id))
+create policy "scoped update invoice items" on cc_invoice_items for update using (
+  cc_can_approve((select company_id from cc_invoices where id = invoice_id))
+  or exists (select 1 from cc_invoices i where i.id = invoice_id and i.created_by = auth.uid() and i.approval_status = 'pending')
 );
-create policy "admin delete invoice items" on cc_invoice_items for delete using (
-  cc_is_admin((select company_id from cc_invoices where id = invoice_id))
+create policy "scoped delete invoice items" on cc_invoice_items for delete using (
+  cc_can_approve((select company_id from cc_invoices where id = invoice_id))
+  or exists (select 1 from cc_invoices i where i.id = invoice_id and i.created_by = auth.uid() and i.approval_status = 'pending')
 );
 
+-- credit notes: module-scoped create + approval workflow (mirrors invoices)
+create policy "members select credit notes" on cc_credit_notes for select using (cc_is_member(company_id));
+create policy "scoped write credit notes" on cc_credit_notes for insert with check (cc_has_module(company_id, 'credit_notes'));
+create policy "management update credit notes" on cc_credit_notes for update using (cc_can_approve(company_id));
+create policy "creator edit pending credit note" on cc_credit_notes for update
+  using (created_by = auth.uid() and approval_status = 'pending')
+  with check (created_by = auth.uid() and approval_status = 'pending');
+create policy "management delete credit notes" on cc_credit_notes for delete using (cc_can_approve(company_id));
+create policy "creator delete pending credit note" on cc_credit_notes for delete using (created_by = auth.uid() and approval_status = 'pending');
+
+create policy "members select credit note items" on cc_credit_note_items for select using (
+  cc_is_member((select company_id from cc_credit_notes where id = credit_note_id))
+);
+create policy "scoped write credit note items" on cc_credit_note_items for insert with check (
+  cc_has_module((select company_id from cc_credit_notes where id = credit_note_id), 'credit_notes')
+);
+create policy "scoped update credit note items" on cc_credit_note_items for update using (
+  cc_can_approve((select company_id from cc_credit_notes where id = credit_note_id))
+  or exists (select 1 from cc_credit_notes c where c.id = credit_note_id and c.created_by = auth.uid() and c.approval_status = 'pending')
+);
+create policy "scoped delete credit note items" on cc_credit_note_items for delete using (
+  cc_can_approve((select company_id from cc_credit_notes where id = credit_note_id))
+  or exists (select 1 from cc_credit_notes c where c.id = credit_note_id and c.created_by = auth.uid() and c.approval_status = 'pending')
+);
+
+-- employees / payroll / employee tasks: module-scoped ('payroll')
 create policy "members select employees" on cc_employees for select using (cc_is_member(company_id));
-create policy "admin write employees" on cc_employees for insert with check (cc_is_admin(company_id));
-create policy "admin update employees" on cc_employees for update using (cc_is_admin(company_id));
-create policy "admin delete employees" on cc_employees for delete using (cc_is_admin(company_id));
+create policy "scoped write employees" on cc_employees for insert with check (cc_has_module(company_id, 'payroll'));
+create policy "scoped update employees" on cc_employees for update using (cc_has_module(company_id, 'payroll'));
+create policy "scoped delete employees" on cc_employees for delete using (cc_has_module(company_id, 'payroll'));
 
 create policy "members select payroll" on cc_payroll_payments for select using (cc_is_member(company_id));
-create policy "admin write payroll" on cc_payroll_payments for insert with check (cc_is_admin(company_id));
-create policy "admin update payroll" on cc_payroll_payments for update using (cc_is_admin(company_id));
-create policy "admin delete payroll" on cc_payroll_payments for delete using (cc_is_admin(company_id));
-
--- ============ EMPLOYEE TASKS (added 2026-09-06) ============
-
-create table if not exists cc_employee_tasks (
-  id uuid primary key default gen_random_uuid(),
-  company_id uuid not null references cc_companies(id) on delete cascade,
-  employee_id uuid not null references cc_employees(id) on delete cascade,
-  description text not null,
-  status text not null default 'in_progress' check (status in ('todo','in_progress','done')),
-  created_at timestamptz default now()
-);
-
-alter table cc_employee_tasks enable row level security;
+create policy "scoped write payroll" on cc_payroll_payments for insert with check (cc_has_module(company_id, 'payroll'));
+create policy "scoped update payroll" on cc_payroll_payments for update using (cc_has_module(company_id, 'payroll'));
+create policy "scoped delete payroll" on cc_payroll_payments for delete using (cc_has_module(company_id, 'payroll'));
 
 create policy "members select employee tasks" on cc_employee_tasks for select using (cc_is_member(company_id));
-create policy "admin write employee tasks" on cc_employee_tasks for insert with check (cc_is_admin(company_id));
-create policy "admin update employee tasks" on cc_employee_tasks for update using (cc_is_admin(company_id));
-create policy "admin delete employee tasks" on cc_employee_tasks for delete using (cc_is_admin(company_id));
+create policy "scoped write employee tasks" on cc_employee_tasks for insert with check (cc_has_module(company_id, 'payroll'));
+create policy "scoped update employee tasks" on cc_employee_tasks for update using (cc_has_module(company_id, 'payroll'));
+create policy "scoped delete employee tasks" on cc_employee_tasks for delete using (cc_has_module(company_id, 'payroll'));
