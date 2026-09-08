@@ -68,6 +68,9 @@ create table if not exists cc_entries (
   recurrence_next_date date,
   tags text[] default '{}',
   vat_applicable boolean not null default false,
+  -- only meaningful when type='expense': splits Cost of Sales from Operating
+  -- Expenses so the P&L report can compute Gross Profit
+  expense_category text not null default 'operating' check (expense_category in ('cost_of_sales','operating')),
   created_by uuid references auth.users(id),
   created_at timestamptz default now()
 );
@@ -80,6 +83,9 @@ create table if not exists cc_assets (
   description text not null,
   value numeric not null,
   category text,
+  -- current (cash-like / convertible within 12 months) vs fixed/non-current,
+  -- used by the Balance Sheet report
+  is_current boolean not null default false,
   created_at timestamptz default now()
 );
 
@@ -92,6 +98,8 @@ create table if not exists cc_liabilities (
   interest_rate numeric,
   term_months integer,
   start_date date,
+  -- due within 12 months vs long-term, used by the Balance Sheet report
+  is_current boolean not null default false,
   created_at timestamptz default now()
 );
 

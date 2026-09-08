@@ -422,6 +422,11 @@ create policy "scoped delete credit note items" on cc_credit_note_items for dele
   or exists (select 1 from cc_credit_notes c where c.id = credit_note_id and c.created_by = auth.uid() and c.approval_status = 'pending')
 );
 
+-- ---------- Reports: P&L / Balance Sheet columns (idempotent) ----------
+alter table cc_entries add column if not exists expense_category text not null default 'operating' check (expense_category in ('cost_of_sales','operating'));
+alter table cc_assets add column if not exists is_current boolean not null default false;
+alter table cc_liabilities add column if not exists is_current boolean not null default false;
+
 -- ---------- verify ----------
 select tablename, count(*) as policy_count
 from pg_policies

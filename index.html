@@ -14,7 +14,7 @@
     --shadow:0 1px 2px rgba(30,20,60,.03), 0 6px 18px rgba(30,20,60,.04);
     --c-dashboard:#7c5cff; --c-revenue:#0fb981; --c-expenses:#f4406a; --c-assets:#06b6d4;
     --c-liabilities:#f5a524; --c-clients:#a855f7; --c-invoices:#6366f1; --c-creditnotes:#ec4899;
-    --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b;
+    --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b; --c-reports:#1d4ed8;
   }
   *{box-sizing:border-box;}
   body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
@@ -83,6 +83,7 @@
   #sidebar nav button[data-view="creditnotes"]{--dot:var(--c-creditnotes);}
   #sidebar nav button[data-view="payroll"]{--dot:var(--c-payroll);}
   #sidebar nav button[data-view="vat"]{--dot:var(--c-vat);}
+  #sidebar nav button[data-view="reports"]{--dot:var(--c-reports);}
   #sidebar nav button[data-view="team"]{--dot:var(--c-team);}
   #sidebar .logout{margin-top:10px;font-size:.8rem;color:var(--muted);background:none;border:none;text-align:left;padding:9px 10px;}
 
@@ -95,6 +96,16 @@
   .card .sub{font-size:.8rem;color:var(--muted);margin-top:4px;}
   .value.positive{color:var(--accent2);}
   .value.negative{color:var(--danger);}
+  .positive{color:var(--accent2);}
+  .negative{color:var(--danger);}
+  .tabbar{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap;}
+  .period-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:20px;}
+  .report-table td{padding:9px 10px;}
+  @media print{
+    #sidebar, #toast, .tabbar, .period-bar, .section-header .btn{display:none !important;}
+    #main{padding:0;max-width:100%;}
+    body{background:#fff;}
+  }
 
   table{width:100%;border-collapse:collapse;font-size:.88rem;}
   th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);}
@@ -178,6 +189,7 @@
       <button data-view="creditnotes"><span class="dot"></span>Credit Notes</button>
       <button data-view="payroll"><span class="dot"></span>Payroll</button>
       <button data-view="vat"><span class="dot"></span>VAT</button>
+      <button data-view="reports"><span class="dot"></span>Reports</button>
       <button data-view="team"><span class="dot"></span>Team</button>
     </nav>
     <button class="logout" id="logout-btn">Log out</button>
@@ -213,7 +225,9 @@ let state = {
   employees: [],
   payrollPayments: [],
   employeeTasks: [],
-  view: 'dashboard'
+  view: 'dashboard',
+  reportsTab: 'pl',
+  reportsPeriod: {mode:'month'}
 };
 
 function fmt(n){
@@ -412,6 +426,17 @@ async function refreshAll(){
   state.employees = employees.data || [];
   state.payrollPayments = payments.data || [];
   state.employeeTasks = tasks.data || [];
+
+  const invoiceIds = state.invoices.map(i=>i.id);
+  const creditNoteIds = state.creditNotes.map(cn=>cn.id);
+  const [invItemsRes, cnItemsRes] = await Promise.all([
+    invoiceIds.length ? sb.from('cc_invoice_items').select('*').in('invoice_id', invoiceIds) : Promise.resolve({data:[]}),
+    creditNoteIds.length ? sb.from('cc_credit_note_items').select('*').in('credit_note_id', creditNoteIds) : Promise.resolve({data:[]})
+  ]);
+  state.invoiceItems = {};
+  (invItemsRes.data||[]).forEach(it=>{ (state.invoiceItems[it.invoice_id] = state.invoiceItems[it.invoice_id]||[]).push(it); });
+  state.creditNoteItems = {};
+  (cnItemsRes.data||[]).forEach(it=>{ (state.creditNoteItems[it.credit_note_id] = state.creditNoteItems[it.credit_note_id]||[]).push(it); });
 }
 
 /* ========================= NAV / RENDER ========================= */
@@ -436,6 +461,7 @@ function render(){
     case 'creditnotes': main.innerHTML = renderCreditNotes(); attachCreditNoteHandlers(); break;
     case 'payroll': main.innerHTML = renderPayroll(); attachPayrollHandlers(); break;
     case 'vat': main.innerHTML = renderVat(); break;
+    case 'reports': main.innerHTML = renderReports(); attachReportsHandlers(); break;
     case 'team': main.innerHTML = renderTeam(); attachTeamHandlers(); break;
   }
 }
@@ -453,10 +479,11 @@ function totalsFor(){
   return {revenue, expenses, predictedBalance, totalAssets, totalLiabilities, netWorth, payrollPaid};
 }
 
-function vatFor(){
-  const vatCollected = state.entries.filter(e=>e.type==='revenue' && e.vat_applicable)
+function vatFor(asOf){
+  const inRange = e => !asOf || e.entry_date <= asOf;
+  const vatCollected = state.entries.filter(e=>e.type==='revenue' && e.vat_applicable && inRange(e))
     .reduce((s,e)=> s + Number(e.amount) - Number(e.amount)/(1+VAT_RATE), 0);
-  const vatPaid = state.entries.filter(e=>e.type==='expense' && e.vat_applicable)
+  const vatPaid = state.entries.filter(e=>e.type==='expense' && e.vat_applicable && inRange(e))
     .reduce((s,e)=> s + Number(e.amount) - Number(e.amount)/(1+VAT_RATE), 0);
   return {vatCollected, vatPaid, vatPayable: vatCollected - vatPaid};
 }
@@ -521,10 +548,11 @@ function renderEntries(type){
     <div class="section-header" style="--accent-c:${accent};"><h1>${label}</h1>${canEdit ? `<button class="btn" id="add-entry-btn">+ Add ${type==='revenue'?'Revenue':'Expense'}</button>` : ''}</div>
     <div class="grid"><div class="card" style="--accent-c:${accent};"><h3>Total ${label}</h3><div class="value">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${rows.length ? `<table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Tags</th><th>VAT</th><th>Recurring</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+      ${rows.length ? `<table><thead><tr><th>Date</th><th>Description</th>${type==='expense'?'<th>Category</th>':''}<th>Amount</th><th>Tags</th><th>VAT</th><th>Recurring</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${rows.map(e=>`<tr>
           <td>${e.entry_date}</td>
           <td>${e.description}</td>
+          ${type==='expense'?`<td>${e.expense_category==='cost_of_sales'?'Cost of Sales':'Operating'}</td>`:''}
           <td>${fmt(e.amount)}</td>
           <td>${(e.tags||[]).map(t=>`<span class="tag-pill">${t}</span>`).join('')}</td>
           <td>${e.vat_applicable?'Yes':'No'}</td>
@@ -549,6 +577,10 @@ function entryModal(type){
         <div class="field"><label>Date</label><input type="date" id="entry-date" required></div>
         <div class="field"><label>Tags (comma separated)</label><input type="text" id="entry-tags" placeholder="e.g. office, marketing"></div>
         ${type==='revenue' ? `<div class="field"><label>Client (optional)</label><select id="entry-client"><option value="">—</option>${state.clients.map(c=>`<option value="${c.id}">${c.name}</option>`).join('')}</select></div>` : ''}
+        ${type==='expense' ? `<div class="field"><label>Category</label><select id="entry-expense-category">
+          <option value="operating">Operating Expense</option>
+          <option value="cost_of_sales">Cost of Sales (COS)</option>
+        </select></div>` : ''}
         <div class="field"><label><input type="checkbox" id="entry-vat" style="width:auto;"> Includes VAT (15%)</label></div>
         <div class="field"><label><input type="checkbox" id="entry-recurring" style="width:auto;"> Recurring</label></div>
         <div class="field hidden" id="entry-recurrence-field"><label>Frequency</label>
@@ -597,6 +629,9 @@ function attachEntryHandlers(type){
       const clientId = document.getElementById('entry-client').value;
       if(clientId) payload.client_id = clientId;
     }
+    if(type==='expense'){
+      payload.expense_category = document.getElementById('entry-expense-category').value;
+    }
     const {error} = await sb.from('cc_entries').insert(payload);
     if(error){ toast(error.message); return; }
     await refreshAll(); render(); toast('Saved.');
@@ -618,8 +653,8 @@ function renderAssets(){
     <div class="section-header" style="--accent-c:var(--c-assets);"><h1>Assets</h1>${canEdit ? `<button class="btn" id="add-asset-btn">+ Add Asset</button>` : ''}</div>
     <div class="grid"><div class="card" style="--accent-c:var(--c-assets);"><h3>Total Assets</h3><div class="value">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.assets.map(a=>`<tr><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td>${canEdit?`<td><button class="btn small danger" data-del-asset="${a.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th><th>Current?</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.assets.map(a=>`<tr><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td><td>${a.is_current?'Yes':'No'}</td>${canEdit?`<td><button class="btn small danger" data-del-asset="${a.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No assets recorded yet.</div>`}
     </div>
     ${canEdit ? `
@@ -628,8 +663,9 @@ function renderAssets(){
       <h2>Add Asset</h2>
       <form id="asset-form">
         <div class="field"><label>Description</label><input type="text" id="asset-description" required></div>
-        <div class="field"><label>Category</label><input type="text" id="asset-category" placeholder="e.g. equipment, property, vehicle"></div>
+        <div class="field"><label>Category</label><input type="text" id="asset-category" placeholder="e.g. equipment, property, vehicle, stock"></div>
         <div class="field"><label>Value (R)</label><input type="number" step="0.01" id="asset-value" required></div>
+        <div class="field"><label><input type="checkbox" id="asset-current" style="width:auto;"> Current asset (cash-like, or convertible to cash within 12 months)</label></div>
         <div class="modal-actions"><button type="button" class="btn secondary" id="asset-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
       </form>
     </div></div>` : ''}
@@ -646,7 +682,8 @@ function attachAssetHandlers(){
       company_id: state.company.id,
       description: document.getElementById('asset-description').value.trim(),
       category: document.getElementById('asset-category').value.trim() || null,
-      value: parseFloat(document.getElementById('asset-value').value)
+      value: parseFloat(document.getElementById('asset-value').value),
+      is_current: document.getElementById('asset-current').checked
     });
     if(error){ toast(error.message); return; }
     await refreshAll(); render(); toast('Saved.');
@@ -668,8 +705,8 @@ function renderLiabilities(){
     <div class="section-header" style="--accent-c:var(--c-liabilities);"><h1>Liabilities</h1>${canEdit ? `<button class="btn" id="add-liability-btn">+ Add Liability</button>` : ''}</div>
     <div class="grid"><div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Liabilities</h3><div class="value negative">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${state.liabilities.length ? `<table><thead><tr><th>Description</th><th>Type</th><th>Amount</th><th>Rate</th><th>Term</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.liabilities.map(l=>`<tr><td>${l.description}</td><td>${l.type}</td><td>${fmt(l.amount)}</td><td>${l.interest_rate?l.interest_rate+'%':'—'}</td><td>${l.term_months?l.term_months+' mo':'—'}</td>${canEdit?`<td><button class="btn small danger" data-del-liability="${l.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.liabilities.length ? `<table><thead><tr><th>Description</th><th>Type</th><th>Amount</th><th>Rate</th><th>Term</th><th>Current?</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.liabilities.map(l=>`<tr><td>${l.description}</td><td>${l.type}</td><td>${fmt(l.amount)}</td><td>${l.interest_rate?l.interest_rate+'%':'—'}</td><td>${l.term_months?l.term_months+' mo':'—'}</td><td>${l.is_current?'Yes':'No'}</td>${canEdit?`<td><button class="btn small danger" data-del-liability="${l.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No liabilities recorded yet.</div>`}
     </div>
     ${canEdit ? `
@@ -683,6 +720,7 @@ function renderLiabilities(){
         <div class="field"><label>Interest rate (%, optional)</label><input type="number" step="0.01" id="liability-rate"></div>
         <div class="field"><label>Term (months, optional)</label><input type="number" id="liability-term"></div>
         <div class="field"><label>Start date (optional)</label><input type="date" id="liability-start"></div>
+        <div class="field"><label><input type="checkbox" id="liability-current" style="width:auto;"> Current liability (due within 12 months)</label></div>
         <div class="modal-actions"><button type="button" class="btn secondary" id="liability-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
       </form>
     </div></div>` : ''}
@@ -702,7 +740,8 @@ function attachLiabilityHandlers(){
       amount: parseFloat(document.getElementById('liability-amount').value),
       interest_rate: parseFloat(document.getElementById('liability-rate').value) || null,
       term_months: parseInt(document.getElementById('liability-term').value) || null,
-      start_date: document.getElementById('liability-start').value || null
+      start_date: document.getElementById('liability-start').value || null,
+      is_current: document.getElementById('liability-current').checked
     });
     if(error){ toast(error.message); return; }
     await refreshAll(); render(); toast('Saved.');
@@ -1336,6 +1375,240 @@ function attachPayrollHandlers(){
       await sb.from('cc_employee_tasks').delete().eq('id', btn.dataset.delTask);
       await refreshAll(); render();
     });
+  });
+}
+
+/* ========================= REPORTS (P&L / BALANCE SHEET / RATIOS) ========================= */
+function todayIso(){ return new Date().toISOString().slice(0,10); }
+function fmtPct(x){ return (x===null||x===undefined||!isFinite(x)) ? '—' : (x*100).toFixed(1)+'%'; }
+function fmtRatio(x){ return (x===null||x===undefined||!isFinite(x)) ? '—' : x.toFixed(2); }
+
+function periodRange(mode){
+  const now = new Date();
+  const y = now.getFullYear(), m = now.getMonth();
+  const iso = d => d.toISOString().slice(0,10);
+  if(mode==='month'){ return {start: iso(new Date(y,m,1)), end: iso(new Date(y,m+1,0))}; }
+  if(mode==='quarter'){ const q = Math.floor(m/3); return {start: iso(new Date(y,q*3,1)), end: iso(new Date(y,q*3+3,0))}; }
+  if(mode==='year'){ return {start: iso(new Date(y,0,1)), end: iso(new Date(y,11,31))}; }
+  return {start: '2000-01-01', end: iso(now)}; // 'all'
+}
+function currentPeriod(){
+  const rp = state.reportsPeriod || {mode:'month'};
+  if(rp.mode === 'custom'){
+    const end = rp.end || todayIso();
+    const start = rp.start || end;
+    return {start, end};
+  }
+  return periodRange(rp.mode || 'month');
+}
+function periodModeLabel(m){ return {month:'This Month', quarter:'This Quarter', year:'This Year', all:'All Time'}[m] || m; }
+
+function computePL(start, end){
+  const inRange = e => e.entry_date >= start && e.entry_date <= end;
+  const revenue = state.entries.filter(e=>e.type==='revenue' && inRange(e)).reduce((s,e)=>s+Number(e.amount),0);
+  const expenseRows = state.entries.filter(e=>e.type==='expense' && inRange(e));
+  const cos = expenseRows.filter(e=>e.expense_category==='cost_of_sales').reduce((s,e)=>s+Number(e.amount),0);
+  const opex = expenseRows.filter(e=>e.expense_category!=='cost_of_sales').reduce((s,e)=>s+Number(e.amount),0);
+  const payrollCost = state.payrollPayments.filter(p=>p.paid && p.pay_date>=start && p.pay_date<=end).reduce((s,p)=>s+Number(p.net),0);
+  const grossProfit = revenue - cos;
+  const totalOpex = opex + payrollCost;
+  const netProfit = grossProfit - totalOpex;
+  return {
+    start, end, revenue, cos, opex, payrollCost, totalOpex, grossProfit, netProfit,
+    grossMargin: revenue ? grossProfit/revenue : null,
+    netMargin: revenue ? netProfit/revenue : null
+  };
+}
+
+function docTotal(items){ return (items||[]).reduce((s,it)=>s+Number(it.quantity)*Number(it.unit_price),0); }
+
+function computeBS(asOf){
+  const upTo = d => d <= asOf;
+  const revenue = state.entries.filter(e=>e.type==='revenue' && upTo(e.entry_date)).reduce((s,e)=>s+Number(e.amount),0);
+  const expenses = state.entries.filter(e=>e.type==='expense' && upTo(e.entry_date)).reduce((s,e)=>s+Number(e.amount),0);
+  const startingBalance = state.accounts.reduce((s,a)=>s+Number(a.starting_balance||0),0);
+  const payrollPaid = state.payrollPayments.filter(p=>p.paid && upTo(p.pay_date)).reduce((s,p)=>s+Number(p.net),0);
+  const cash = startingBalance + revenue - expenses - payrollPaid;
+
+  const arInvoices = state.invoices.filter(i=> i.approval_status==='approved' && (i.status==='sent'||i.status==='overdue') && upTo(i.issue_date));
+  const accountsReceivableGross = arInvoices.reduce((s,i)=>s+docTotal(state.invoiceItems[i.id]),0);
+  const issuedCreditNotes = state.creditNotes.filter(cn=> cn.approval_status==='approved' && cn.status==='issued' && upTo(cn.issue_date));
+  const creditNoteTotal = issuedCreditNotes.reduce((s,cn)=>s+docTotal(state.creditNoteItems[cn.id]),0);
+  const accountsReceivable = Math.max(0, accountsReceivableGross - creditNoteTotal);
+
+  const v = vatFor(asOf);
+  const vatPayableAmt = Math.max(0, v.vatPayable);
+  const vatReceivableAmt = Math.max(0, -v.vatPayable);
+
+  const otherCurrentAssets = state.assets.filter(a=>a.is_current).reduce((s,a)=>s+Number(a.value),0);
+  const inventoryValue = state.assets.filter(a=>a.is_current && /stock|inventory/i.test(a.category||'')).reduce((s,a)=>s+Number(a.value),0);
+  const fixedAssets = state.assets.filter(a=>!a.is_current).reduce((s,a)=>s+Number(a.value),0);
+
+  const currentAssets = cash + accountsReceivable + otherCurrentAssets + vatReceivableAmt;
+  const totalAssets = currentAssets + fixedAssets;
+
+  const currentLiabOther = state.liabilities.filter(l=>l.is_current).reduce((s,l)=>s+Number(l.amount),0);
+  const nonCurrentLiab = state.liabilities.filter(l=>!l.is_current).reduce((s,l)=>s+Number(l.amount),0);
+  const currentLiabilities = currentLiabOther + vatPayableAmt;
+  const totalLiabilities = currentLiabilities + nonCurrentLiab;
+
+  const equity = totalAssets - totalLiabilities;
+
+  return {
+    asOf, cash, accountsReceivable, vatReceivableAmt, otherCurrentAssets, currentAssets, fixedAssets, totalAssets,
+    vatPayableAmt, currentLiabOther, currentLiabilities, nonCurrentLiab, totalLiabilities, equity, inventoryValue
+  };
+}
+
+function computeRatios(pl, bs){
+  const div = (a,b) => (!b) ? null : a/b;
+  const quickAssets = bs.currentAssets - bs.inventoryValue;
+  return {
+    grossMargin: pl.grossMargin,
+    netMargin: pl.netMargin,
+    currentRatio: div(bs.currentAssets, bs.currentLiabilities),
+    quickRatio: div(quickAssets, bs.currentLiabilities),
+    workingCapital: bs.currentAssets - bs.currentLiabilities,
+    debtToEquity: div(bs.totalLiabilities, bs.equity),
+    debtRatio: div(bs.totalLiabilities, bs.totalAssets),
+    roa: div(pl.netProfit, bs.totalAssets),
+    roe: div(pl.netProfit, bs.equity)
+  };
+}
+
+function renderReports(){
+  if(!(isAdmin() || canApprove())){
+    return `<h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-reports);display:inline-block;"></span>Reports</h1>
+    <div class="panel"><p class="empty">Management accounts are only visible to management (and staff approved as an accountant).</p></div>`;
+  }
+  const period = currentPeriod();
+  const pl = computePL(period.start, period.end);
+  const bs = computeBS(period.end);
+  const ratios = computeRatios(pl, bs);
+
+  return `
+    <div class="section-header" style="--accent-c:var(--c-reports);"><h1>Reports</h1><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
+    <div class="tabbar">
+      <button class="btn ${state.reportsTab==='pl'?'':'secondary'} small" data-report-tab="pl">Profit &amp; Loss</button>
+      <button class="btn ${state.reportsTab==='bs'?'':'secondary'} small" data-report-tab="bs">Balance Sheet</button>
+      <button class="btn ${state.reportsTab==='ratios'?'':'secondary'} small" data-report-tab="ratios">Ratios</button>
+    </div>
+    <div class="panel period-bar">
+      ${['month','quarter','year','all'].map(m=>`<button class="btn ${state.reportsPeriod.mode===m?'':'secondary'} small" data-period-mode="${m}">${periodModeLabel(m)}</button>`).join('')}
+      <button class="btn ${state.reportsPeriod.mode==='custom'?'':'secondary'} small" data-period-mode="custom">Custom</button>
+      ${state.reportsPeriod.mode==='custom' ? `
+        <div class="field"><label>From</label><input type="date" id="reports-custom-start" value="${state.reportsPeriod.start||period.start}"></div>
+        <div class="field"><label>To</label><input type="date" id="reports-custom-end" value="${state.reportsPeriod.end||period.end}"></div>
+        <button class="btn small" id="reports-custom-apply">Apply</button>
+      ` : ''}
+      <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">P&amp;L: ${period.start} to ${period.end}<br>Balance sheet as of ${period.end}</div>
+    </div>
+    ${state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : renderPL(pl)}
+  `;
+}
+
+function renderPL(pl){
+  return `
+  <div class="panel">
+    <table class="report-table"><tbody>
+      <tr><td>Revenue</td><td style="text-align:right;">${fmt(pl.revenue)}</td></tr>
+      <tr><td>Cost of Sales</td><td style="text-align:right;">(${fmt(pl.cos)})</td></tr>
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Gross Profit</td><td style="text-align:right;">${fmt(pl.grossProfit)}</td></tr>
+      <tr><td style="color:var(--muted);font-size:.82rem;">Gross Margin</td><td style="text-align:right;color:var(--muted);font-size:.82rem;">${fmtPct(pl.grossMargin)}</td></tr>
+      <tr><td style="padding-top:16px;">Operating Expenses</td><td style="text-align:right;padding-top:16px;">(${fmt(pl.opex)})</td></tr>
+      <tr><td>Payroll &amp; Staff Costs</td><td style="text-align:right;">(${fmt(pl.payrollCost)})</td></tr>
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Net Profit</td><td style="text-align:right;" class="${pl.netProfit<0?'negative':'positive'}">${fmt(pl.netProfit)}</td></tr>
+      <tr><td style="color:var(--muted);font-size:.82rem;">Net Margin</td><td style="text-align:right;color:var(--muted);font-size:.82rem;">${fmtPct(pl.netMargin)}</td></tr>
+    </tbody></table>
+  </div>
+  <p style="color:var(--muted);font-size:.8rem;">Figures are drawn from Revenue and Expense entries dated within the selected period, plus payroll payments marked paid in that period. Not tax advice — confirm with your accountant before relying on these for statutory reporting.</p>
+  `;
+}
+
+function renderBS(bs){
+  return `
+  <div class="grid">
+    <div class="card" style="--accent-c:var(--c-assets);"><h3>Total Assets</h3><div class="value">${fmt(bs.totalAssets)}</div></div>
+    <div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Liabilities</h3><div class="value negative">${fmt(bs.totalLiabilities)}</div></div>
+    <div class="card" style="--accent-c:var(--c-dashboard);"><h3>Owner's Equity</h3><div class="value ${bs.equity<0?'negative':'positive'}">${fmt(bs.equity)}</div><div class="sub">Computed: assets − liabilities</div></div>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">Assets</h3>
+    <table class="report-table"><tbody>
+      <tr><td>Cash &amp; Bank</td><td style="text-align:right;">${fmt(bs.cash)}</td></tr>
+      <tr><td>Accounts Receivable</td><td style="text-align:right;">${fmt(bs.accountsReceivable)}</td></tr>
+      ${bs.vatReceivableAmt>0?`<tr><td>VAT Receivable</td><td style="text-align:right;">${fmt(bs.vatReceivableAmt)}</td></tr>`:''}
+      <tr><td>Other Current Assets</td><td style="text-align:right;">${fmt(bs.otherCurrentAssets)}</td></tr>
+      <tr style="font-weight:600;border-top:1px solid var(--border);"><td>Total Current Assets</td><td style="text-align:right;">${fmt(bs.currentAssets)}</td></tr>
+      <tr><td style="padding-top:10px;">Fixed / Non-Current Assets</td><td style="text-align:right;padding-top:10px;">${fmt(bs.fixedAssets)}</td></tr>
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Total Assets</td><td style="text-align:right;">${fmt(bs.totalAssets)}</td></tr>
+    </tbody></table>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">Liabilities</h3>
+    <table class="report-table"><tbody>
+      ${bs.vatPayableAmt>0?`<tr><td>VAT Payable</td><td style="text-align:right;">${fmt(bs.vatPayableAmt)}</td></tr>`:''}
+      <tr><td>Other Current Liabilities</td><td style="text-align:right;">${fmt(bs.currentLiabOther)}</td></tr>
+      <tr style="font-weight:600;border-top:1px solid var(--border);"><td>Total Current Liabilities</td><td style="text-align:right;">${fmt(bs.currentLiabilities)}</td></tr>
+      <tr><td style="padding-top:10px;">Non-Current Liabilities</td><td style="text-align:right;padding-top:10px;">${fmt(bs.nonCurrentLiab)}</td></tr>
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Total Liabilities</td><td style="text-align:right;">${fmt(bs.totalLiabilities)}</td></tr>
+    </tbody></table>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">Owner's Equity</h3>
+    <table class="report-table"><tbody>
+      <tr style="font-weight:700;"><td>Equity (Total Assets − Total Liabilities)</td><td style="text-align:right;" class="${bs.equity<0?'negative':'positive'}">${fmt(bs.equity)}</td></tr>
+    </tbody></table>
+    <p style="color:var(--muted);font-size:.8rem;margin-bottom:0;">This is a computed balancing figure, not tracked via separate share capital / drawings accounts — treat it as retained earnings plus any capital introduced.</p>
+  </div>
+  <p style="color:var(--muted);font-size:.8rem;">As at ${bs.asOf}. Fixed assets are shown at the value you recorded — not automatically depreciated.</p>
+  `;
+}
+
+function renderRatios(ratios, bs){
+  const rows = [
+    ['Gross Profit Margin', fmtPct(ratios.grossMargin), 'Gross profit as a % of revenue — how much of each Rand of sales is left after direct costs.'],
+    ['Net Profit Margin', fmtPct(ratios.netMargin), 'Net profit as a % of revenue — overall profitability for the period.'],
+    ['Current Ratio', fmtRatio(ratios.currentRatio), 'Current assets ÷ current liabilities. Above 1 generally means short-term obligations are covered.'],
+    ['Quick Ratio', fmtRatio(ratios.quickRatio), 'Like the current ratio but excludes stock/inventory — a stricter short-term liquidity test.'],
+    ['Working Capital', fmt(ratios.workingCapital), 'Current assets minus current liabilities, in Rand.'],
+    ['Debt-to-Equity', fmtRatio(ratios.debtToEquity), 'Total liabilities ÷ equity. Higher means more reliance on debt vs. owner funding.'],
+    ['Debt Ratio', fmtPct(ratios.debtRatio), 'Total liabilities as a % of total assets.'],
+    ['Return on Assets (ROA)', fmtPct(ratios.roa), 'Net profit ÷ total assets for the period — how efficiently assets generate profit. Not annualized.'],
+    ['Return on Equity (ROE)', fmtPct(ratios.roe), 'Net profit ÷ equity for the period — return generated on owner funding. Not annualized.']
+  ];
+  return `
+  <div class="panel">
+    <table><thead><tr><th>Ratio</th><th>Value</th><th>What it means</th></tr></thead><tbody>
+      ${rows.map(r=>`<tr><td style="font-weight:600;white-space:nowrap;">${r[0]}</td><td style="white-space:nowrap;">${r[1]}</td><td style="color:var(--muted);font-size:.85rem;">${r[2]}</td></tr>`).join('')}
+    </tbody></table>
+  </div>
+  <p style="color:var(--muted);font-size:.8rem;">Profitability ratios use the P&amp;L period above; liquidity and leverage ratios use the balance sheet as of ${bs.asOf}.</p>
+  `;
+}
+
+function attachReportsHandlers(){
+  document.querySelectorAll('[data-report-tab]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{ state.reportsTab = btn.dataset.reportTab; render(); });
+  });
+  document.querySelectorAll('[data-period-mode]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const mode = btn.dataset.periodMode;
+      if(mode === 'custom'){
+        const cur = currentPeriod();
+        state.reportsPeriod = {mode:'custom', start: cur.start, end: cur.end};
+      } else {
+        state.reportsPeriod = {mode};
+      }
+      render();
+    });
+  });
+  document.getElementById('reports-custom-apply')?.addEventListener('click', ()=>{
+    const start = document.getElementById('reports-custom-start').value;
+    const end = document.getElementById('reports-custom-end').value;
+    if(!start || !end || start>end){ toast('Enter a valid date range.'); return; }
+    state.reportsPeriod = {mode:'custom', start, end};
+    render();
   });
 }
 
