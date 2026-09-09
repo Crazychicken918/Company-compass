@@ -427,6 +427,72 @@ alter table cc_entries add column if not exists expense_category text not null d
 alter table cc_assets add column if not exists is_current boolean not null default false;
 alter table cc_liabilities add column if not exists is_current boolean not null default false;
 
+-- ---------- Wave 2: cash flow, AR/AP aging, recurring invoices, budget vs
+-- actual, fixed asset register + depreciation, signed financials (idempotent) ----------
+alter table cc_invoices add column if not exists is_recurring boolean not null default false;
+alter table cc_invoices add column if not exists recurrence_frequency text check (recurrence_frequency in ('weekly','monthly','quarterly','annually'));
+alter table cc_invoices add column if not exists recurrence_next_date date;
+alter table cc_invoices add column if not exists recurrence_end_date date;
+
+alter table cc_liabilities add column if not exists due_date date;
+
+alter table cc_assets add column if not exists purchase_date date;
+alter table cc_assets add column if not exists useful_life_months integer;
+alter table cc_assets add column if not exists residual_value numeric not null default 0;
+alter table cc_assets add column if not exists accumulated_depreciation numeric not null default 0;
+alter table cc_assets add column if not exists last_depreciation_run date;
+
+create table if not exists cc_budgets (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  tag text not null,
+  type text not null default 'expense' check (type in ('revenue','expense')),
+  monthly_amount numeric not null,
+  created_at timestamptz default now(),
+  unique (company_id, tag, type)
+);
+alter table cc_budgets enable row level security;
+drop policy if exists "members select budgets" on cc_budgets;
+create policy "members select budgets" on cc_budgets for select using (cc_is_member(company_id));
+drop policy if exists "admin write budgets" on cc_budgets;
+create policy "admin write budgets" on cc_budgets for insert with check (cc_is_admin(company_id));
+drop policy if exists "admin update budgets" on cc_budgets;
+create policy "admin update budgets" on cc_budgets for update using (cc_is_admin(company_id));
+drop policy if exists "admin delete budgets" on cc_budgets;
+create policy "admin delete budgets" on cc_budgets for delete using (cc_is_admin(company_id));
+
+create table if not exists cc_financial_statements (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  period_label text not null,
+  file_path text not null,
+  file_name text,
+  notes text,
+  uploaded_by uuid references auth.users(id),
+  created_at timestamptz default now()
+);
+alter table cc_financial_statements enable row level security;
+drop policy if exists "members select financial statements" on cc_financial_statements;
+create policy "members select financial statements" on cc_financial_statements for select using (cc_is_member(company_id));
+drop policy if exists "admin write financial statements" on cc_financial_statements;
+create policy "admin write financial statements" on cc_financial_statements for insert with check (cc_is_admin(company_id));
+drop policy if exists "admin delete financial statements" on cc_financial_statements;
+create policy "admin delete financial statements" on cc_financial_statements for delete using (cc_is_admin(company_id));
+
+insert into storage.buckets (id, name, public)
+values ('financials', 'financials', false)
+on conflict (id) do nothing;
+
+drop policy if exists "members view financials files" on storage.objects;
+create policy "members view financials files" on storage.objects for select
+  using (bucket_id = 'financials' and cc_is_member((storage.foldername(name))[1]::uuid));
+drop policy if exists "admin upload financials files" on storage.objects;
+create policy "admin upload financials files" on storage.objects for insert
+  with check (bucket_id = 'financials' and cc_is_admin((storage.foldername(name))[1]::uuid));
+drop policy if exists "admin delete financials files" on storage.objects;
+create policy "admin delete financials files" on storage.objects for delete
+  using (bucket_id = 'financials' and cc_is_admin((storage.foldername(name))[1]::uuid));
+
 -- ---------- verify ----------
 select tablename, count(*) as policy_count
 from pg_policies

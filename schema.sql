@@ -86,6 +86,12 @@ create table if not exists cc_assets (
   -- current (cash-like / convertible within 12 months) vs fixed/non-current,
   -- used by the Balance Sheet report
   is_current boolean not null default false,
+  -- Fixed Asset Register / depreciation (only meaningful for fixed, i.e. !is_current, assets)
+  purchase_date date,
+  useful_life_months integer,
+  residual_value numeric not null default 0,
+  accumulated_depreciation numeric not null default 0,
+  last_depreciation_run date,
   created_at timestamptz default now()
 );
 
@@ -98,6 +104,8 @@ create table if not exists cc_liabilities (
   interest_rate numeric,
   term_months integer,
   start_date date,
+  -- powers payables aging + due-date alerts
+  due_date date,
   -- due within 12 months vs long-term, used by the Balance Sheet report
   is_current boolean not null default false,
   created_at timestamptz default now()
@@ -119,6 +127,11 @@ create table if not exists cc_invoices (
   approved_by uuid references auth.users(id),
   approved_at timestamptz,
   rejection_note text,
+  -- recurring invoices
+  is_recurring boolean not null default false,
+  recurrence_frequency text check (recurrence_frequency in ('weekly','monthly','quarterly','annually')),
+  recurrence_next_date date,
+  recurrence_end_date date,
   created_at timestamptz default now()
 );
 
@@ -393,3 +406,47 @@ create policy "members select employee tasks" on cc_employee_tasks for select us
 create policy "scoped write employee tasks" on cc_employee_tasks for insert with check (cc_has_module(company_id, 'payroll'));
 create policy "scoped update employee tasks" on cc_employee_tasks for update using (cc_has_module(company_id, 'payroll'));
 create policy "scoped delete employee tasks" on cc_employee_tasks for delete using (cc_has_module(company_id, 'payroll'));
+
+-- ============ BUDGET VS ACTUAL ============
+create table if not exists cc_budgets (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  tag text not null,
+  type text not null default 'expense' check (type in ('revenue','expense')),
+  monthly_amount numeric not null,
+  created_at timestamptz default now(),
+  unique (company_id, tag, type)
+);
+alter table cc_budgets enable row level security;
+create policy "members select budgets" on cc_budgets for select using (cc_is_member(company_id));
+create policy "admin write budgets" on cc_budgets for insert with check (cc_is_admin(company_id));
+create policy "admin update budgets" on cc_budgets for update using (cc_is_admin(company_id));
+create policy "admin delete budgets" on cc_budgets for delete using (cc_is_admin(company_id));
+
+-- ============ SIGNED FINANCIAL STATEMENTS ============
+create table if not exists cc_financial_statements (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  period_label text not null,
+  file_path text not null,
+  file_name text,
+  notes text,
+  uploaded_by uuid references auth.users(id),
+  created_at timestamptz default now()
+);
+alter table cc_financial_statements enable row level security;
+create policy "members select financial statements" on cc_financial_statements for select using (cc_is_member(company_id));
+create policy "admin write financial statements" on cc_financial_statements for insert with check (cc_is_admin(company_id));
+create policy "admin delete financial statements" on cc_financial_statements for delete using (cc_is_admin(company_id));
+
+-- storage bucket for signed financials (private) — path convention: <company_id>/<filename>
+insert into storage.buckets (id, name, public)
+values ('financials', 'financials', false)
+on conflict (id) do nothing;
+
+create policy "members view financials files" on storage.objects for select
+  using (bucket_id = 'financials' and cc_is_member((storage.foldername(name))[1]::uuid));
+create policy "admin upload financials files" on storage.objects for insert
+  with check (bucket_id = 'financials' and cc_is_admin((storage.foldername(name))[1]::uuid));
+create policy "admin delete financials files" on storage.objects for delete
+  using (bucket_id = 'financials' and cc_is_admin((storage.foldername(name))[1]::uuid));

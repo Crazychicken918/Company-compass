@@ -139,6 +139,12 @@
   .modal input,.modal select,.modal textarea{width:100%;}
   .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px;}
   .close-x{float:right;background:none;border:none;color:var(--muted);font-size:1.1rem;}
+  .legal-links{text-align:center;font-size:.78rem;color:var(--muted);margin-top:14px;}
+  .legal-links a{color:var(--muted);text-decoration:underline;}
+  .sidebar-legal-links{margin-top:auto;padding-top:10px;text-align:center;}
+  #legal-content h3{margin-top:18px;margin-bottom:6px;}
+  #legal-content h3:first-child{margin-top:0;}
+  #legal-content p{margin:0 0 10px 0;color:var(--muted);}
   .role-badge{font-size:.72rem;padding:2px 8px;border-radius:999px;background:var(--panel2);border:1px solid var(--border);}
   .invoice-items-table input{width:100%;}
   #toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:#fff;padding:10px 16px;border-radius:10px;font-size:.85rem;z-index:99;display:none;box-shadow:0 8px 24px -8px rgba(30,20,60,.4);}
@@ -170,6 +176,9 @@
         <span id="auth-toggle-text">Don't have an account?</span>
         <a href="#" id="auth-toggle-link">Sign up</a>
       </div>
+      <div class="legal-links">
+        <a href="#" data-open-legal="terms">Terms &amp; Conditions</a> · <a href="#" data-open-legal="privacy">Privacy Policy</a>
+      </div>
     </div>
   </div>
 </div>
@@ -192,10 +201,22 @@
       <button data-view="reports"><span class="dot"></span>Reports</button>
       <button data-view="team"><span class="dot"></span>Team</button>
     </nav>
+    <div class="legal-links sidebar-legal-links">
+      <a href="#" data-open-legal="terms">Terms</a> · <a href="#" data-open-legal="privacy">Privacy</a>
+    </div>
     <button class="logout" id="logout-btn">Log out</button>
   </div>
   <div id="main"></div>
 </div>
+
+<div class="modal-backdrop hidden" id="legal-modal-backdrop"><div class="modal" style="max-width:640px;">
+  <button class="close-x" id="legal-modal-close">✕</button>
+  <div class="tabbar" style="margin-bottom:12px;">
+    <button class="btn small" id="legal-tab-terms" data-legal-tab="terms">Terms &amp; Conditions</button>
+    <button class="btn secondary small" id="legal-tab-privacy" data-legal-tab="privacy">Privacy Policy</button>
+  </div>
+  <div id="legal-content" style="font-size:.86rem;line-height:1.6;color:var(--text);"></div>
+</div></div>
 
 <div id="toast"></div>
 
@@ -206,6 +227,25 @@ const SUPABASE_ANON_KEY = 'sb_publishable__WQYy168UXfdP4WmZOFQPQ_asRpInsR';
 const VAT_RATE = 0.15; // South Africa standard VAT rate
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const chartInstances = {};
+function makeChart(canvasId, config){
+  const canvas = document.getElementById(canvasId);
+  if(!canvas || typeof Chart === 'undefined') return;
+  if(chartInstances[canvasId]){ chartInstances[canvasId].destroy(); delete chartInstances[canvasId]; }
+  chartInstances[canvasId] = new Chart(canvas.getContext('2d'), config);
+}
+function last6MonthsRange(){
+  const now = new Date();
+  const months = [];
+  for(let i=5;i>=0;i--){
+    const d = new Date(now.getFullYear(), now.getMonth()-i, 1);
+    const start = d.toISOString().slice(0,10);
+    const end = new Date(d.getFullYear(), d.getMonth()+1, 0).toISOString().slice(0,10);
+    months.push({label: d.toLocaleString(undefined,{month:'short',year:'2-digit'}), start, end});
+  }
+  return months;
+}
 
 /* ========================= STATE ========================= */
 let state = {
@@ -330,6 +370,72 @@ document.getElementById('logout-btn').addEventListener('click', async ()=>{
   window.location.reload();
 });
 
+/* ========================= LEGAL: TERMS & PRIVACY ========================= */
+const LEGAL_LAST_UPDATED = 'September 2026';
+const TERMS_HTML = `
+  <p style="color:var(--muted);font-size:.78rem;">Last updated: ${LEGAL_LAST_UPDATED}</p>
+  <h3>1. Acceptance of these Terms</h3>
+  <p>By creating an account or using Company Compass ("the App"), you agree to these Terms &amp; Conditions on behalf of yourself and, where applicable, the company that invited you. If you don't agree, please don't use the App.</p>
+  <h3>2. What the App is</h3>
+  <p>Company Compass is a business finance record-keeping and reporting tool. It helps you capture revenue, expenses, assets, liabilities, invoices, credit notes, payroll and related management reports (including P&amp;L, balance sheet, cash flow, budgets and ratios) for your company.</p>
+  <h3>3. Not financial, tax or legal advice</h3>
+  <p>Reports, figures and calculations produced by the App (including VAT estimates, depreciation, ratios and management accounts) are provided for convenience and internal planning only. They are not a substitute for advice from a qualified accountant, tax practitioner or legal advisor, and should be independently reviewed before being relied on for statutory filings (e.g. VAT201 returns) or other official purposes.</p>
+  <h3>4. Accounts, roles and access</h3>
+  <p>Access is by invitation from a company administrator. Management-level users can configure roles and module-level permissions for staff; each user is responsible for keeping their own login credentials confidential and for activity carried out under their account.</p>
+  <h3>5. Your data and content</h3>
+  <p>You and your company retain ownership of the financial data, documents and records you enter into or upload to the App. You're responsible for the accuracy of what you enter, and for having the right to upload any documents (such as signed financial statements) that you store in the App.</p>
+  <h3>6. Acceptable use</h3>
+  <p>Please don't use the App to store data you're not authorised to hold, attempt to bypass role-based permissions or approval workflows, or interfere with the App's normal operation.</p>
+  <h3>7. Availability and changes</h3>
+  <p>The App is provided on an "as is" and "as available" basis. Features may be added, changed or removed over time as the App evolves, and we'll aim to keep your data intact when that happens.</p>
+  <h3>8. Limitation of liability</h3>
+  <p>To the fullest extent permitted by law, the App and its operators are not liable for indirect or consequential losses arising from use of the App, or for decisions made based on reports it generates. Nothing in these Terms limits liability that cannot be excluded by law.</p>
+  <h3>9. Changes to these Terms</h3>
+  <p>These Terms may be updated from time to time; continued use of the App after an update means you accept the revised Terms.</p>
+`;
+const PRIVACY_HTML = `
+  <p style="color:var(--muted);font-size:.78rem;">Last updated: ${LEGAL_LAST_UPDATED}</p>
+  <h3>1. Who this applies to</h3>
+  <p>This Privacy Policy explains how Company Compass collects, uses and protects personal information, in line with South Africa's Protection of Personal Information Act (POPIA) and general good-practice data principles.</p>
+  <h3>2. What we collect</h3>
+  <p>Account information (name, email, role); financial and business records you or your team enter (revenue, expenses, assets, liabilities, clients, invoices, credit notes, payroll figures, budgets); documents you upload (such as signed financial statements); and basic usage information needed to operate the App (e.g. login timestamps).</p>
+  <h3>3. How we use it</h3>
+  <p>To provide the App's core functionality — recording transactions, generating reports (P&amp;L, balance sheet, cash flow, ratios, budgets, aging, depreciation), managing approvals, and enforcing role-based access — and to maintain the security and reliability of the service.</p>
+  <h3>4. Where it's stored</h3>
+  <p>Data is stored with our database and file-storage provider (Supabase), which applies row-level security so that each company's data is only accessible to that company's authorised members. Uploaded documents (such as signed financials) are stored in a private file store, accessible only via time-limited links generated for authorised users.</p>
+  <h3>5. Sharing</h3>
+  <p>We don't sell personal or financial information. Data is shared only with the infrastructure providers needed to run the App (such as hosting and database services), or where required by law.</p>
+  <h3>6. Data retention</h3>
+  <p>Your company's records are retained for as long as your account is active, so historical reporting stays accurate. If your company's access is removed, data may be retained for a reasonable period afterward for backup, legal or accounting purposes before deletion.</p>
+  <h3>7. Your rights</h3>
+  <p>Subject to applicable law, you can request access to, correction of, or deletion of personal information held about you by contacting your company administrator, who can action this within the App, or by contacting the App operator directly.</p>
+  <h3>8. Security</h3>
+  <p>Access to the App requires authentication, and permissions are enforced per role and module. As with any online service, no method of transmission or storage is 100% secure, but reasonable technical and organisational measures are used to protect your information.</p>
+  <h3>9. Local storage &amp; cookies</h3>
+  <p>The App may use your browser's local storage to keep you logged in and remember basic preferences. It does not use third-party advertising trackers.</p>
+  <h3>10. Changes to this Policy</h3>
+  <p>This Policy may be updated as the App evolves; material changes will be reflected here with an updated date.</p>
+`;
+function openLegalModal(which){
+  const backdrop = document.getElementById('legal-modal-backdrop');
+  const content = document.getElementById('legal-content');
+  const termsTab = document.getElementById('legal-tab-terms');
+  const privacyTab = document.getElementById('legal-tab-privacy');
+  content.innerHTML = which === 'privacy' ? PRIVACY_HTML : TERMS_HTML;
+  termsTab.className = which === 'privacy' ? 'btn secondary small' : 'btn small';
+  privacyTab.className = which === 'privacy' ? 'btn small' : 'btn secondary small';
+  backdrop.classList.remove('hidden');
+}
+document.querySelectorAll('[data-open-legal]').forEach(link=>{
+  link.addEventListener('click', (e)=>{ e.preventDefault(); openLegalModal(link.dataset.openLegal); });
+});
+document.getElementById('legal-tab-terms')?.addEventListener('click', ()=>openLegalModal('terms'));
+document.getElementById('legal-tab-privacy')?.addEventListener('click', ()=>openLegalModal('privacy'));
+document.getElementById('legal-modal-close')?.addEventListener('click', ()=>{
+  document.getElementById('legal-modal-backdrop').classList.add('hidden');
+});
+
+
 sb.auth.onAuthStateChange((event, session)=>{
   if(session && session.user){
     onAuthReady(session.user);
@@ -451,7 +557,7 @@ document.getElementById('nav').addEventListener('click', (e)=>{
 function render(){
   const main = document.getElementById('main');
   switch(state.view){
-    case 'dashboard': main.innerHTML = renderDashboard(); break;
+    case 'dashboard': main.innerHTML = renderDashboard(); attachDashboardHandlers(); break;
     case 'revenue': main.innerHTML = renderEntries('revenue'); attachEntryHandlers('revenue'); break;
     case 'expenses': main.innerHTML = renderEntries('expense'); attachEntryHandlers('expense'); break;
     case 'assets': main.innerHTML = renderAssets(); attachAssetHandlers(); break;
@@ -464,6 +570,23 @@ function render(){
     case 'reports': main.innerHTML = renderReports(); attachReportsHandlers(); break;
     case 'team': main.innerHTML = renderTeam(); attachTeamHandlers(); break;
   }
+}
+
+function attachDashboardHandlers(){
+  const months = last6MonthsRange();
+  const revenueData = months.map(m=>state.entries.filter(e=>e.type==='revenue' && e.entry_date>=m.start && e.entry_date<=m.end).reduce((s,e)=>s+Number(e.amount),0));
+  const expenseData = months.map(m=>state.entries.filter(e=>e.type==='expense' && e.entry_date>=m.start && e.entry_date<=m.end).reduce((s,e)=>s+Number(e.amount),0));
+  makeChart('dashboard-trend-chart', {
+    type: 'bar',
+    data: {
+      labels: months.map(m=>m.label),
+      datasets: [
+        {label:'Revenue', data: revenueData, backgroundColor: '#0fb981'},
+        {label:'Expenses', data: expenseData, backgroundColor: '#f4406a'}
+      ]
+    },
+    options: {responsive:true, maintainAspectRatio:false, scales:{y:{beginAtZero:true}}}
+  });
 }
 
 /* ========================= CALCULATIONS ========================= */
@@ -492,14 +615,25 @@ function vatFor(asOf){
 function renderDashboard(){
   const t = totalsFor();
   const v = vatFor();
+  const today = todayIso();
   const outstandingInvoices = state.invoices.filter(i=>i.status==='sent'||i.status==='overdue');
+  const overdueInvoices = outstandingInvoices.filter(i=>i.due_date && i.due_date < today);
+  const overdueLiabilities = state.liabilities.filter(l=>l.is_current && l.due_date && l.due_date < today);
+  const dueSoonLiabilities = state.liabilities.filter(l=>l.is_current && l.due_date && l.due_date >= today && daysBetween(today, l.due_date) <= 7);
   return `
     <h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-dashboard);display:inline-block;"></span>Dashboard</h1>
+    ${overdueInvoices.length ? `<div class="alert-banner overdue">⚠ ${overdueInvoices.length} client invoice${overdueInvoices.length>1?'s are':' is'} past due: ${overdueInvoices.map(i=>`${i.invoice_number} (${clientName(i.client_id)}, due ${i.due_date})`).join(', ')}</div>` : ''}
+    ${overdueLiabilities.length ? `<div class="alert-banner overdue">⚠ ${overdueLiabilities.length} supplier/liability payment${overdueLiabilities.length>1?'s are':' is'} past due: ${overdueLiabilities.map(l=>`${l.description} (due ${l.due_date})`).join(', ')}</div>` : ''}
+    ${dueSoonLiabilities.length ? `<div class="alert-banner due">⏰ ${dueSoonLiabilities.length} supplier/liability payment${dueSoonLiabilities.length>1?'s are':' is'} due within 7 days: ${dueSoonLiabilities.map(l=>`${l.description} (due ${l.due_date})`).join(', ')}</div>` : ''}
     <div class="grid">
       <div class="card" style="--accent-c:var(--c-dashboard);"><h3>Predicted Balance</h3><div class="value ${t.predictedBalance<0?'negative':'positive'}">${fmt(t.predictedBalance)}</div><div class="sub">Starting balance + revenue − expenses − payroll</div></div>
       <div class="card" style="--accent-c:var(--c-revenue);"><h3>Revenue vs Expenses</h3><div class="value">${fmt(t.revenue - t.expenses)}</div><div class="sub">${fmt(t.revenue)} revenue, ${fmt(t.expenses)} expenses</div></div>
       <div class="card" style="--accent-c:var(--c-assets);"><h3>Net Worth</h3><div class="value ${t.netWorth<0?'negative':'positive'}">${fmt(t.netWorth)}</div><div class="sub">Assets + balance − liabilities</div></div>
       <div class="card" style="--accent-c:var(--c-vat);"><h3>VAT Payable (current)</h3><div class="value">${fmt(v.vatPayable)}</div><div class="sub">Collected ${fmt(v.vatCollected)} − paid ${fmt(v.vatPaid)}</div></div>
+    </div>
+    <div class="chart-wrap">
+      <h3 style="margin-top:0;">Revenue vs Expenses — last 6 months</h3>
+      <canvas id="dashboard-trend-chart" style="height:220px;"></canvas>
     </div>
     <div class="panel">
       <h3 style="margin-top:0;">Outstanding invoices</h3>
@@ -507,27 +641,33 @@ function renderDashboard(){
         ${outstandingInvoices.map(i=>`<tr><td>${i.invoice_number}</td><td>${clientName(i.client_id)}</td><td>${i.due_date||'—'}</td><td><span class="status-pill status-${i.status}">${i.status}</span></td></tr>`).join('')}
       </tbody></table>` : `<div class="empty">No outstanding invoices.</div>`}
     </div>
-    <div class="panel">
-      <h3 style="margin-top:0;">Recent activity</h3>
-      ${state.entries.slice(0,8).length ? `<table><thead><tr><th>Date</th><th>Type</th><th>Description</th><th>Amount</th></tr></thead><tbody>
-        ${state.entries.slice(0,8).map(e=>`<tr><td>${e.entry_date}</td><td>${e.type}</td><td>${e.description}</td><td>${fmt(e.amount)}</td></tr>`).join('')}
-      </tbody></table>` : `<div class="empty">No entries yet.</div>`}
-    </div>
-    <div class="panel" style="border-top:3px solid var(--c-payroll);">
-      <h3 style="margin-top:0;">Payroll staff &amp; current tasks</h3>
-      ${state.employees.length ? `<table><thead><tr><th>Employee</th><th>Role</th><th>Working on</th></tr></thead><tbody>
-        ${state.employees.filter(e=>e.active).map(e=>{
-          const openTasks = state.employeeTasks.filter(t=>t.employee_id===e.id && t.status!=='done');
-          return `<tr><td>${e.name}</td><td>${e.role_title||'—'}</td><td>${openTasks.length ? openTasks.map(t=>`<span class="tag-pill" title="${t.status}">${t.description}</span>`).join(' ') : '<span style="color:var(--muted);">No active task</span>'}</td></tr>`;
-        }).join('')}
-      </tbody></table>` : `<div class="empty">No employees yet. Add your team under Payroll.</div>`}
-    </div>
-    <div class="panel" style="border-top:3px solid var(--c-team);">
-      <h3 style="margin-top:0;">Team (app access)</h3>
-      ${state.members.length ? `<table><thead><tr><th>Email</th><th>Role</th><th>Status</th></tr></thead><tbody>
-        ${state.members.map(m=>`<tr><td>${m.email}</td><td><span class="role-badge">${m.role}</span></td><td>${m.status}</td></tr>`).join('')}
-      </tbody></table>` : `<div class="empty">No team members yet.</div>`}
-    </div>
+    <details class="collapsible" open>
+      <summary>Recent activity</summary>
+      <div class="panel">
+        ${state.entries.slice(0,8).length ? `<table><thead><tr><th>Date</th><th>Type</th><th>Description</th><th>Amount</th></tr></thead><tbody>
+          ${state.entries.slice(0,8).map(e=>`<tr><td>${e.entry_date}</td><td>${e.type}</td><td>${e.description}</td><td>${fmt(e.amount)}</td></tr>`).join('')}
+        </tbody></table>` : `<div class="empty">No entries yet.</div>`}
+      </div>
+    </details>
+    <details class="collapsible">
+      <summary>Payroll staff &amp; current tasks</summary>
+      <div class="panel" style="border-top:3px solid var(--c-payroll);">
+        ${state.employees.length ? `<table><thead><tr><th>Employee</th><th>Role</th><th>Working on</th></tr></thead><tbody>
+          ${state.employees.filter(e=>e.active).map(e=>{
+            const openTasks = state.employeeTasks.filter(t=>t.employee_id===e.id && t.status!=='done');
+            return `<tr><td>${e.name}</td><td>${e.role_title||'—'}</td><td>${openTasks.length ? openTasks.map(t=>`<span class="tag-pill" title="${t.status}">${t.description}</span>`).join(' ') : '<span style="color:var(--muted);">No active task</span>'}</td></tr>`;
+          }).join('')}
+        </tbody></table>` : `<div class="empty">No employees yet. Add your team under Payroll.</div>`}
+      </div>
+    </details>
+    <details class="collapsible">
+      <summary>Team (app access)</summary>
+      <div class="panel" style="border-top:3px solid var(--c-team);">
+        ${state.members.length ? `<table><thead><tr><th>Email</th><th>Role</th><th>Status</th></tr></thead><tbody>
+          ${state.members.map(m=>`<tr><td>${m.email}</td><td><span class="role-badge">${m.role}</span></td><td>${m.status}</td></tr>`).join('')}
+        </tbody></table>` : `<div class="empty">No team members yet.</div>`}
+      </div>
+    </details>
   `;
 }
 
@@ -646,6 +786,12 @@ function attachEntryHandlers(type){
 }
 
 /* ========================= ASSETS ========================= */
+function assetMonthlyDepreciation(a){
+  if(a.is_current || !a.useful_life_months) return null;
+  const depreciable = Number(a.value) - Number(a.residual_value||0);
+  return depreciable > 0 ? depreciable / a.useful_life_months : 0;
+}
+function assetNBV(a){ return Number(a.value) - Number(a.accumulated_depreciation||0); }
 function renderAssets(){
   const canEdit = hasModule('assets');
   const total = state.assets.reduce((s,a)=>s+Number(a.value),0);
@@ -653,8 +799,15 @@ function renderAssets(){
     <div class="section-header" style="--accent-c:var(--c-assets);"><h1>Assets</h1>${canEdit ? `<button class="btn" id="add-asset-btn">+ Add Asset</button>` : ''}</div>
     <div class="grid"><div class="card" style="--accent-c:var(--c-assets);"><h3>Total Assets</h3><div class="value">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th><th>Current?</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.assets.map(a=>`<tr><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td><td>${a.is_current?'Yes':'No'}</td>${canEdit?`<td><button class="btn small danger" data-del-asset="${a.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th><th>Current?</th><th>Purchase Date</th><th>Monthly Depr.</th><th>Accum. Depr.</th><th>NBV</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.assets.map(a=>{
+          const md = assetMonthlyDepreciation(a);
+          const canRun = canEdit && !a.is_current && md && assetNBV(a) > Number(a.residual_value||0) && a.last_depreciation_run !== todayIso();
+          return `<tr><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td><td>${a.is_current?'Yes':'No'}</td><td>${a.purchase_date||'—'}</td><td>${md!==null?fmt(md):'—'}</td><td>${fmt(Number(a.accumulated_depreciation||0))}</td><td>${a.is_current?'—':fmt(assetNBV(a))}</td>${canEdit?`<td>
+            ${canRun?`<button class="btn small secondary" data-run-depr="${a.id}">Run Depreciation</button>`:''}
+            <button class="btn small danger" data-del-asset="${a.id}">Delete</button>
+          </td>`:''}</tr>`;
+        }).join('')}
       </tbody></table>` : `<div class="empty">No assets recorded yet.</div>`}
     </div>
     ${canEdit ? `
@@ -666,6 +819,9 @@ function renderAssets(){
         <div class="field"><label>Category</label><input type="text" id="asset-category" placeholder="e.g. equipment, property, vehicle, stock"></div>
         <div class="field"><label>Value (R)</label><input type="number" step="0.01" id="asset-value" required></div>
         <div class="field"><label><input type="checkbox" id="asset-current" style="width:auto;"> Current asset (cash-like, or convertible to cash within 12 months)</label></div>
+        <div class="field"><label>Purchase date (optional — used for depreciation &amp; cash flow)</label><input type="date" id="asset-purchase-date"></div>
+        <div class="field"><label>Useful life, months (fixed assets only, for depreciation)</label><input type="number" id="asset-useful-life" min="1"></div>
+        <div class="field"><label>Residual value (R, optional)</label><input type="number" step="0.01" id="asset-residual" value="0"></div>
         <div class="modal-actions"><button type="button" class="btn secondary" id="asset-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
       </form>
     </div></div>` : ''}
@@ -683,7 +839,10 @@ function attachAssetHandlers(){
       description: document.getElementById('asset-description').value.trim(),
       category: document.getElementById('asset-category').value.trim() || null,
       value: parseFloat(document.getElementById('asset-value').value),
-      is_current: document.getElementById('asset-current').checked
+      is_current: document.getElementById('asset-current').checked,
+      purchase_date: document.getElementById('asset-purchase-date').value || null,
+      useful_life_months: parseInt(document.getElementById('asset-useful-life').value) || null,
+      residual_value: parseFloat(document.getElementById('asset-residual').value) || 0
     });
     if(error){ toast(error.message); return; }
     await refreshAll(); render(); toast('Saved.');
@@ -693,6 +852,35 @@ function attachAssetHandlers(){
       if(!confirm('Delete this asset?')) return;
       await sb.from('cc_assets').delete().eq('id', btn.dataset.delAsset);
       await refreshAll(); render();
+    });
+  });
+  document.querySelectorAll('[data-run-depr]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const asset = state.assets.find(a=>a.id===btn.dataset.runDepr);
+      if(!asset) return;
+      const monthly = assetMonthlyDepreciation(asset);
+      if(!monthly){ toast('Set a useful life to run depreciation.'); return; }
+      const remaining = assetNBV(asset) - Number(asset.residual_value||0);
+      const amount = Math.min(monthly, remaining);
+      if(amount <= 0){ toast('This asset is already fully depreciated.'); return; }
+      const today = todayIso();
+      const {error: entryError} = await sb.from('cc_entries').insert({
+        company_id: state.company.id,
+        type: 'expense',
+        description: `Depreciation — ${asset.description}`,
+        amount,
+        entry_date: today,
+        expense_category: 'operating',
+        tags: ['depreciation'],
+        created_by: state.user.id
+      });
+      if(entryError){ toast(entryError.message); return; }
+      const {error: assetError} = await sb.from('cc_assets').update({
+        accumulated_depreciation: Number(asset.accumulated_depreciation||0) + amount,
+        last_depreciation_run: today
+      }).eq('id', asset.id);
+      if(assetError){ toast(assetError.message); return; }
+      await refreshAll(); render(); toast('Depreciation posted.');
     });
   });
 }
@@ -705,8 +893,8 @@ function renderLiabilities(){
     <div class="section-header" style="--accent-c:var(--c-liabilities);"><h1>Liabilities</h1>${canEdit ? `<button class="btn" id="add-liability-btn">+ Add Liability</button>` : ''}</div>
     <div class="grid"><div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Liabilities</h3><div class="value negative">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${state.liabilities.length ? `<table><thead><tr><th>Description</th><th>Type</th><th>Amount</th><th>Rate</th><th>Term</th><th>Current?</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.liabilities.map(l=>`<tr><td>${l.description}</td><td>${l.type}</td><td>${fmt(l.amount)}</td><td>${l.interest_rate?l.interest_rate+'%':'—'}</td><td>${l.term_months?l.term_months+' mo':'—'}</td><td>${l.is_current?'Yes':'No'}</td>${canEdit?`<td><button class="btn small danger" data-del-liability="${l.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.liabilities.length ? `<table><thead><tr><th>Description</th><th>Type</th><th>Amount</th><th>Rate</th><th>Term</th><th>Due Date</th><th>Current?</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.liabilities.map(l=>`<tr><td>${l.description}</td><td>${l.type}</td><td>${fmt(l.amount)}</td><td>${l.interest_rate?l.interest_rate+'%':'—'}</td><td>${l.term_months?l.term_months+' mo':'—'}</td><td>${l.due_date||'—'}</td><td>${l.is_current?'Yes':'No'}</td>${canEdit?`<td><button class="btn small danger" data-del-liability="${l.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No liabilities recorded yet.</div>`}
     </div>
     ${canEdit ? `
@@ -720,6 +908,7 @@ function renderLiabilities(){
         <div class="field"><label>Interest rate (%, optional)</label><input type="number" step="0.01" id="liability-rate"></div>
         <div class="field"><label>Term (months, optional)</label><input type="number" id="liability-term"></div>
         <div class="field"><label>Start date (optional)</label><input type="date" id="liability-start"></div>
+        <div class="field"><label>Due date (optional — powers payables alerts &amp; aging)</label><input type="date" id="liability-due"></div>
         <div class="field"><label><input type="checkbox" id="liability-current" style="width:auto;"> Current liability (due within 12 months)</label></div>
         <div class="modal-actions"><button type="button" class="btn secondary" id="liability-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
       </form>
@@ -741,6 +930,7 @@ function attachLiabilityHandlers(){
       interest_rate: parseFloat(document.getElementById('liability-rate').value) || null,
       term_months: parseInt(document.getElementById('liability-term').value) || null,
       start_date: document.getElementById('liability-start').value || null,
+      due_date: document.getElementById('liability-due').value || null,
       is_current: document.getElementById('liability-current').checked
     });
     if(error){ toast(error.message); return; }
@@ -816,6 +1006,80 @@ function nextInvoiceNumber(){
   return `INV-${year}-${String(next).padStart(3,'0')}`;
 }
 
+function addMonthsIso(dateStr, months){
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setMonth(d.getMonth() + months);
+  return d.toISOString().slice(0,10);
+}
+function nextRecurrenceDate(fromDateStr, frequency){
+  if(!fromDateStr) return null;
+  switch(frequency){
+    case 'weekly': {
+      const d = new Date(fromDateStr + 'T00:00:00');
+      d.setDate(d.getDate() + 7);
+      return d.toISOString().slice(0,10);
+    }
+    case 'quarterly': return addMonthsIso(fromDateStr, 3);
+    case 'annually': return addMonthsIso(fromDateStr, 12);
+    case 'monthly':
+    default: return addMonthsIso(fromDateStr, 1);
+  }
+}
+async function generateDueRecurringInvoices(){
+  if(!canApprove() && !hasModule('invoices')) return; // only attempt if this user could plausibly create invoices
+  const today = new Date().toISOString().slice(0,10);
+  const due = state.invoices.filter(i=>
+    i.is_recurring &&
+    i.recurrence_next_date &&
+    i.recurrence_next_date <= today &&
+    (!i.recurrence_end_date || i.recurrence_next_date <= i.recurrence_end_date)
+  );
+  if(!due.length) return;
+  for(const src of due){
+    // Fetch the source invoice's line items to copy across.
+    const {data: srcItems} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', src.id);
+    const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const {data: created, error} = await sb.from('cc_invoices').insert({
+      company_id: state.company.id,
+      client_id: src.client_id,
+      invoice_number: nextInvoiceNumber(),
+      issue_date: src.recurrence_next_date,
+      due_date: src.due_date ? (()=>{
+        const dayOffset = Math.round((new Date(src.due_date+'T00:00:00') - new Date(src.issue_date+'T00:00:00')) / (1000*60*60*24));
+        const d = new Date(src.recurrence_next_date + 'T00:00:00');
+        d.setDate(d.getDate() + dayOffset);
+        return d.toISOString().slice(0,10);
+      })() : null,
+      status: 'draft',
+      notes: src.notes,
+      created_by: src.created_by,
+      approval_status: approvalStatus,
+      is_recurring: false,
+      recurrence_frequency: null,
+      recurrence_next_date: null,
+      recurrence_end_date: null
+    }).select().single();
+    if(error || !created) continue;
+    if(srcItems && srcItems.length){
+      await sb.from('cc_invoice_items').insert(srcItems.map(it=>({
+        invoice_id: created.id,
+        description: it.description,
+        quantity: it.quantity,
+        unit_price: it.unit_price,
+        vat_applicable: it.vat_applicable
+      })));
+    }
+    // Advance the source invoice's schedule so it isn't regenerated on the next refresh.
+    const advanced = nextRecurrenceDate(src.recurrence_next_date, src.recurrence_frequency);
+    const stillActive = !src.recurrence_end_date || advanced <= src.recurrence_end_date;
+    await sb.from('cc_invoices').update({
+      recurrence_next_date: stillActive ? advanced : null,
+      is_recurring: stillActive
+    }).eq('id', src.id);
+    state.invoices.push(created);
+    state.invoiceItems[created.id] = srcItems || [];
+  }
+}
 function canManageDoc(doc){
   return canApprove() || (doc.created_by === state.user.id && doc.approval_status === 'pending');
 }
@@ -833,7 +1097,7 @@ function renderInvoices(){
     <div class="panel">
       ${state.invoices.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Due</th><th>Status</th><th>Approval</th><th>Total</th><th></th></tr></thead><tbody>
         ${state.invoices.map(i=>`<tr>
-          <td>${i.invoice_number}</td><td>${clientName(i.client_id)}</td><td>${i.issue_date}</td><td>${i.due_date||'—'}</td>
+          <td>${i.invoice_number}${i.is_recurring?` <span class="tag-pill" title="Recurring ${i.recurrence_frequency||''}">↻ recurring</span>`:''}</td><td>${clientName(i.client_id)}</td><td>${i.issue_date}</td><td>${i.due_date||'—'}</td>
           <td><span class="status-pill status-${i.status}">${i.status}</span></td>
           <td>${approvalPill(i)}</td>
           <td id="inv-total-${i.id}">…</td>
@@ -863,6 +1127,16 @@ function invoiceModal(){
         <div class="row">
           <div class="field"><label>Issue date</label><input type="date" id="invoice-issue-date" required></div>
           <div class="field"><label>Due date</label><input type="date" id="invoice-due-date"></div>
+        </div>
+        <div class="field"><label><input type="checkbox" id="invoice-recurring" style="width:auto;"> Recurring invoice</label></div>
+        <div class="row hidden" id="invoice-recurrence-fields">
+          <div class="field"><label>Repeats</label><select id="invoice-recurrence-frequency">
+            <option value="weekly">Weekly</option>
+            <option value="monthly" selected>Monthly</option>
+            <option value="quarterly">Quarterly</option>
+            <option value="annually">Annually</option>
+          </select></div>
+          <div class="field"><label>Stop after (optional)</label><input type="date" id="invoice-recurrence-end"></div>
         </div>
         <h3 style="margin-bottom:6px;">Line items</h3>
         <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:70px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
@@ -902,6 +1176,9 @@ function attachInvoiceHandlers(){
   document.getElementById('invoice-add-item')?.addEventListener('click', ()=>{
     document.getElementById('invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRow());
   });
+  document.getElementById('invoice-recurring')?.addEventListener('change', (e)=>{
+    document.getElementById('invoice-recurrence-fields').classList.toggle('hidden', !e.target.checked);
+  });
   document.getElementById('invoice-items-body')?.addEventListener('click', (e)=>{
     if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
   });
@@ -910,16 +1187,23 @@ function attachInvoiceHandlers(){
     const clientId = document.getElementById('invoice-client').value;
     if(!clientId){ toast('Add a client first.'); return; }
     const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const isRecurring = document.getElementById('invoice-recurring').checked;
+    const issueDate = document.getElementById('invoice-issue-date').value;
+    const frequency = document.getElementById('invoice-recurrence-frequency').value;
     const {data: invoice, error} = await sb.from('cc_invoices').insert({
       company_id: state.company.id,
       client_id: clientId,
       invoice_number: document.getElementById('invoice-number').value.trim(),
-      issue_date: document.getElementById('invoice-issue-date').value,
+      issue_date: issueDate,
       due_date: document.getElementById('invoice-due-date').value || null,
       status: 'draft',
       notes: document.getElementById('invoice-notes').value.trim() || null,
       created_by: state.user.id,
-      approval_status: approvalStatus
+      approval_status: approvalStatus,
+      is_recurring: isRecurring,
+      recurrence_frequency: isRecurring ? frequency : null,
+      recurrence_next_date: isRecurring ? nextRecurrenceDate(issueDate, frequency) : null,
+      recurrence_end_date: isRecurring ? (document.getElementById('invoice-recurrence-end').value || null) : null
     }).select().single();
     if(error){ toast(error.message); return; }
     const rows = [...document.querySelectorAll('#invoice-items-body tr')].map(tr=>({
@@ -1442,7 +1726,7 @@ function computeBS(asOf){
 
   const otherCurrentAssets = state.assets.filter(a=>a.is_current).reduce((s,a)=>s+Number(a.value),0);
   const inventoryValue = state.assets.filter(a=>a.is_current && /stock|inventory/i.test(a.category||'')).reduce((s,a)=>s+Number(a.value),0);
-  const fixedAssets = state.assets.filter(a=>!a.is_current).reduce((s,a)=>s+Number(a.value),0);
+  const fixedAssets = state.assets.filter(a=>!a.is_current).reduce((s,a)=>s+assetNBV(a),0);
 
   const currentAssets = cash + accountsReceivable + otherCurrentAssets + vatReceivableAmt;
   const totalAssets = currentAssets + fixedAssets;
@@ -1476,6 +1760,222 @@ function computeRatios(pl, bs){
   };
 }
 
+function dayBeforeIso(dateStr){
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() - 1);
+  return d.toISOString().slice(0,10);
+}
+function computeCashFlow(start, end){
+  const inRange = (d) => d && d >= start && d <= end;
+
+  // Operating activities — cash-basis revenue and expenses recorded in the period,
+  // plus payroll actually paid in the period.
+  const cashFromRevenue = state.entries.filter(e=>e.type==='revenue' && inRange(e.entry_date)).reduce((s,e)=>s+Number(e.amount),0);
+  const expenseRows = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date));
+  const cosOut = expenseRows.filter(e=>e.expense_category==='cost_of_sales').reduce((s,e)=>s+Number(e.amount),0);
+  const opexOut = expenseRows.filter(e=>e.expense_category!=='cost_of_sales').reduce((s,e)=>s+Number(e.amount),0);
+  const payrollOut = state.payrollPayments.filter(p=>p.paid && inRange(p.pay_date)).reduce((s,p)=>s+Number(p.net),0);
+  const netOperating = cashFromRevenue - cosOut - opexOut - payrollOut;
+
+  // Investing activities — assets purchased (cash out) during the period. Only assets
+  // with a purchase date recorded are included; older assets without one are excluded.
+  const assetPurchases = state.assets.filter(a=>inRange(a.purchase_date)).reduce((s,a)=>s+Number(a.value),0);
+  const netInvesting = -assetPurchases;
+
+  // Financing activities — new liabilities drawn down (cash in) during the period,
+  // based on each liability's start date.
+  const liabilityDraws = state.liabilities.filter(l=>inRange(l.start_date)).reduce((s,l)=>s+Number(l.amount),0);
+  const netFinancing = liabilityDraws;
+
+  const netChange = netOperating + netInvesting + netFinancing;
+  const openingCash = computeBS(dayBeforeIso(start)).cash;
+  const closingCashActual = computeBS(end).cash;
+  const closingCashDerived = openingCash + netChange;
+
+  return {
+    start, end, cashFromRevenue, cosOut, opexOut, payrollOut, netOperating,
+    assetPurchases, netInvesting, liabilityDraws, netFinancing,
+    netChange, openingCash, closingCashDerived, closingCashActual,
+    reconciles: Math.abs(closingCashDerived - closingCashActual) < 0.01
+  };
+}
+function renderCF(cf){
+  return `
+  <div class="panel">
+    <table class="report-table"><tbody>
+      <tr style="font-weight:600;"><td colspan="2">Operating Activities</td></tr>
+      <tr><td>Cash received from revenue</td><td style="text-align:right;">${fmt(cf.cashFromRevenue)}</td></tr>
+      <tr><td>Cash paid — cost of sales</td><td style="text-align:right;">(${fmt(cf.cosOut)})</td></tr>
+      <tr><td>Cash paid — operating expenses</td><td style="text-align:right;">(${fmt(cf.opexOut)})</td></tr>
+      <tr><td>Cash paid — payroll</td><td style="text-align:right;">(${fmt(cf.payrollOut)})</td></tr>
+      <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Net cash from operating activities</td><td style="text-align:right;" class="${cf.netOperating<0?'negative':'positive'}">${fmt(cf.netOperating)}</td></tr>
+
+      <tr style="font-weight:600;"><td colspan="2" style="padding-top:16px;">Investing Activities</td></tr>
+      <tr><td>Purchase of fixed assets</td><td style="text-align:right;">${cf.assetPurchases?`(${fmt(cf.assetPurchases)})`:fmt(0)}</td></tr>
+      <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Net cash from investing activities</td><td style="text-align:right;" class="${cf.netInvesting<0?'negative':'positive'}">${fmt(cf.netInvesting)}</td></tr>
+
+      <tr style="font-weight:600;"><td colspan="2" style="padding-top:16px;">Financing Activities</td></tr>
+      <tr><td>New loans / liabilities drawn</td><td style="text-align:right;">${fmt(cf.liabilityDraws)}</td></tr>
+      <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Net cash from financing activities</td><td style="text-align:right;" class="${cf.netFinancing<0?'negative':'positive'}">${fmt(cf.netFinancing)}</td></tr>
+
+      <tr style="font-weight:700;border-top:2px solid var(--border);padding-top:10px;"><td style="padding-top:10px;">Net change in cash</td><td style="text-align:right;padding-top:10px;" class="${cf.netChange<0?'negative':'positive'}">${fmt(cf.netChange)}</td></tr>
+      <tr><td>Opening cash balance</td><td style="text-align:right;">${fmt(cf.openingCash)}</td></tr>
+      <tr style="font-weight:700;"><td>Closing cash balance</td><td style="text-align:right;">${fmt(cf.closingCashDerived)}</td></tr>
+    </tbody></table>
+  </div>
+  ${cf.reconciles ? '' : `<div class="alert-banner due">Note: this statement's derived closing cash (${fmt(cf.closingCashDerived)}) doesn't quite match the balance sheet's cash figure (${fmt(cf.closingCashActual)}) as of ${cf.end} — usually because some entries or asset/liability dates fall outside how this method attributes cash. Treat the balance sheet as the source of truth for the cash balance.</div>`}
+  <p style="color:var(--muted);font-size:.8rem;">Direct method — cash actually received and paid during ${cf.start} to ${cf.end}, drawn from Revenue/Expense entries, paid payroll, asset purchase dates, and liability start dates.</p>
+  `;
+}
+function daysBetween(fromIso, toIso){
+  const a = new Date(fromIso + 'T00:00:00'), b = new Date(toIso + 'T00:00:00');
+  return Math.round((b - a) / (1000*60*60*24));
+}
+function agingBucketLabel(daysOverdue){
+  if(daysOverdue <= 0) return 'not_due';
+  if(daysOverdue <= 30) return '0-30';
+  if(daysOverdue <= 60) return '31-60';
+  if(daysOverdue <= 90) return '61-90';
+  return '90+';
+}
+function computeARAging(){
+  const today = todayIso();
+  const rows = state.invoices
+    .filter(i=>i.approval_status==='approved' && (i.status==='sent'||i.status==='overdue') && i.due_date)
+    .map(i=>{
+      const daysOverdue = daysBetween(i.due_date, today);
+      const total = docTotal(state.invoiceItems[i.id]);
+      return {id:i.id, number:i.invoice_number, client:clientName(i.client_id), due_date:i.due_date, daysOverdue, bucket: agingBucketLabel(daysOverdue), total};
+    });
+  const buckets = {not_due:0, '0-30':0, '31-60':0, '61-90':0, '90+':0};
+  rows.forEach(r=>{ buckets[r.bucket] += r.total; });
+  return {rows: rows.sort((a,b)=>b.daysOverdue-a.daysOverdue), buckets};
+}
+function computeAPAging(){
+  const today = todayIso();
+  const rows = state.liabilities
+    .filter(l=>l.is_current && l.due_date)
+    .map(l=>{
+      const daysOverdue = daysBetween(l.due_date, today);
+      return {id:l.id, description:l.description, due_date:l.due_date, daysOverdue, bucket: agingBucketLabel(daysOverdue), amount:Number(l.amount)};
+    });
+  const buckets = {not_due:0, '0-30':0, '31-60':0, '61-90':0, '90+':0};
+  rows.forEach(r=>{ buckets[r.bucket] += r.amount; });
+  return {rows: rows.sort((a,b)=>b.daysOverdue-a.daysOverdue), buckets};
+}
+function bucketPillClass(bucket){
+  if(bucket==='not_due') return 'status-pill status-paid';
+  if(bucket==='0-30') return 'status-pill status-pending';
+  return 'status-pill status-overdue';
+}
+function renderAging(ar, ap){
+  const bucketRow = (buckets) => `
+    <div class="grid" style="grid-template-columns:repeat(5,1fr);">
+      <div class="card"><h3>Not yet due</h3><div class="value">${fmt(buckets.not_due)}</div></div>
+      <div class="card"><h3>0–30 days</h3><div class="value">${fmt(buckets['0-30'])}</div></div>
+      <div class="card"><h3>31–60 days</h3><div class="value">${fmt(buckets['31-60'])}</div></div>
+      <div class="card"><h3>61–90 days</h3><div class="value">${fmt(buckets['61-90'])}</div></div>
+      <div class="card"><h3>90+ days</h3><div class="value negative">${fmt(buckets['90+'])}</div></div>
+    </div>`;
+  return `
+  <div class="panel">
+    <h3 style="margin-top:0;">Accounts Receivable Aging</h3>
+    ${bucketRow(ar.buckets)}
+    ${ar.rows.length ? `<table style="margin-top:14px;"><thead><tr><th>Invoice</th><th>Client</th><th>Due Date</th><th>Status</th><th>Amount</th></tr></thead><tbody>
+      ${ar.rows.map(r=>`<tr><td>${r.number}</td><td>${r.client}</td><td>${r.due_date}</td><td><span class="${bucketPillClass(r.bucket)}">${r.bucket==='not_due'?'not due':r.daysOverdue+'d overdue ('+r.bucket+')'}</span></td><td>${fmt(r.total)}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No outstanding invoices with a due date.</div>`}
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">Accounts Payable Aging</h3>
+    ${bucketRow(ap.buckets)}
+    ${ap.rows.length ? `<table style="margin-top:14px;"><thead><tr><th>Liability</th><th>Due Date</th><th>Status</th><th>Amount</th></tr></thead><tbody>
+      ${ap.rows.map(r=>`<tr><td>${r.description}</td><td>${r.due_date}</td><td><span class="${bucketPillClass(r.bucket)}">${r.bucket==='not_due'?'not due':r.daysOverdue+'d overdue ('+r.bucket+')'}</span></td><td>${fmt(r.amount)}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No current liabilities with a due date set.</div>`}
+  </div>
+  <p style="color:var(--muted);font-size:.8rem;">As of ${todayIso()}. Add a due date to invoices and current liabilities to have them tracked here.</p>
+  `;
+}
+function monthsInPeriod(start, end){
+  const s = new Date(start + 'T00:00:00'), e = new Date(end + 'T00:00:00');
+  const months = (e.getFullYear()*12 + e.getMonth()) - (s.getFullYear()*12 + s.getMonth()) + 1;
+  return Math.max(1, months);
+}
+function computeBudgetVsActual(start, end){
+  const inRange = e => e.entry_date >= start && e.entry_date <= end;
+  const months = monthsInPeriod(start, end);
+  return state.budgets.map(b=>{
+    const actual = state.entries
+      .filter(e=>e.type===b.type && inRange(e) && (e.tags||[]).includes(b.tag))
+      .reduce((s,e)=>s+Number(e.amount),0);
+    const budgeted = Number(b.monthly_amount) * months;
+    const pct = budgeted ? actual/budgeted : null;
+    return {id:b.id, tag:b.tag, type:b.type, monthlyAmount:Number(b.monthly_amount), budgeted, actual, pct, months};
+  }).sort((a,b)=>a.tag.localeCompare(b.tag));
+}
+function renderBudget(rows, start, end){
+  const canEdit = isAdmin();
+  return `
+  ${canEdit ? `
+  <div class="panel">
+    <h3 style="margin-top:0;">Add / update a budget line</h3>
+    <form id="budget-form" class="row" style="align-items:flex-end;">
+      <div class="field"><label>Tag</label><input type="text" id="budget-tag" placeholder="e.g. marketing" required></div>
+      <div class="field"><label>Type</label><select id="budget-type"><option value="expense">Expense</option><option value="revenue">Revenue</option></select></div>
+      <div class="field"><label>Monthly budget</label><input type="number" id="budget-amount" step="0.01" min="0" required></div>
+      <button class="btn" type="submit">Save</button>
+    </form>
+    <p style="color:var(--muted);font-size:.8rem;margin-bottom:0;">Tag entries under Revenue/Expenses with a matching tag for them to count toward that budget line. Saving an existing tag+type updates its monthly amount.</p>
+  </div>
+  ` : ''}
+  <div class="panel">
+    <h3 style="margin-top:0;">Budget vs Actual — ${start} to ${end}</h3>
+    ${rows.length ? rows.map(r=>{
+      const over = r.pct !== null && r.pct > 1;
+      const pctDisplay = r.pct===null ? '—' : fmtPct(r.pct);
+      const barPct = r.pct===null ? 0 : Math.min(100, r.pct*100);
+      return `<div class="budget-row">
+        <div style="display:flex;justify-content:space-between;font-size:.88rem;margin-bottom:2px;">
+          <span style="font-weight:600;">${r.tag} <span class="tag-pill">${r.type}</span></span>
+          <span class="${over?'negative':''}">${fmt(r.actual)} / ${fmt(r.budgeted)} (${pctDisplay})</span>
+        </div>
+        <div class="budget-bar-track"><div class="budget-bar-fill" style="width:${barPct}%;background:${over?'var(--danger)':'var(--accent)'};"></div></div>
+        ${canEdit ? `<div style="margin-top:4px;"><button class="btn small secondary" data-del-budget="${r.id}">Remove budget line</button></div>` : ''}
+      </div>`;
+    }).join('') : `<div class="empty">No budget lines yet. ${canEdit?'Add one above.':'Ask management to set one up.'}</div>`}
+  </div>
+  <p style="color:var(--muted);font-size:.8rem;">Budgeted amounts are each line's monthly figure × ${monthsInPeriod(start,end)} month(s) in the selected period. Actuals are Revenue/Expense entries in that period tagged with the matching tag.</p>
+  `;
+}
+function renderFinancials(){
+  const canEdit = isAdmin();
+  const statements = state.financialStatements || [];
+  const mostRecent = statements[0];
+  return `
+  ${canEdit ? `
+  <div class="panel">
+    <h3 style="margin-top:0;">Upload signed financials</h3>
+    <form id="financials-form" class="row" style="align-items:flex-end;">
+      <div class="field"><label>Period label</label><input type="text" id="financials-period" placeholder="e.g. FY2025, Q1 2026" required></div>
+      <div class="field"><label>File (PDF recommended)</label><input type="file" id="financials-file" required></div>
+      <div class="field"><label>Notes (optional)</label><input type="text" id="financials-notes"></div>
+      <button class="btn" type="submit">Upload</button>
+    </form>
+  </div>
+  ` : ''}
+  ${mostRecent ? `<div class="panel" style="border-top:3px solid var(--c-reports);">
+    <h3 style="margin-top:0;">Most recent signed financials</h3>
+    <p style="margin-bottom:10px;"><strong>${mostRecent.period_label}</strong> — uploaded ${new Date(mostRecent.created_at).toLocaleDateString()}${mostRecent.notes?` · ${mostRecent.notes}`:''}</p>
+    <button class="btn small" data-view-financial="${mostRecent.id}">View</button>
+  </div>` : ''}
+  <div class="panel">
+    <h3 style="margin-top:0;">All signed financials</h3>
+    ${statements.length ? `<table><thead><tr><th>Period</th><th>File</th><th>Notes</th><th>Uploaded</th><th></th></tr></thead><tbody>
+      ${statements.map(s=>`<tr><td>${s.period_label}</td><td>${s.file_name||'—'}</td><td>${s.notes||'—'}</td><td>${new Date(s.created_at).toLocaleDateString()}</td>
+        <td><button class="btn small secondary" data-view-financial="${s.id}">View</button>${canEdit?` <button class="btn small danger" data-del-financial="${s.id}">Delete</button>`:''}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No signed financials uploaded yet.</div>`}
+  </div>
+  `;
+}
 function renderReports(){
   if(!(isAdmin() || canApprove())){
     return `<h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-reports);display:inline-block;"></span>Reports</h1>
@@ -1484,6 +1984,7 @@ function renderReports(){
   const period = currentPeriod();
   const pl = computePL(period.start, period.end);
   const bs = computeBS(period.end);
+  const cf = computeCashFlow(period.start, period.end);
   const ratios = computeRatios(pl, bs);
 
   return `
@@ -1491,6 +1992,10 @@ function renderReports(){
     <div class="tabbar">
       <button class="btn ${state.reportsTab==='pl'?'':'secondary'} small" data-report-tab="pl">Profit &amp; Loss</button>
       <button class="btn ${state.reportsTab==='bs'?'':'secondary'} small" data-report-tab="bs">Balance Sheet</button>
+      <button class="btn ${state.reportsTab==='cf'?'':'secondary'} small" data-report-tab="cf">Cash Flow</button>
+      <button class="btn ${state.reportsTab==='aging'?'':'secondary'} small" data-report-tab="aging">Receivables &amp; Payables</button>
+      <button class="btn ${state.reportsTab==='budget'?'':'secondary'} small" data-report-tab="budget">Budget vs Actual</button>
+      <button class="btn ${state.reportsTab==='financials'?'':'secondary'} small" data-report-tab="financials">Signed Financials</button>
       <button class="btn ${state.reportsTab==='ratios'?'':'secondary'} small" data-report-tab="ratios">Ratios</button>
     </div>
     <div class="panel period-bar">
@@ -1503,12 +2008,16 @@ function renderReports(){
       ` : ''}
       <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">P&amp;L: ${period.start} to ${period.end}<br>Balance sheet as of ${period.end}</div>
     </div>
-    ${state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : renderPL(pl)}
+    ${state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='aging' ? renderAging(computeARAging(), computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : renderPL(pl)}
   `;
 }
 
 function renderPL(pl){
   return `
+  <div class="chart-wrap">
+    <h3 style="margin-top:0;">P&amp;L breakdown</h3>
+    <canvas id="pl-chart" style="height:220px;"></canvas>
+  </div>
   <div class="panel">
     <table class="report-table"><tbody>
       <tr><td>Revenue</td><td style="text-align:right;">${fmt(pl.revenue)}</td></tr>
@@ -1527,6 +2036,10 @@ function renderPL(pl){
 
 function renderBS(bs){
   return `
+  <div class="chart-wrap">
+    <h3 style="margin-top:0;">Assets vs Liabilities vs Equity</h3>
+    <canvas id="bs-chart" style="height:220px;"></canvas>
+  </div>
   <div class="grid">
     <div class="card" style="--accent-c:var(--c-assets);"><h3>Total Assets</h3><div class="value">${fmt(bs.totalAssets)}</div></div>
     <div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Liabilities</h3><div class="value negative">${fmt(bs.totalLiabilities)}</div></div>
@@ -1561,7 +2074,7 @@ function renderBS(bs){
     </tbody></table>
     <p style="color:var(--muted);font-size:.8rem;margin-bottom:0;">This is a computed balancing figure, not tracked via separate share capital / drawings accounts — treat it as retained earnings plus any capital introduced.</p>
   </div>
-  <p style="color:var(--muted);font-size:.8rem;">As at ${bs.asOf}. Fixed assets are shown at the value you recorded — not automatically depreciated.</p>
+  <p style="color:var(--muted);font-size:.8rem;">As at ${bs.asOf}. Fixed assets are shown at net book value (cost less accumulated depreciation) where depreciation has been run under Assets.</p>
   `;
 }
 
@@ -1588,6 +2101,33 @@ function renderRatios(ratios, bs){
 }
 
 function attachReportsHandlers(){
+  const period = currentPeriod();
+  if(state.reportsTab==='pl' || !state.reportsTab){
+    const pl = computePL(period.start, period.end);
+    makeChart('pl-chart', {
+      type: 'bar',
+      data: {
+        labels: ['Revenue','Cost of Sales','Operating Exp.','Payroll','Net Profit'],
+        datasets: [{
+          label: 'Amount',
+          data: [pl.revenue, -pl.cos, -pl.opex, -pl.payrollCost, pl.netProfit],
+          backgroundColor: ['#0fb981','#f4406a','#f4406a','#f4406a', pl.netProfit<0?'#f4406a':'#7c5cff']
+        }]
+      },
+      options: {responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}}
+    });
+  }
+  if(state.reportsTab==='bs'){
+    const bs = computeBS(period.end);
+    makeChart('bs-chart', {
+      type: 'doughnut',
+      data: {
+        labels: ['Total Assets','Total Liabilities',"Owner's Equity"],
+        datasets: [{data: [bs.totalAssets, bs.totalLiabilities, Math.max(0,bs.equity)], backgroundColor: ['#0fb981','#f4406a','#7c5cff']}]
+      },
+      options: {responsive:true, maintainAspectRatio:false}
+    });
+  }
   document.querySelectorAll('[data-report-tab]').forEach(btn=>{
     btn.addEventListener('click', ()=>{ state.reportsTab = btn.dataset.reportTab; render(); });
   });
@@ -1609,6 +2149,64 @@ function attachReportsHandlers(){
     if(!start || !end || start>end){ toast('Enter a valid date range.'); return; }
     state.reportsPeriod = {mode:'custom', start, end};
     render();
+  });
+  document.getElementById('budget-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const tag = document.getElementById('budget-tag').value.trim();
+    const type = document.getElementById('budget-type').value;
+    const monthly_amount = parseFloat(document.getElementById('budget-amount').value) || 0;
+    if(!tag){ toast('Enter a tag.'); return; }
+    const {error} = await sb.from('cc_budgets').upsert({
+      company_id: state.company.id, tag, type, monthly_amount
+    }, {onConflict: 'company_id,tag,type'});
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Budget line saved.');
+  });
+  document.querySelectorAll('[data-del-budget]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Remove this budget line?')) return;
+      await sb.from('cc_budgets').delete().eq('id', btn.dataset.delBudget);
+      await refreshAll(); render();
+    });
+  });
+  document.getElementById('financials-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const fileInput = document.getElementById('financials-file');
+    const file = fileInput.files[0];
+    if(!file){ toast('Choose a file.'); return; }
+    const period = document.getElementById('financials-period').value.trim();
+    const notes = document.getElementById('financials-notes').value.trim() || null;
+    const path = `${state.company.id}/${Date.now()}_${file.name}`;
+    const {error: upErr} = await sb.storage.from('financials').upload(path, file);
+    if(upErr){ toast(upErr.message); return; }
+    const {error: rowErr} = await sb.from('cc_financial_statements').insert({
+      company_id: state.company.id,
+      period_label: period,
+      file_path: path,
+      file_name: file.name,
+      notes,
+      uploaded_by: state.user.id
+    });
+    if(rowErr){ toast(rowErr.message); return; }
+    await refreshAll(); render(); toast('Signed financials uploaded.');
+  });
+  document.querySelectorAll('[data-view-financial]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const s = (state.financialStatements||[]).find(x=>x.id===btn.dataset.viewFinancial);
+      if(!s) return;
+      const {data, error} = await sb.storage.from('financials').createSignedUrl(s.file_path, 300);
+      if(error || !data){ toast((error&&error.message)||'Could not open file.'); return; }
+      window.open(data.signedUrl, '_blank');
+    });
+  });
+  document.querySelectorAll('[data-del-financial]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this signed financials record?')) return;
+      const s = (state.financialStatements||[]).find(x=>x.id===btn.dataset.delFinancial);
+      await sb.from('cc_financial_statements').delete().eq('id', btn.dataset.delFinancial);
+      if(s) await sb.storage.from('financials').remove([s.file_path]);
+      await refreshAll(); render();
+    });
   });
 }
 
