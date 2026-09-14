@@ -15,6 +15,7 @@
     --c-dashboard:#7c5cff; --c-revenue:#0fb981; --c-expenses:#f4406a; --c-assets:#06b6d4;
     --c-liabilities:#f5a524; --c-clients:#a855f7; --c-invoices:#6366f1; --c-creditnotes:#ec4899;
     --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b; --c-reports:#1d4ed8;
+    --c-scenarios:#059669;
   }
   *{box-sizing:border-box;}
   body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
@@ -85,6 +86,7 @@
   #sidebar nav button[data-view="vat"]{--dot:var(--c-vat);}
   #sidebar nav button[data-view="reports"]{--dot:var(--c-reports);}
   #sidebar nav button[data-view="team"]{--dot:var(--c-team);}
+  #sidebar nav button[data-view="scenarios"]{--dot:var(--c-scenarios);}
   #sidebar .logout{margin-top:10px;font-size:.8rem;color:var(--muted);background:none;border:none;text-align:left;padding:9px 10px;}
 
   #main{flex:1;padding:26px 32px;max-width:1100px;}
@@ -199,6 +201,7 @@
       <button data-view="payroll"><span class="dot"></span>Payroll</button>
       <button data-view="vat"><span class="dot"></span>VAT</button>
       <button data-view="reports"><span class="dot"></span>Reports</button>
+      <button data-view="scenarios"><span class="dot"></span>Scenarios</button>
       <button data-view="team"><span class="dot"></span>Team</button>
     </nav>
     <div class="legal-links sidebar-legal-links">
@@ -247,6 +250,98 @@ function last6MonthsRange(){
   return months;
 }
 
+/* ========================= SCENARIO PLANNER — finance helpers ========================= */
+// Nominal-rate convention throughout (annual rate / periods-per-year), matching the
+// standard loan-amortization formula used below — keeps discount-rate and loan-rate
+// math on the same footing and easy to hand-verify.
+function periodsPerYear(unit){ return unit==='month' ? 12 : (unit==='quarter' ? 4 : 1); }
+function periodicRateFromAnnual(annualPct, unit){ return (Number(annualPct)||0)/100 / periodsPerYear(unit); }
+function annualRateFromPeriodic(periodicRateVal, unit){ return periodicRateVal * periodsPerYear(unit) * 100; }
+
+function computeNPV(cashflows, periodicRateVal){
+  return (cashflows||[]).reduce((sum,cf)=> sum + Number(cf.amount)/Math.pow(1+periodicRateVal, Number(cf.period_number)), 0);
+}
+
+// Bisection search for the periodic rate at which NPV = 0. Returns null when the
+// cash flow stream never changes sign (no IRR exists — e.g. all inflows or all outflows).
+function computeIRRPeriodic(cashflows){
+  const npvAt = r => (cashflows||[]).reduce((s,cf)=> s + Number(cf.amount)/Math.pow(1+r, Number(cf.period_number)), 0);
+  let lo = -0.999999, hi = 10;
+  let fLo = npvAt(lo), fHi = npvAt(hi);
+  if(!isFinite(fLo) || !isFinite(fHi) || (fLo === 0) || (fHi === 0) || ((fLo>0) === (fHi>0))) return null;
+  let mid = 0;
+  for(let i=0;i<200;i++){
+    mid = (lo+hi)/2;
+    const fMid = npvAt(mid);
+    if(Math.abs(fMid) < 1e-9) break;
+    if((fLo<0) === (fMid<0)){ lo = mid; fLo = fMid; } else { hi = mid; }
+  }
+  return mid;
+}
+function computeIRR(cashflows, periodUnit){
+  const p = computeIRRPeriodic(cashflows);
+  return p===null ? null : annualRateFromPeriodic(p, periodUnit);
+}
+
+// Standard amortizing-loan formula. termMonths must be a positive integer.
+function amortizationSchedule(principal, annualRatePct, termMonths){
+  principal = Number(principal)||0;
+  const n = Math.max(1, Math.round(Number(termMonths)||0));
+  const monthlyRate = (Number(annualRatePct)||0)/100/12;
+  const payment = monthlyRate === 0 ? principal/n : principal * monthlyRate / (1 - Math.pow(1+monthlyRate, -n));
+  const rows = [];
+  let balance = principal;
+  for(let m=1; m<=n; m++){
+    const interest = balance*monthlyRate;
+    const principalPortion = Math.min(balance, payment - interest);
+    balance = Math.max(0, balance - principalPortion);
+    rows.push({month:m, payment, interest, principal:principalPortion, balance});
+  }
+  return {payment, rows};
+}
+
+// Payment / total-interest at the base rate plus/minus 1-2 percentage points, so a
+// loan decision can be pressure-tested against rate movement.
+function loanRateSensitivity(principal, baseRatePct, termMonths){
+  const deltas = [-2,-1,0,1,2];
+  return deltas.map(d=>{
+    const rate = Math.max(0, (Number(baseRatePct)||0)+d);
+    const {payment, rows} = amortizationSchedule(principal, rate, termMonths);
+    const totalInterest = rows.reduce((s,r)=>s+r.interest,0);
+    return {delta:d, rate, payment, totalInterest, totalPaid: payment*rows.length};
+  });
+}
+
+// period 0 = loan proceeds received; periods 1..n = repayments. Discounting this
+// stream at the company's own hurdle (discount) rate shows whether the loan is cheap
+// or expensive relative to that hurdle — and as a self-check, the IRR of this exact
+// stream comes back equal to the loan's own annual rate.
+function generateLoanCashflows(params){
+  const principal = Number(params.principal)||0;
+  const annualRate = Number(params.annual_rate)||0;
+  const termMonths = Math.max(1, Math.round(Number(params.term_months)||0));
+  const {payment} = amortizationSchedule(principal, annualRate, termMonths);
+  const cfs = [{period_number:0, label:'Loan proceeds', amount: principal}];
+  for(let m=1; m<=termMonths; m++){
+    cfs.push({period_number:m, label:`Repayment ${m}`, amount: -payment});
+  }
+  return cfs;
+}
+
+// Generates the recurring cash-outflow timeline for one supplier option, shifting
+// each period's outflow forward by its payment terms (days) so two suppliers with
+// the same headline cost but different terms show up with different cash timing.
+function generateSupplierCashflows(supplier, periodsCount, periodUnit){
+  const daysPerPeriod = periodUnit==='month' ? 30 : (periodUnit==='quarter' ? 90 : 365);
+  const shift = Math.round((Number(supplier.payment_terms_days)||0)/daysPerPeriod);
+  const n = Math.max(1, Math.round(Number(periodsCount)||0));
+  const cfs = [];
+  for(let p=1; p<=n; p++){
+    cfs.push({period_number: p+shift, label:`${supplier.name||'Supplier'} — period ${p}`, amount: -Math.abs(Number(supplier.cost_per_period)||0)});
+  }
+  return cfs;
+}
+
 /* ========================= STATE ========================= */
 let state = {
   user: null,
@@ -265,9 +360,14 @@ let state = {
   employees: [],
   payrollPayments: [],
   employeeTasks: [],
+  scenarios: [],
+  scenarioCashflows: {},   // scenarioId -> cashflow rows[], sorted by period_number
   view: 'dashboard',
   reportsTab: 'pl',
-  reportsPeriod: {mode:'month'}
+  reportsPeriod: {mode:'month'},
+  scenarioDetailId: null,  // scenario id currently expanded for editing, or null = list view
+  scenarioNewCategory: null, // category chosen in the "new scenario" modal, or null = modal closed
+  scenarioCompareIds: []   // scenario ids currently selected for side-by-side comparison
 };
 
 function fmt(n){
@@ -533,6 +633,15 @@ async function refreshAll(){
   state.payrollPayments = payments.data || [];
   state.employeeTasks = tasks.data || [];
 
+  const scenariosRes = await sb.from('cc_scenarios').select('*').eq('company_id', cid).order('created_at', {ascending:false});
+  state.scenarios = scenariosRes.data || [];
+  const scenarioIds = state.scenarios.map(s=>s.id);
+  const cashflowsRes = scenarioIds.length
+    ? await sb.from('cc_scenario_cashflows').select('*').in('scenario_id', scenarioIds).order('period_number', {ascending:true})
+    : {data: []};
+  state.scenarioCashflows = {};
+  (cashflowsRes.data||[]).forEach(row=>{ (state.scenarioCashflows[row.scenario_id] = state.scenarioCashflows[row.scenario_id]||[]).push(row); });
+
   const invoiceIds = state.invoices.map(i=>i.id);
   const creditNoteIds = state.creditNotes.map(cn=>cn.id);
   const [invItemsRes, cnItemsRes] = await Promise.all([
@@ -568,6 +677,7 @@ function render(){
     case 'payroll': main.innerHTML = renderPayroll(); attachPayrollHandlers(); break;
     case 'vat': main.innerHTML = renderVat(); break;
     case 'reports': main.innerHTML = renderReports(); attachReportsHandlers(); break;
+    case 'scenarios': main.innerHTML = renderScenarios(); attachScenarioHandlers(); break;
     case 'team': main.innerHTML = renderTeam(); attachTeamHandlers(); break;
   }
 }
@@ -2355,6 +2465,335 @@ function attachTeamHandlers(){
     btn.addEventListener('click', async ()=>{
       if(!confirm('Remove this team member?')) return;
       await sb.from('cc_company_members').delete().eq('id', btn.dataset.delMember);
+      await refreshAll(); render();
+    });
+  });
+}
+
+/* ========================= SCENARIO PLANNER ========================= */
+function scenarioCategoryLabel(cat){
+  return cat==='loan' ? 'Loan' : (cat==='supplier' ? 'Supplier' : 'General');
+}
+function scenarioCategoryBadge(cat){
+  const colors = { loan:['#fef3de','#c9860b'], supplier:['#e3faf1','#0fb981'], general:['#ece7ff','#7c5cff'] };
+  const pair = colors[cat] || colors.general;
+  return `<span class="status-pill" style="background:${pair[0]};color:${pair[1]};">${scenarioCategoryLabel(cat)}</span>`;
+}
+function fmtPct(n){
+  return (n===null || n===undefined || !isFinite(n)) ? '—' : n.toFixed(1) + '%';
+}
+function scenarioCashflowsFor(scenarioId){
+  return state.scenarioCashflows[scenarioId] || [];
+}
+function scenarioNPV(sc){
+  return computeNPV(scenarioCashflowsFor(sc.id), periodicRateFromAnnual(sc.discount_rate, sc.period_unit));
+}
+function scenarioIRR(sc){
+  return computeIRR(scenarioCashflowsFor(sc.id), sc.period_unit);
+}
+
+function renderScenarios(){
+  const canView = isAdmin() || canApprove();
+  if(!canView){
+    return `<h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-scenarios);display:inline-block;"></span>Scenarios</h1>
+    <div class="panel"><p class="empty">What-if scenario planning is only visible to management (and staff approved as an accountant).</p></div>`;
+  }
+  const canEdit = canView;
+  if(state.scenarioDetailId){
+    const sc = state.scenarios.find(s=>s.id===state.scenarioDetailId);
+    if(sc) return renderScenarioDetail(sc, canEdit);
+    state.scenarioDetailId = null;
+  }
+  return renderScenarioList(canEdit);
+}
+
+function renderScenarioList(canEdit){
+  const compareIds = state.scenarioCompareIds.filter(id => state.scenarios.some(s=>s.id===id));
+  return `
+    <div class="section-header" style="--accent-c:var(--c-scenarios);"><h1>Scenarios</h1>${canEdit ? `<button class="btn" id="add-scenario-btn">+ New Scenario</button>` : ''}</div>
+    <div class="panel">
+      <p style="color:var(--muted);font-size:.86rem;margin-top:0;">Model a what-if — a supplier option, a loan you're considering, or any other plan — as a scenario, then tick two or more to compare them side by side. Nothing here posts to your books until you say so.</p>
+      ${state.scenarios.length ? `<table><thead><tr><th></th><th>Name</th><th>Category</th><th>Discount Rate</th><th>Period</th><th>Cash Flow Lines</th><th>NPV</th><th>IRR</th><th></th></tr></thead><tbody>
+        ${state.scenarios.map(sc=>{
+          const npv = scenarioNPV(sc);
+          const irr = scenarioIRR(sc);
+          const lineCount = scenarioCashflowsFor(sc.id).length;
+          return `<tr>
+            <td><input type="checkbox" data-compare-scenario="${sc.id}" ${compareIds.includes(sc.id)?'checked':''} style="width:auto;"></td>
+            <td>${sc.name}</td>
+            <td>${scenarioCategoryBadge(sc.category)}</td>
+            <td>${Number(sc.discount_rate).toFixed(1)}%</td>
+            <td>${sc.period_unit}</td>
+            <td>${lineCount}</td>
+            <td class="${npv<0?'negative':''}">${fmt(npv)}</td>
+            <td>${fmtPct(irr)}</td>
+            <td style="white-space:nowrap;"><button class="btn small secondary" data-manage-scenario="${sc.id}">Manage</button>${canEdit?` <button class="btn small danger" data-del-scenario="${sc.id}">Delete</button>`:''}</td>
+          </tr>`;
+        }).join('')}
+      </tbody></table>` : `<div class="empty">No scenarios yet. Create one to model a supplier choice, a loan decision, or any other what-if.</div>`}
+    </div>
+    ${compareIds.length >= 2 ? renderScenarioComparison(compareIds) : (compareIds.length===1 ? `<div class="panel"><p class="empty">Select at least one more scenario to compare.</p></div>` : '')}
+    ${canEdit ? `
+    <div class="modal-backdrop hidden" id="scenario-modal-backdrop"><div class="modal">
+      <button class="close-x" id="scenario-modal-close">✕</button>
+      <h2>New Scenario</h2>
+      <form id="scenario-form">
+        <div class="field"><label>Name</label><input type="text" id="scenario-name" placeholder="e.g. Supplier A, Equipment loan, Revenue -10%" required></div>
+        <div class="field"><label>Category</label><select id="scenario-category">
+          <option value="general">General — freeform cash flow lines</option>
+          <option value="supplier">Supplier comparison — cost + payment timing</option>
+          <option value="loan">Loan — amortization + NPV/IRR</option>
+        </select></div>
+        <div class="field"><label>Discount rate (annual %, for NPV/IRR)</label><input type="number" step="0.1" id="scenario-discount-rate" value="10" required></div>
+        <div class="field"><label>Period</label><select id="scenario-period-unit"><option value="month">Monthly</option><option value="quarter">Quarterly</option><option value="year">Yearly</option></select></div>
+        <div class="field"><label>Notes (optional)</label><textarea id="scenario-notes" rows="2"></textarea></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="scenario-cancel">Cancel</button><button type="submit" class="btn">Create</button></div>
+      </form>
+    </div></div>` : ''}
+  `;
+}
+
+function renderScenarioComparison(ids){
+  const rows = ids.map(id=>state.scenarios.find(s=>s.id===id)).filter(Boolean)
+    .map(sc=>({ sc, npv: scenarioNPV(sc), irr: scenarioIRR(sc), cfs: scenarioCashflowsFor(sc.id) }));
+  const bestNpv = rows.length ? Math.max(...rows.map(r=>r.npv)) : null;
+  const allPeriods = [...new Set(rows.flatMap(r=>r.cfs.map(cf=>Number(cf.period_number))))].sort((a,b)=>a-b);
+  return `
+    <div class="panel" style="border-top:3px solid var(--c-scenarios);">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <h3 style="margin-top:0;">Comparing ${rows.length} scenarios</h3>
+        <button class="btn small secondary" id="scenario-clear-compare">Clear</button>
+      </div>
+      <div class="grid" style="grid-template-columns:repeat(${rows.length},minmax(160px,1fr));">
+        ${rows.map(r=>`<div class="card" style="--accent-c:var(--c-scenarios);${r.npv===bestNpv?'box-shadow:0 0 0 2px var(--c-scenarios) inset;':''}">
+          <h3>${r.sc.name}${r.npv===bestNpv?' <span class="status-pill status-paid">Best NPV</span>':''}</h3>
+          <div class="value ${r.npv<0?'negative':''}">${fmt(r.npv)}</div>
+          <div style="color:var(--muted);font-size:.8rem;">IRR: ${fmtPct(r.irr)} · ${scenarioCategoryLabel(r.sc.category)} · ${Number(r.sc.discount_rate).toFixed(1)}% discount</div>
+        </div>`).join('')}
+      </div>
+      ${allPeriods.length ? `<table><thead><tr><th>Period</th>${rows.map(r=>`<th>${r.sc.name}</th>`).join('')}</tr></thead><tbody>
+        ${allPeriods.map(p=>`<tr><td>${p}</td>${rows.map(r=>{
+          const cf = r.cfs.find(x=>Number(x.period_number)===p);
+          return `<td class="${cf && Number(cf.amount)<0 ? 'negative' : ''}">${cf ? fmt(cf.amount) : '—'}</td>`;
+        }).join('')}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No cash flow lines to compare yet — open a scenario and generate or add its cash flows first.</div>`}
+    </div>
+  `;
+}
+
+function renderScenarioDetail(sc, canEdit){
+  const cfs = scenarioCashflowsFor(sc.id);
+  const npv = computeNPV(cfs, periodicRateFromAnnual(sc.discount_rate, sc.period_unit));
+  const irr = computeIRR(cfs, sc.period_unit);
+  const params = sc.params || {};
+
+  let categorySection = '';
+  if(sc.category === 'loan'){
+    const principal = params.principal ?? '';
+    const rate = params.annual_rate ?? sc.discount_rate;
+    const term = params.term_months ?? '';
+    let scheduleHtml = '';
+    if(cfs.length && params.principal){
+      const schedule = amortizationSchedule(Number(params.principal)||0, Number(params.annual_rate)||0, Number(params.term_months)||0);
+      const totalInterest = schedule.rows.reduce((s,r)=>s+r.interest,0);
+      const sensitivity = loanRateSensitivity(Number(params.principal)||0, Number(params.annual_rate)||0, Number(params.term_months)||0);
+      scheduleHtml = `
+        <div class="grid">
+          <div class="card"><h3>Monthly Payment</h3><div class="value">${fmt(schedule.payment)}</div></div>
+          <div class="card"><h3>Total Interest</h3><div class="value negative">${fmt(totalInterest)}</div></div>
+          <div class="card"><h3>Total Repaid</h3><div class="value">${fmt(schedule.payment*schedule.rows.length)}</div></div>
+        </div>
+        <h3>Rate sensitivity</h3>
+        <table><thead><tr><th>Rate</th><th>Monthly Payment</th><th>Total Interest</th><th>Total Paid</th></tr></thead><tbody>
+          ${sensitivity.map(row=>`<tr ${row.delta===0?'style="font-weight:600;background:var(--panel2);"':''}><td>${row.rate.toFixed(1)}%${row.delta===0?' (current)':''}</td><td>${fmt(row.payment)}</td><td>${fmt(row.totalInterest)}</td><td>${fmt(row.totalPaid)}</td></tr>`).join('')}
+        </tbody></table>
+        <details class="collapsible">
+          <summary>Full amortization schedule (${schedule.rows.length} payments)</summary>
+          <div class="panel"><table><thead><tr><th>#</th><th>Payment</th><th>Interest</th><th>Principal</th><th>Balance</th></tr></thead><tbody>
+            ${schedule.rows.map(r=>`<tr><td>${r.month}</td><td>${fmt(r.payment)}</td><td>${fmt(r.interest)}</td><td>${fmt(r.principal)}</td><td>${fmt(r.balance)}</td></tr>`).join('')}
+          </tbody></table></div>
+        </details>
+      `;
+    }
+    categorySection = `
+      <div class="panel">
+        <h3 style="margin-top:0;">Loan terms</h3>
+        ${canEdit ? `<form id="scenario-loan-form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+          <div class="field"><label>Principal (R)</label><input type="number" step="0.01" id="loan-principal" value="${principal}" required></div>
+          <div class="field"><label>Annual rate (%)</label><input type="number" step="0.01" id="loan-rate" value="${rate}" required></div>
+          <div class="field"><label>Term (months)</label><input type="number" id="loan-term" value="${term}" required></div>
+          <button type="submit" class="btn">Generate Amortization Cash Flows</button>
+        </form>` : ''}
+        ${scheduleHtml || `<div class="empty">Enter the loan terms and generate cash flows to see the amortization schedule, payment, and NPV/IRR. Period 0 is the loan proceeds; each month after is a repayment — so the IRR you see back is the loan's own rate, and the NPV shows whether it's cheap or expensive against your discount rate.</div>`}
+      </div>
+    `;
+  } else if(sc.category === 'supplier'){
+    const cost = params.cost_per_period ?? '';
+    const terms = params.payment_terms_days ?? 0;
+    const periodsCount = params.periods_count ?? 12;
+    categorySection = `
+      <div class="panel">
+        <h3 style="margin-top:0;">Supplier terms</h3>
+        ${canEdit ? `<form id="scenario-supplier-form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+          <div class="field"><label>Cost per ${sc.period_unit} (R)</label><input type="number" step="0.01" id="supplier-cost" value="${cost}" required></div>
+          <div class="field"><label>Payment terms (days)</label><input type="number" id="supplier-terms" value="${terms}"></div>
+          <div class="field"><label>Number of ${sc.period_unit}s to project</label><input type="number" id="supplier-periods" value="${periodsCount}" required></div>
+          <button type="submit" class="btn">Generate Cash Flows</button>
+        </form>` : ''}
+        ${cfs.length ? `<p style="color:var(--muted);font-size:.85rem;">Longer payment terms push the cash outflow later without changing the headline cost — so two suppliers charging the same amount can still look very different for cash flow timing. Create a second scenario for the other supplier to compare them.</p>` : `<div class="empty">Enter this supplier's cost and payment terms, then generate cash flows. Create a second scenario for the other supplier and tick both from the list to compare.</div>`}
+      </div>
+    `;
+  } else {
+    categorySection = `
+      <div class="panel">
+        <h3 style="margin-top:0;">Cash flow lines</h3>
+        ${canEdit ? `<form id="scenario-line-form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+          <div class="field"><label>Period #</label><input type="number" id="line-period" required style="width:80px;"></div>
+          <div class="field"><label>Label</label><input type="text" id="line-label" placeholder="optional"></div>
+          <div class="field"><label>Amount (R, negative = outflow)</label><input type="number" step="0.01" id="line-amount" required></div>
+          <button type="submit" class="btn">Add Line</button>
+        </form>` : ''}
+        ${cfs.length ? `<table><thead><tr><th>Period</th><th>Label</th><th>Amount</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+          ${cfs.map(cf=>`<tr><td>${cf.period_number}</td><td>${cf.label||'—'}</td><td class="${Number(cf.amount)<0?'negative':''}">${fmt(cf.amount)}</td>${canEdit?`<td><button class="btn small danger" data-del-cashflow="${cf.id}">Delete</button></td>`:''}</tr>`).join('')}
+        </tbody></table>` : `<div class="empty">No cash flow lines yet — add periods and amounts above (e.g. period 0 = today, period 1 = next month).</div>`}
+      </div>
+    `;
+  }
+
+  return `
+    <div class="section-header" style="--accent-c:var(--c-scenarios);">
+      <h1><button class="btn small secondary" id="scenario-back-btn" style="margin-right:10px;">← Back</button>${sc.name} ${scenarioCategoryBadge(sc.category)}</h1>
+      ${canEdit ? `<button class="btn danger" data-del-scenario="${sc.id}">Delete Scenario</button>` : ''}
+    </div>
+    <div class="grid">
+      <div class="card" style="--accent-c:var(--c-scenarios);"><h3>NPV @ ${Number(sc.discount_rate).toFixed(1)}%</h3><div class="value ${npv<0?'negative':''}">${fmt(npv)}</div></div>
+      <div class="card" style="--accent-c:var(--c-scenarios);"><h3>IRR (annualized)</h3><div class="value">${fmtPct(irr)}</div></div>
+      <div class="card" style="--accent-c:var(--c-scenarios);"><h3>Cash Flow Lines</h3><div class="value">${cfs.length}</div></div>
+    </div>
+    ${sc.notes ? `<div class="panel"><em>${sc.notes}</em></div>` : ''}
+    ${categorySection}
+  `;
+}
+
+function attachScenarioHandlers(){
+  const backdrop = document.getElementById('scenario-modal-backdrop');
+  document.getElementById('add-scenario-btn')?.addEventListener('click', ()=>backdrop.classList.remove('hidden'));
+  document.getElementById('scenario-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('scenario-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('scenario-category')?.addEventListener('change', (e)=>{
+    const periodSel = document.getElementById('scenario-period-unit');
+    if(!periodSel) return;
+    if(e.target.value === 'loan'){ periodSel.value = 'month'; periodSel.disabled = true; }
+    else { periodSel.disabled = false; }
+  });
+  document.getElementById('scenario-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const category = document.getElementById('scenario-category').value;
+    const periodUnit = category === 'loan' ? 'month' : document.getElementById('scenario-period-unit').value;
+    const {error} = await sb.from('cc_scenarios').insert({
+      company_id: state.company.id,
+      name: document.getElementById('scenario-name').value.trim(),
+      category,
+      discount_rate: parseFloat(document.getElementById('scenario-discount-rate').value) || 0,
+      period_unit: periodUnit,
+      notes: document.getElementById('scenario-notes').value.trim() || null,
+      created_by: state.user.id,
+      params: {}
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Scenario created.');
+  });
+
+  document.querySelectorAll('[data-compare-scenario]').forEach(cb=>{
+    cb.addEventListener('change', ()=>{
+      const id = cb.dataset.compareScenario;
+      if(cb.checked){ if(!state.scenarioCompareIds.includes(id)) state.scenarioCompareIds.push(id); }
+      else { state.scenarioCompareIds = state.scenarioCompareIds.filter(x=>x!==id); }
+      render();
+    });
+  });
+  document.getElementById('scenario-clear-compare')?.addEventListener('click', ()=>{
+    state.scenarioCompareIds = [];
+    render();
+  });
+
+  document.querySelectorAll('[data-manage-scenario]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      state.scenarioDetailId = btn.dataset.manageScenario;
+      render();
+    });
+  });
+  document.getElementById('scenario-back-btn')?.addEventListener('click', ()=>{
+    state.scenarioDetailId = null;
+    render();
+  });
+
+  document.querySelectorAll('[data-del-scenario]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this scenario and all its cash flow lines?')) return;
+      const id = btn.dataset.delScenario;
+      await sb.from('cc_scenarios').delete().eq('id', id);
+      if(state.scenarioDetailId === id) state.scenarioDetailId = null;
+      state.scenarioCompareIds = state.scenarioCompareIds.filter(x=>x!==id);
+      await refreshAll(); render(); toast('Scenario deleted.');
+    });
+  });
+
+  document.getElementById('scenario-loan-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const sc = state.scenarios.find(s=>s.id===state.scenarioDetailId);
+    if(!sc) return;
+    const params = {
+      principal: parseFloat(document.getElementById('loan-principal').value) || 0,
+      annual_rate: parseFloat(document.getElementById('loan-rate').value) || 0,
+      term_months: parseInt(document.getElementById('loan-term').value) || 0
+    };
+    const cfs = generateLoanCashflows(params);
+    await sb.from('cc_scenario_cashflows').delete().eq('scenario_id', sc.id);
+    if(cfs.length){
+      const {error} = await sb.from('cc_scenario_cashflows').insert(cfs.map(cf=>({scenario_id: sc.id, period_number: cf.period_number, label: cf.label, amount: cf.amount})));
+      if(error){ toast(error.message); return; }
+    }
+    await sb.from('cc_scenarios').update({params}).eq('id', sc.id);
+    await refreshAll(); render(); toast('Cash flows generated.');
+  });
+
+  document.getElementById('scenario-supplier-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const sc = state.scenarios.find(s=>s.id===state.scenarioDetailId);
+    if(!sc) return;
+    const params = {
+      name: sc.name,
+      cost_per_period: parseFloat(document.getElementById('supplier-cost').value) || 0,
+      payment_terms_days: parseInt(document.getElementById('supplier-terms').value) || 0,
+      periods_count: parseInt(document.getElementById('supplier-periods').value) || 0
+    };
+    const cfs = generateSupplierCashflows(params, params.periods_count, sc.period_unit);
+    await sb.from('cc_scenario_cashflows').delete().eq('scenario_id', sc.id);
+    if(cfs.length){
+      const {error} = await sb.from('cc_scenario_cashflows').insert(cfs.map(cf=>({scenario_id: sc.id, period_number: cf.period_number, label: cf.label, amount: cf.amount})));
+      if(error){ toast(error.message); return; }
+    }
+    await sb.from('cc_scenarios').update({params}).eq('id', sc.id);
+    await refreshAll(); render(); toast('Cash flows generated.');
+  });
+
+  document.getElementById('scenario-line-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const sc = state.scenarios.find(s=>s.id===state.scenarioDetailId);
+    if(!sc) return;
+    const {error} = await sb.from('cc_scenario_cashflows').insert({
+      scenario_id: sc.id,
+      period_number: parseInt(document.getElementById('line-period').value),
+      label: document.getElementById('line-label').value.trim() || null,
+      amount: parseFloat(document.getElementById('line-amount').value)
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Line added.');
+  });
+  document.querySelectorAll('[data-del-cashflow]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      await sb.from('cc_scenario_cashflows').delete().eq('id', btn.dataset.delCashflow);
       await refreshAll(); render();
     });
   });
