@@ -88,7 +88,10 @@ create table if not exists cc_assets (
   is_current boolean not null default false,
   -- Fixed Asset Register / depreciation (only meaningful for fixed, i.e. !is_current, assets)
   purchase_date date,
+  -- 'straight_line' (uses useful_life_months) or 'reducing_balance' (uses depreciation_rate)
+  depreciation_method text default 'straight_line' check (depreciation_method is null or depreciation_method in ('straight_line','reducing_balance')),
   useful_life_months integer,
+  depreciation_rate numeric, -- annual %, reducing-balance method only
   residual_value numeric not null default 0,
   accumulated_depreciation numeric not null default 0,
   last_depreciation_run date,

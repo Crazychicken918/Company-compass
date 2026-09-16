@@ -542,6 +542,10 @@ create policy "management delete scenario cashflows" on cc_scenario_cashflows fo
   exists (select 1 from cc_scenarios s where s.id = scenario_id and (cc_is_admin(s.company_id) or cc_can_approve(s.company_id)))
 );
 
+-- ---------- Wave 5: depreciation method on the Fixed Asset Register (idempotent) ----------
+alter table cc_assets add column if not exists depreciation_method text default 'straight_line' check (depreciation_method is null or depreciation_method in ('straight_line','reducing_balance'));
+alter table cc_assets add column if not exists depreciation_rate numeric;
+
 -- ---------- verify ----------
 select tablename, count(*) as policy_count
 from pg_policies

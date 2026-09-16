@@ -897,9 +897,22 @@ function attachEntryHandlers(type){
 }
 
 /* ========================= ASSETS ========================= */
+function depreciationMethodLabel(m){ return m==='reducing_balance' ? 'Reducing Balance' : 'Straight-Line'; }
 function assetMonthlyDepreciation(a){
-  if(a.is_current || !a.useful_life_months) return null;
-  const depreciable = Number(a.value) - Number(a.residual_value||0);
+  if(a.is_current) return null;
+  const method = a.depreciation_method || 'straight_line';
+  const residual = Number(a.residual_value||0);
+  if(method === 'reducing_balance'){
+    if(!a.depreciation_rate) return null;
+    const remaining = assetNBV(a) - residual;
+    if(remaining <= 0) return 0;
+    // Reducing balance: rate applied to the current net book value each month, so the
+    // charge shrinks over time — capped so it never depreciates below residual value.
+    const raw = assetNBV(a) * (Number(a.depreciation_rate)/100/12);
+    return Math.max(0, Math.min(raw, remaining));
+  }
+  if(!a.useful_life_months) return null;
+  const depreciable = Number(a.value) - residual;
   return depreciable > 0 ? depreciable / a.useful_life_months : 0;
 }
 function assetNBV(a){ return Number(a.value) - Number(a.accumulated_depreciation||0); }
@@ -910,11 +923,12 @@ function renderAssets(){
     <div class="section-header" style="--accent-c:var(--c-assets);"><h1>Assets</h1>${canEdit ? `<button class="btn" id="add-asset-btn">+ Add Asset</button>` : ''}</div>
     <div class="grid"><div class="card" style="--accent-c:var(--c-assets);"><h3>Total Assets</h3><div class="value">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th><th>Current?</th><th>Purchase Date</th><th>Monthly Depr.</th><th>Accum. Depr.</th><th>NBV</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+      ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th><th>Type</th><th>Purchase Date</th><th>Monthly Depr.</th><th>Accum. Depr.</th><th>NBV</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${state.assets.map(a=>{
           const md = assetMonthlyDepreciation(a);
           const canRun = canEdit && !a.is_current && md && assetNBV(a) > Number(a.residual_value||0) && a.last_depreciation_run !== todayIso();
-          return `<tr><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td><td>${a.is_current?'Yes':'No'}</td><td>${a.purchase_date||'—'}</td><td>${md!==null?fmt(md):'—'}</td><td>${fmt(Number(a.accumulated_depreciation||0))}</td><td>${a.is_current?'—':fmt(assetNBV(a))}</td>${canEdit?`<td>
+          const typeLabel = a.is_current ? 'Current' : `Fixed · ${depreciationMethodLabel(a.depreciation_method)}`;
+          return `<tr><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td><td>${typeLabel}</td><td>${a.purchase_date||'—'}</td><td>${md!==null?fmt(md):'—'}</td><td>${fmt(Number(a.accumulated_depreciation||0))}</td><td>${a.is_current?'—':fmt(assetNBV(a))}</td>${canEdit?`<td>
             ${canRun?`<button class="btn small secondary" data-run-depr="${a.id}">Run Depreciation</button>`:''}
             <button class="btn small danger" data-del-asset="${a.id}">Delete</button>
           </td>`:''}</tr>`;
@@ -929,10 +943,20 @@ function renderAssets(){
         <div class="field"><label>Description</label><input type="text" id="asset-description" required></div>
         <div class="field"><label>Category</label><input type="text" id="asset-category" placeholder="e.g. equipment, property, vehicle, stock"></div>
         <div class="field"><label>Value (R)</label><input type="number" step="0.01" id="asset-value" required></div>
-        <div class="field"><label><input type="checkbox" id="asset-current" style="width:auto;"> Current asset (cash-like, or convertible to cash within 12 months)</label></div>
-        <div class="field"><label>Purchase date (optional — used for depreciation &amp; cash flow)</label><input type="date" id="asset-purchase-date"></div>
-        <div class="field"><label>Useful life, months (fixed assets only, for depreciation)</label><input type="number" id="asset-useful-life" min="1"></div>
-        <div class="field"><label>Residual value (R, optional)</label><input type="number" step="0.01" id="asset-residual" value="0"></div>
+        <div class="field"><label>Asset Type</label><select id="asset-type">
+          <option value="current">Current Asset (cash-like, or convertible to cash within 12 months)</option>
+          <option value="fixed">Fixed Asset (Fixed Asset Register — depreciable)</option>
+        </select></div>
+        <div class="field"><label>Purchase date (optional — used for cash flow, and depreciation on fixed assets)</label><input type="date" id="asset-purchase-date"></div>
+        <div id="asset-fixed-fields" class="hidden">
+          <div class="field"><label>Depreciation Method</label><select id="asset-depr-method">
+            <option value="straight_line">Straight-Line</option>
+            <option value="reducing_balance">Reducing Balance (Diminishing Value)</option>
+          </select></div>
+          <div id="asset-sl-fields"><div class="field"><label>Useful life (months)</label><input type="number" id="asset-useful-life" min="1"></div></div>
+          <div id="asset-rb-fields" class="hidden"><div class="field"><label>Depreciation rate (% per year, applied to net book value each month)</label><input type="number" step="0.1" id="asset-depr-rate"></div></div>
+          <div class="field"><label>Residual value (R, optional)</label><input type="number" step="0.01" id="asset-residual" value="0"></div>
+        </div>
         <div class="modal-actions"><button type="button" class="btn secondary" id="asset-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
       </form>
     </div></div>` : ''}
@@ -943,17 +967,29 @@ function attachAssetHandlers(){
   document.getElementById('add-asset-btn')?.addEventListener('click', ()=>backdrop.classList.remove('hidden'));
   document.getElementById('asset-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('asset-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('asset-type')?.addEventListener('change', (e)=>{
+    document.getElementById('asset-fixed-fields').classList.toggle('hidden', e.target.value !== 'fixed');
+  });
+  document.getElementById('asset-depr-method')?.addEventListener('change', (e)=>{
+    const isRB = e.target.value === 'reducing_balance';
+    document.getElementById('asset-sl-fields').classList.toggle('hidden', isRB);
+    document.getElementById('asset-rb-fields').classList.toggle('hidden', !isRB);
+  });
   document.getElementById('asset-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
+    const isFixed = document.getElementById('asset-type').value === 'fixed';
+    const method = document.getElementById('asset-depr-method').value;
     const {error} = await sb.from('cc_assets').insert({
       company_id: state.company.id,
       description: document.getElementById('asset-description').value.trim(),
       category: document.getElementById('asset-category').value.trim() || null,
       value: parseFloat(document.getElementById('asset-value').value),
-      is_current: document.getElementById('asset-current').checked,
+      is_current: !isFixed,
       purchase_date: document.getElementById('asset-purchase-date').value || null,
-      useful_life_months: parseInt(document.getElementById('asset-useful-life').value) || null,
-      residual_value: parseFloat(document.getElementById('asset-residual').value) || 0
+      depreciation_method: isFixed ? method : null,
+      useful_life_months: (isFixed && method==='straight_line') ? (parseInt(document.getElementById('asset-useful-life').value) || null) : null,
+      depreciation_rate: (isFixed && method==='reducing_balance') ? (parseFloat(document.getElementById('asset-depr-rate').value) || null) : null,
+      residual_value: isFixed ? (parseFloat(document.getElementById('asset-residual').value) || 0) : 0
     });
     if(error){ toast(error.message); return; }
     await refreshAll(); render(); toast('Saved.');
@@ -1891,12 +1927,17 @@ function computeCashFlow(start, end){
   const inRange = (d) => d && d >= start && d <= end;
 
   // Operating activities — cash-basis revenue and expenses recorded in the period,
-  // plus payroll actually paid in the period.
+  // plus payroll actually paid in the period. Depreciation is a book expense, not a
+  // cash movement, so entries tagged 'depreciation' (posted by "Run Depreciation"
+  // under Assets) are excluded here even though they correctly reduce Net Profit
+  // on the P&L.
   const cashFromRevenue = state.entries.filter(e=>e.type==='revenue' && inRange(e.entry_date)).reduce((s,e)=>s+Number(e.amount),0);
-  const expenseRows = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date));
+  const isNonCash = e => (e.tags||[]).includes('depreciation');
+  const expenseRows = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date) && !isNonCash(e));
   const cosOut = expenseRows.filter(e=>e.expense_category==='cost_of_sales').reduce((s,e)=>s+Number(e.amount),0);
   const opexOut = expenseRows.filter(e=>e.expense_category!=='cost_of_sales').reduce((s,e)=>s+Number(e.amount),0);
   const payrollOut = state.payrollPayments.filter(p=>p.paid && inRange(p.pay_date)).reduce((s,p)=>s+Number(p.net),0);
+  const depreciationExcluded = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date) && isNonCash(e)).reduce((s,e)=>s+Number(e.amount),0);
   const netOperating = cashFromRevenue - cosOut - opexOut - payrollOut;
 
   // Investing activities — assets purchased (cash out) during the period. Only assets
@@ -1915,7 +1956,7 @@ function computeCashFlow(start, end){
   const closingCashDerived = openingCash + netChange;
 
   return {
-    start, end, cashFromRevenue, cosOut, opexOut, payrollOut, netOperating,
+    start, end, cashFromRevenue, cosOut, opexOut, payrollOut, netOperating, depreciationExcluded,
     assetPurchases, netInvesting, liabilityDraws, netFinancing,
     netChange, openingCash, closingCashDerived, closingCashActual,
     reconciles: Math.abs(closingCashDerived - closingCashActual) < 0.01
@@ -1931,6 +1972,7 @@ function renderCF(cf){
       <tr><td>Cash paid — operating expenses</td><td style="text-align:right;">(${fmt(cf.opexOut)})</td></tr>
       <tr><td>Cash paid — payroll</td><td style="text-align:right;">(${fmt(cf.payrollOut)})</td></tr>
       <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Net cash from operating activities</td><td style="text-align:right;" class="${cf.netOperating<0?'negative':'positive'}">${fmt(cf.netOperating)}</td></tr>
+      ${cf.depreciationExcluded ? `<tr><td style="color:var(--muted);font-size:.8rem;">Depreciation charged this period (non-cash, excluded above)</td><td style="text-align:right;color:var(--muted);font-size:.8rem;">${fmt(cf.depreciationExcluded)}</td></tr>` : ''}
 
       <tr style="font-weight:600;"><td colspan="2" style="padding-top:16px;">Investing Activities</td></tr>
       <tr><td>Purchase of fixed assets</td><td style="text-align:right;">${cf.assetPurchases?`(${fmt(cf.assetPurchases)})`:fmt(0)}</td></tr>
@@ -1957,6 +1999,7 @@ function computeAssetRegister(start, end){
     return {
       id: a.id, description: a.description, category: a.category,
       purchase_date: a.purchase_date, cost: Number(a.value),
+      method: a.depreciation_method || 'straight_line',
       monthlyDep, accumulatedDep: Number(a.accumulated_depreciation||0), nbv: assetNBV(a),
       purchasedInMonth, depreciatedInMonth
     };
@@ -2009,8 +2052,8 @@ function bucketPillClass(bucket){
   if(bucket==='0-30') return 'status-pill status-pending';
   return 'status-pill status-overdue';
 }
-function renderAging(ar, ap){
-  const bucketRow = (buckets) => `
+function agingBucketRow(buckets){
+  return `
     <div class="grid" style="grid-template-columns:repeat(5,1fr);">
       <div class="card"><h3>Not yet due</h3><div class="value">${fmt(buckets.not_due)}</div></div>
       <div class="card"><h3>0–30 days</h3><div class="value">${fmt(buckets['0-30'])}</div></div>
@@ -2018,22 +2061,37 @@ function renderAging(ar, ap){
       <div class="card"><h3>61–90 days</h3><div class="value">${fmt(buckets['61-90'])}</div></div>
       <div class="card"><h3>90+ days</h3><div class="value negative">${fmt(buckets['90+'])}</div></div>
     </div>`;
+}
+function renderDebtors(ar){
+  const total = ar.rows.reduce((s,r)=>s+r.total,0);
   return `
+  <div class="section-header" style="--accent-c:var(--c-invoices);"><h1>Debtors</h1></div>
+  <div class="grid"><div class="card" style="--accent-c:var(--c-invoices);"><h3>Total Outstanding Debtors</h3><div class="value">${fmt(total)}</div></div></div>
   <div class="panel">
     <h3 style="margin-top:0;">Accounts Receivable Aging</h3>
-    ${bucketRow(ar.buckets)}
+    ${agingBucketRow(ar.buckets)}
     ${ar.rows.length ? `<table style="margin-top:14px;"><thead><tr><th>Invoice</th><th>Client</th><th>Due Date</th><th>Status</th><th>Amount</th></tr></thead><tbody>
       ${ar.rows.map(r=>`<tr><td>${r.number}</td><td>${r.client}</td><td>${r.due_date}</td><td><span class="${bucketPillClass(r.bucket)}">${r.bucket==='not_due'?'not due':r.daysOverdue+'d overdue ('+r.bucket+')'}</span></td><td>${fmt(r.total)}</td></tr>`).join('')}
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td colspan="4">Total</td><td>${fmt(total)}</td></tr>
     </tbody></table>` : `<div class="empty">No outstanding invoices with a due date.</div>`}
   </div>
+  <p style="color:var(--muted);font-size:.8rem;">As of ${todayIso()}. Add a due date to invoices to have them tracked here.</p>
+  `;
+}
+function renderCreditors(ap){
+  const total = ap.rows.reduce((s,r)=>s+r.amount,0);
+  return `
+  <div class="section-header" style="--accent-c:var(--c-liabilities);"><h1>Creditors</h1></div>
+  <div class="grid"><div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Outstanding Creditors</h3><div class="value negative">${fmt(total)}</div></div></div>
   <div class="panel">
     <h3 style="margin-top:0;">Accounts Payable Aging</h3>
-    ${bucketRow(ap.buckets)}
-    ${ap.rows.length ? `<table style="margin-top:14px;"><thead><tr><th>Liability</th><th>Due Date</th><th>Status</th><th>Amount</th></tr></thead><tbody>
+    ${agingBucketRow(ap.buckets)}
+    ${ap.rows.length ? `<table style="margin-top:14px;"><thead><tr><th>Creditor</th><th>Due Date</th><th>Status</th><th>Amount</th></tr></thead><tbody>
       ${ap.rows.map(r=>`<tr><td>${r.description}</td><td>${r.due_date}</td><td><span class="${bucketPillClass(r.bucket)}">${r.bucket==='not_due'?'not due':r.daysOverdue+'d overdue ('+r.bucket+')'}</span></td><td>${fmt(r.amount)}</td></tr>`).join('')}
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td colspan="3">Total</td><td>${fmt(total)}</td></tr>
     </tbody></table>` : `<div class="empty">No current liabilities with a due date set.</div>`}
   </div>
-  <p style="color:var(--muted);font-size:.8rem;">As of ${todayIso()}. Add a due date to invoices and current liabilities to have them tracked here.</p>
+  <p style="color:var(--muted);font-size:.8rem;">As of ${todayIso()}. Add a due date to current liabilities to have them tracked here.</p>
   `;
 }
 function monthsInPeriod(start, end){
@@ -2135,7 +2193,8 @@ function renderReports(){
       <button class="btn ${state.reportsTab==='pl'?'':'secondary'} small" data-report-tab="pl">Profit &amp; Loss</button>
       <button class="btn ${state.reportsTab==='bs'?'':'secondary'} small" data-report-tab="bs">Balance Sheet</button>
       <button class="btn ${state.reportsTab==='cf'?'':'secondary'} small" data-report-tab="cf">Cash Flow</button>
-      <button class="btn ${state.reportsTab==='aging'?'':'secondary'} small" data-report-tab="aging">Receivables &amp; Payables</button>
+      <button class="btn ${state.reportsTab==='debtors'?'':'secondary'} small" data-report-tab="debtors">Debtors</button>
+      <button class="btn ${state.reportsTab==='creditors'?'':'secondary'} small" data-report-tab="creditors">Creditors</button>
       <button class="btn ${state.reportsTab==='budget'?'':'secondary'} small" data-report-tab="budget">Budget vs Actual</button>
       <button class="btn ${state.reportsTab==='financials'?'':'secondary'} small" data-report-tab="financials">Signed Financials</button>
       <button class="btn ${state.reportsTab==='ratios'?'':'secondary'} small" data-report-tab="ratios">Ratios</button>
@@ -2158,7 +2217,7 @@ function renderReports(){
       <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">P&amp;L: ${period.start} to ${period.end}<br>Balance sheet as of ${period.end}</div>
     </div>
     `}
-    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='aging' ? renderAging(computeARAging(), computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : renderPL(pl)}
+    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : renderPL(pl)}
   `;
 }
 
@@ -2215,30 +2274,14 @@ function renderMonthlyAccounts(){
 
   <div class="panel">
     <h3 style="margin-top:0;">Fixed Asset Register</h3>
-    ${assetReg.rows.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Purchase Date</th><th>Cost</th><th>Monthly Depr.</th><th>Accum. Depr.</th><th>Net Book Value</th><th></th></tr></thead><tbody>
-      ${assetReg.rows.map(r=>`<tr><td>${r.description}</td><td>${r.category||'—'}</td><td>${r.purchase_date||'—'}</td><td>${fmt(r.cost)}</td><td>${r.monthlyDep!==null?fmt(r.monthlyDep):'—'}</td><td>${fmt(r.accumulatedDep)}</td><td>${fmt(r.nbv)}</td><td style="white-space:nowrap;">${r.purchasedInMonth?'<span class="tag-pill">added this month</span>':''}${r.depreciatedInMonth?' <span class="tag-pill">depreciated this month</span>':''}</td></tr>`).join('')}
-      <tr style="font-weight:700;border-top:2px solid var(--border);"><td colspan="3">Total</td><td>${fmt(assetReg.totals.cost)}</td><td></td><td>${fmt(assetReg.totals.accumulatedDep)}</td><td>${fmt(assetReg.totals.nbv)}</td><td></td></tr>
+    ${assetReg.rows.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Method</th><th>Purchase Date</th><th>Cost</th><th>Monthly Depr.</th><th>Accum. Depr.</th><th>Net Book Value</th><th></th></tr></thead><tbody>
+      ${assetReg.rows.map(r=>`<tr><td>${r.description}</td><td>${r.category||'—'}</td><td>${depreciationMethodLabel(r.method)}</td><td>${r.purchase_date||'—'}</td><td>${fmt(r.cost)}</td><td>${r.monthlyDep!==null?fmt(r.monthlyDep):'—'}</td><td>${fmt(r.accumulatedDep)}</td><td>${fmt(r.nbv)}</td><td style="white-space:nowrap;">${r.purchasedInMonth?'<span class="tag-pill">added this month</span>':''}${r.depreciatedInMonth?' <span class="tag-pill">depreciated this month</span>':''}</td></tr>`).join('')}
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td colspan="4">Total</td><td>${fmt(assetReg.totals.cost)}</td><td></td><td>${fmt(assetReg.totals.accumulatedDep)}</td><td>${fmt(assetReg.totals.nbv)}</td><td></td></tr>
     </tbody></table>` : `<div class="empty">No fixed (non-current) assets recorded yet.</div>`}
     <p style="color:var(--muted);font-size:.8rem;">Cost, accumulated depreciation and net book value reflect the current state of each asset — "added"/"depreciated this month" flags whether that asset's purchase date or last depreciation run falls within the selected month. Run depreciation for the month under Assets before relying on this for a closed period.</p>
   </div>
 
-  <div class="panel">
-    <h3 style="margin-top:0;">Outstanding Debtors</h3>
-    ${ar.rows.length ? `<table><thead><tr><th>Invoice</th><th>Client</th><th>Due Date</th><th>Status</th><th>Amount</th></tr></thead><tbody>
-      ${ar.rows.map(r=>`<tr><td>${r.number}</td><td>${r.client}</td><td>${r.due_date}</td><td><span class="${bucketPillClass(r.bucket)}">${r.bucket==='not_due'?'not due':r.daysOverdue+'d overdue'}</span></td><td>${fmt(r.total)}</td></tr>`).join('')}
-      <tr style="font-weight:700;border-top:2px solid var(--border);"><td colspan="4">Total Outstanding Debtors</td><td>${fmt(ar.rows.reduce((s,r)=>s+r.total,0))}</td></tr>
-    </tbody></table>` : `<div class="empty">No outstanding debtors.</div>`}
-  </div>
-
-  <div class="panel">
-    <h3 style="margin-top:0;">Outstanding Creditors</h3>
-    ${ap.rows.length ? `<table><thead><tr><th>Creditor</th><th>Due Date</th><th>Status</th><th>Amount</th></tr></thead><tbody>
-      ${ap.rows.map(r=>`<tr><td>${r.description}</td><td>${r.due_date}</td><td><span class="${bucketPillClass(r.bucket)}">${r.bucket==='not_due'?'not due':r.daysOverdue+'d overdue'}</span></td><td>${fmt(r.amount)}</td></tr>`).join('')}
-      <tr style="font-weight:700;border-top:2px solid var(--border);"><td colspan="3">Total Outstanding Creditors</td><td>${fmt(ap.rows.reduce((s,r)=>s+r.amount,0))}</td></tr>
-    </tbody></table>` : `<div class="empty">No outstanding creditors.</div>`}
-  </div>
-
-  <p style="color:var(--muted);font-size:.8rem;">Debtors and creditors are shown as currently outstanding (today), while the P&amp;L is for the selected month and the balance sheet as at month end — full aging buckets are under the Receivables &amp; Payables tab. Not tax advice — confirm with your accountant before relying on these for statutory reporting.</p>
+  <p style="color:var(--muted);font-size:.8rem;">Debtors and creditors totals above are currently outstanding (today); full itemized listings with aging are under the Debtors and Creditors tabs. The P&amp;L is for the selected month and the balance sheet as at month end. Not tax advice — confirm with your accountant before relying on these for statutory reporting.</p>
   `;
 }
 
