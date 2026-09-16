@@ -16,6 +16,27 @@
     --c-liabilities:#f5a524; --c-clients:#a855f7; --c-invoices:#6366f1; --c-creditnotes:#ec4899;
     --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b; --c-reports:#1d4ed8;
     --c-scenarios:#059669;
+    --grid-line: rgba(25,26,35,.03);
+  }
+  /* Dark mode: follows the OS setting by default; a manual toggle (data-theme)
+     overrides it and is remembered per browser via localStorage. */
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      color-scheme: dark;
+      --bg:#14151c; --bg-elev:#1b1c26; --panel:#1b1c26; --panel2:#242534; --border:#2e3040;
+      --text:#eef0fa; --muted:#9299b5; --accent:#8f74ff; --accent-dim:#2c2650; --accent2:#22d3a5;
+      --danger:#ff5c81; --warn:#ffc266;
+      --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 22px rgba(0,0,0,.4);
+      --grid-line: rgba(255,255,255,.045);
+    }
+  }
+  :root[data-theme="dark"]{
+    color-scheme: dark;
+    --bg:#14151c; --bg-elev:#1b1c26; --panel:#1b1c26; --panel2:#242534; --border:#2e3040;
+    --text:#eef0fa; --muted:#9299b5; --accent:#8f74ff; --accent-dim:#2c2650; --accent2:#22d3a5;
+    --danger:#ff5c81; --warn:#ffc266;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 22px rgba(0,0,0,.4);
+    --grid-line: rgba(255,255,255,.045);
   }
   *{box-sizing:border-box;}
   body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
@@ -41,8 +62,8 @@
       var(--bg);
   }
   #auth-screen::before{content:'';position:absolute;inset:0;background-image:
-      linear-gradient(rgba(25,26,35,.03) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(25,26,35,.03) 1px, transparent 1px);
+      linear-gradient(var(--grid-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
     background-size:36px 36px;mask-image:radial-gradient(circle at 50% 40%, #000 0%, transparent 75%);pointer-events:none;}
   .auth-wrap{position:relative;z-index:1;width:100%;max-width:380px;display:flex;flex-direction:column;align-items:center;}
   .auth-badge{width:60px;height:60px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.7rem;
@@ -116,6 +137,7 @@
   .section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
   .section-header h1{display:flex;align-items:center;gap:10px;}
   .section-header h1::before{content:'';display:inline-block;width:11px;height:11px;border-radius:3px;background:var(--accent-c,var(--accent));}
+  .section-caption{color:var(--muted);font-size:.85rem;margin:-8px 0 16px;}
   .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:20px;box-shadow:var(--shadow);}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;}
   .field{display:flex;flex-direction:column;gap:4px;font-size:.8rem;color:var(--muted);}
@@ -151,9 +173,16 @@
   .invoice-items-table input{width:100%;}
   #toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:#fff;padding:10px 16px;border-radius:10px;font-size:.85rem;z-index:99;display:none;box-shadow:0 8px 24px -8px rgba(30,20,60,.4);}
   .muted-link{color:var(--muted);text-decoration:underline;cursor:pointer;font-size:.8rem;}
+  #theme-toggle-global{position:fixed;top:16px;right:16px;z-index:50;background:var(--bg-elev);border:1px solid var(--border);color:var(--text);
+    padding:7px 14px;border-radius:999px;font-size:.78rem;font-weight:600;box-shadow:var(--shadow);}
+  #theme-toggle-global:hover{background:var(--panel2);}
+  .intro-video-link{display:inline-block;margin:-8px 0 18px;font-size:.85rem;font-weight:600;color:var(--accent);text-decoration:none;}
+  .intro-video-link:hover{text-decoration:underline;}
 </style>
 </head>
 <body>
+
+<button type="button" id="theme-toggle-global">Dark mode</button>
 
 <div id="auth-screen">
   <div class="auth-wrap">
@@ -161,6 +190,7 @@
     <div class="auth-box">
       <h1 id="auth-heading">Welcome back</h1>
       <p class="tagline" id="auth-tagline">Good to see you — let's get your numbers sorted.</p>
+      <a href="./intro-video.mp4" target="_blank" rel="noopener" class="intro-video-link">Watch a 60-second intro</a>
       <form id="auth-form">
         <input type="email" id="auth-email" placeholder="Email" required>
         <div class="auth-field has-toggle">
@@ -228,6 +258,46 @@
 const SUPABASE_URL = 'https://fejcuijyskosvdxkgupo.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable__WQYy168UXfdP4WmZOFQPQ_asRpInsR';
 const VAT_RATE = 0.15; // South Africa standard VAT rate
+
+/* ========================= THEME (light / dark) =========================
+   Defaults to the OS/browser's light-or-dark setting; a manual toggle
+   overrides it and is remembered per browser in localStorage. */
+function getStoredTheme(){
+  try{ return localStorage.getItem('cc_theme'); }catch(e){ return null; }
+}
+function setStoredTheme(v){
+  try{ if(v) localStorage.setItem('cc_theme', v); else localStorage.removeItem('cc_theme'); }catch(e){}
+}
+function systemPrefersDark(){
+  return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+function currentEffectiveTheme(){
+  const stored = getStoredTheme();
+  if(stored === 'dark' || stored === 'light') return stored;
+  return systemPrefersDark() ? 'dark' : 'light';
+}
+function applyTheme(theme){
+  // theme: 'light' | 'dark' | null/undefined (follow system)
+  if(theme === 'dark' || theme === 'light'){
+    document.documentElement.setAttribute('data-theme', theme);
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+  }
+  const label = currentEffectiveTheme() === 'dark' ? 'Light mode' : 'Dark mode';
+  document.querySelectorAll('.theme-toggle-btn, #theme-toggle-global').forEach(b=>{ b.textContent = label; });
+}
+function toggleTheme(){
+  const next = currentEffectiveTheme() === 'dark' ? 'light' : 'dark';
+  setStoredTheme(next);
+  applyTheme(next);
+}
+applyTheme(getStoredTheme());
+if(window.matchMedia){
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  const onSystemChange = () => { if(!getStoredTheme()) applyTheme(null); };
+  if(mq.addEventListener) mq.addEventListener('change', onSystemChange);
+  else if(mq.addListener) mq.addListener(onSystemChange);
+}
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -430,6 +500,8 @@ document.getElementById('auth-toggle-link').addEventListener('click', (e)=>{
   document.getElementById('auth-toggle-link').textContent = authMode === 'login' ? 'Sign up' : 'Log in';
   document.getElementById('auth-error').textContent = '';
 });
+
+document.getElementById('theme-toggle-global').addEventListener('click', toggleTheme);
 
 document.getElementById('auth-pw-toggle').addEventListener('click', ()=>{
   const pwInput = document.getElementById('auth-password');
@@ -733,6 +805,7 @@ function renderDashboard(){
   const dueSoonLiabilities = state.liabilities.filter(l=>l.is_current && l.due_date && l.due_date >= today && daysBetween(today, l.due_date) <= 7);
   return `
     <h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-dashboard);display:inline-block;"></span>Dashboard</h1>
+    <p class="section-caption">Your business at a glance — cash, profit, net worth, and anything that needs attention.</p>
     ${overdueInvoices.length ? `<div class="alert-banner overdue">⚠ ${overdueInvoices.length} client invoice${overdueInvoices.length>1?'s are':' is'} past due: ${overdueInvoices.map(i=>`${i.invoice_number} (${clientName(i.client_id)}, due ${i.due_date})`).join(', ')}</div>` : ''}
     ${overdueLiabilities.length ? `<div class="alert-banner overdue">⚠ ${overdueLiabilities.length} supplier/liability payment${overdueLiabilities.length>1?'s are':' is'} past due: ${overdueLiabilities.map(l=>`${l.description} (due ${l.due_date})`).join(', ')}</div>` : ''}
     ${dueSoonLiabilities.length ? `<div class="alert-banner due">⏰ ${dueSoonLiabilities.length} supplier/liability payment${dueSoonLiabilities.length>1?'s are':' is'} due within 7 days: ${dueSoonLiabilities.map(l=>`${l.description} (due ${l.due_date})`).join(', ')}</div>` : ''}
@@ -797,6 +870,7 @@ function renderEntries(type){
   const total = rows.reduce((s,e)=>s+Number(e.amount),0);
   return `
     <div class="section-header" style="--accent-c:${accent};"><h1>${label}</h1>${canEdit ? `<button class="btn" id="add-entry-btn">+ Add ${type==='revenue'?'Revenue':'Expense'}</button>` : ''}</div>
+    <p class="section-caption">${type==='revenue' ? 'Money coming into the business.' : 'Money going out of the business.'}</p>
     <div class="grid"><div class="card" style="--accent-c:${accent};"><h3>Total ${label}</h3><div class="value">${fmt(total)}</div></div></div>
     <div class="panel">
       ${rows.length ? `<table><thead><tr><th>Date</th><th>Description</th>${type==='expense'?'<th>Category</th>':''}<th>Amount</th><th>Tags</th><th>VAT</th><th>Recurring</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
@@ -921,6 +995,7 @@ function renderAssets(){
   const total = state.assets.reduce((s,a)=>s+Number(a.value),0);
   return `
     <div class="section-header" style="--accent-c:var(--c-assets);"><h1>Assets</h1>${canEdit ? `<button class="btn" id="add-asset-btn">+ Add Asset</button>` : ''}</div>
+    <p class="section-caption">What the business owns — current assets, plus fixed assets that depreciate over time.</p>
     <div class="grid"><div class="card" style="--accent-c:var(--c-assets);"><h3>Total Assets</h3><div class="value">${fmt(total)}</div></div></div>
     <div class="panel">
       ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th><th>Type</th><th>Purchase Date</th><th>Monthly Depr.</th><th>Accum. Depr.</th><th>NBV</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
@@ -1038,6 +1113,7 @@ function renderLiabilities(){
   const total = state.liabilities.reduce((s,l)=>s+Number(l.amount),0);
   return `
     <div class="section-header" style="--accent-c:var(--c-liabilities);"><h1>Liabilities</h1>${canEdit ? `<button class="btn" id="add-liability-btn">+ Add Liability</button>` : ''}</div>
+    <p class="section-caption">What the business owes — loans, supplier balances, and other obligations.</p>
     <div class="grid"><div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Liabilities</h3><div class="value negative">${fmt(total)}</div></div></div>
     <div class="panel">
       ${state.liabilities.length ? `<table><thead><tr><th>Description</th><th>Type</th><th>Amount</th><th>Rate</th><th>Term</th><th>Due Date</th><th>Current?</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
@@ -1097,6 +1173,7 @@ function renderClients(){
   const canEdit = hasModule('clients');
   return `
     <div class="section-header" style="--accent-c:var(--c-clients);"><h1>Clients</h1>${canEdit ? `<button class="btn" id="add-client-btn">+ Add Client</button>` : ''}</div>
+    <p class="section-caption">The people and companies you invoice.</p>
     <div class="panel">
       ${state.clients.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td>${canEdit?`<td><button class="btn small danger" data-del-client="${c.id}">Delete</button></td>`:''}</tr>`).join('')}
@@ -1240,6 +1317,7 @@ function renderInvoices(){
   const pendingCount = state.invoices.filter(i=>i.approval_status==='pending').length;
   return `
     <div class="section-header" style="--accent-c:var(--c-invoices);"><h1>Invoices</h1>${canCreate ? `<button class="btn" id="add-invoice-btn">+ New Invoice</button>` : ''}</div>
+    <p class="section-caption">Bills sent to clients — including recurring invoices and approval status.</p>
     ${pendingCount ? `<div class="panel" style="border-top:3px solid var(--warn);"><h3 style="margin-top:0;color:var(--warn);">Pending approval (${pendingCount})</h3><p style="color:var(--muted);font-size:.85rem;margin-bottom:0;">${canApprove() ? 'Open one below to approve or reject it.' : 'Waiting on management or an approver to review.'}</p></div>` : ''}
     <div class="panel">
       ${state.invoices.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Due</th><th>Status</th><th>Approval</th><th>Total</th><th></th></tr></thead><tbody>
@@ -1470,6 +1548,7 @@ function renderCreditNotes(){
   const pendingCount = state.creditNotes.filter(n=>n.approval_status==='pending').length;
   return `
     <div class="section-header" style="--accent-c:var(--c-creditnotes);"><h1>Credit Notes</h1>${canCreate ? `<button class="btn" id="add-creditnote-btn">+ New Credit Note</button>` : ''}</div>
+    <p class="section-caption">Refunds or corrections issued against an invoice.</p>
     ${pendingCount ? `<div class="panel" style="border-top:3px solid var(--warn);"><h3 style="margin-top:0;color:var(--warn);">Pending approval (${pendingCount})</h3><p style="color:var(--muted);font-size:.85rem;margin-bottom:0;">${canApprove() ? 'Open one below to approve or reject it.' : 'Waiting on management or an approver to review.'}</p></div>` : ''}
     <div class="panel">
       ${state.creditNotes.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Against</th><th>Status</th><th>Approval</th><th>Total</th><th></th></tr></thead><tbody>
@@ -1660,6 +1739,7 @@ function renderPayroll(){
   const totalPayroll = state.employees.filter(e=>e.active).reduce((s,e)=>s+Number(e.salary),0);
   return `
     <div class="section-header" style="--accent-c:var(--c-payroll);"><h1>Payroll</h1>${canEdit ? `<button class="btn" id="add-employee-btn">+ Add Employee</button>` : ''}</div>
+    <p class="section-caption">Employees, pay runs, and their current tasks.</p>
     <div class="grid"><div class="card" style="--accent-c:var(--c-payroll);"><h3>Monthly Payroll (active)</h3><div class="value">${fmt(totalPayroll)}</div></div></div>
     <div class="panel">
       <h3 style="margin-top:0;">Employees</h3>
@@ -2066,6 +2146,7 @@ function renderDebtors(ar){
   const total = ar.rows.reduce((s,r)=>s+r.total,0);
   return `
   <div class="section-header" style="--accent-c:var(--c-invoices);"><h1>Debtors</h1></div>
+  <p class="section-caption">Money owed to you by clients, and how overdue it is.</p>
   <div class="grid"><div class="card" style="--accent-c:var(--c-invoices);"><h3>Total Outstanding Debtors</h3><div class="value">${fmt(total)}</div></div></div>
   <div class="panel">
     <h3 style="margin-top:0;">Accounts Receivable Aging</h3>
@@ -2082,6 +2163,7 @@ function renderCreditors(ap){
   const total = ap.rows.reduce((s,r)=>s+r.amount,0);
   return `
   <div class="section-header" style="--accent-c:var(--c-liabilities);"><h1>Creditors</h1></div>
+  <p class="section-caption">Money you owe to suppliers, and when it's due.</p>
   <div class="grid"><div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Outstanding Creditors</h3><div class="value negative">${fmt(total)}</div></div></div>
   <div class="panel">
     <h3 style="margin-top:0;">Accounts Payable Aging</h3>
@@ -2188,6 +2270,7 @@ function renderReports(){
 
   return `
     <div class="section-header" style="--accent-c:var(--c-reports);"><h1>Reports</h1><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
+    <p class="section-caption">Formal accounting reports for the business — pick a report below.</p>
     <div class="tabbar">
       <button class="btn ${state.reportsTab==='monthly'?'':'secondary'} small" data-report-tab="monthly">Monthly Accounts</button>
       <button class="btn ${state.reportsTab==='pl'?'':'secondary'} small" data-report-tab="pl">Profit &amp; Loss</button>
@@ -2199,6 +2282,17 @@ function renderReports(){
       <button class="btn ${state.reportsTab==='financials'?'':'secondary'} small" data-report-tab="financials">Signed Financials</button>
       <button class="btn ${state.reportsTab==='ratios'?'':'secondary'} small" data-report-tab="ratios">Ratios</button>
     </div>
+    <p class="section-caption">${({
+      monthly: "A full month's pack in one place — P&amp;L, balance sheet, fixed assets, and outstanding balances.",
+      pl: "Revenue minus expenses for the period — how much the business made.",
+      bs: "What the business owns, owes, and is worth, as at a point in time.",
+      cf: "Cash actually received and paid — excludes non-cash items like depreciation, unlike the P&amp;L.",
+      debtors: "Money owed to you by clients, and how overdue it is.",
+      creditors: "Money you owe to suppliers, and when it's due.",
+      budget: "Actual spending against what was budgeted, by category.",
+      financials: "Signed-off financial statements, filed for the record.",
+      ratios: "Key ratios that summarise financial health at a glance.",
+    })[state.reportsTab] || "Revenue minus expenses for the period — how much the business made."}</p>
     ${state.reportsTab==='monthly' ? `
     <div class="panel period-bar">
       <div class="field"><label>Month</label><input type="month" id="monthly-accounts-month" value="${state.monthlyAccountsMonth}"></div>
@@ -2495,6 +2589,7 @@ function renderVat(){
   const v = vatFor();
   return `
     <h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-vat);display:inline-block;"></span>VAT</h1>
+    <p class="section-caption">VAT collected, VAT paid, and what's currently payable to SARS.</p>
     <div class="grid">
       <div class="card" style="--accent-c:var(--c-vat);"><h3>VAT Collected</h3><div class="value">${fmt(v.vatCollected)}</div><div class="sub">From revenue marked VAT-inclusive</div></div>
       <div class="card"><h3>VAT Paid</h3><div class="value">${fmt(v.vatPaid)}</div><div class="sub">From expenses marked VAT-inclusive</div></div>
@@ -2681,6 +2776,7 @@ function renderScenarioList(canEdit){
   const compareIds = state.scenarioCompareIds.filter(id => state.scenarios.some(s=>s.id===id));
   return `
     <div class="section-header" style="--accent-c:var(--c-scenarios);"><h1>Scenarios</h1>${canEdit ? `<button class="btn" id="add-scenario-btn">+ New Scenario</button>` : ''}</div>
+    <p class="section-caption">Model what-if decisions — comparing suppliers or a loan — before you commit.</p>
     <div class="panel">
       <p style="color:var(--muted);font-size:.86rem;margin-top:0;">Model a what-if — a supplier option, a loan you're considering, or any other plan — as a scenario, then tick two or more to compare them side by side. Nothing here posts to your books until you say so.</p>
       ${state.scenarios.length ? `<table><thead><tr><th></th><th>Name</th><th>Category</th><th>Discount Rate</th><th>Period</th><th>Cash Flow Lines</th><th>NPV</th><th>IRR</th><th></th></tr></thead><tbody>
