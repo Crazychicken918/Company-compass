@@ -552,3 +552,229 @@ from pg_policies
 where tablename like 'cc_%'
 group by tablename
 order by tablename;
+-- Wave 22: Supplier Invoices (AP subledger), customer invoice payment
+-- allocation, supplier credit notes, invoice-linked accrual entries, and
+-- company invoice branding (logo). Idempotent — safe to run more than once.
+
+-- ============ SUPPLIERS ============
+create table if not exists cc_suppliers (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  name text not null,
+  email text,
+  phone text,
+  address text,
+  created_at timestamptz default now()
+);
+
+-- ============ SUPPLIER INVOICES (bills) ============
+create table if not exists cc_supplier_invoices (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  supplier_id uuid references cc_suppliers(id) on delete set null,
+  bill_number text not null,
+  issue_date date not null default current_date,
+  due_date date,
+  status text not null default 'unpaid' check (status in ('unpaid','partially_paid','paid')),
+  -- splits Cost of Sales from Operating Expenses, same convention as cc_entries
+  expense_category text not null default 'operating' check (expense_category in ('cost_of_sales','operating')),
+  notes text,
+  created_by uuid references auth.users(id),
+  approval_status text not null default 'approved' check (approval_status in ('pending','approved','rejected')),
+  approved_by uuid references auth.users(id),
+  approved_at timestamptz,
+  rejection_note text,
+  created_at timestamptz default now()
+);
+
+create table if not exists cc_supplier_invoice_items (
+  id uuid primary key default gen_random_uuid(),
+  supplier_invoice_id uuid not null references cc_supplier_invoices(id) on delete cascade,
+  description text not null,
+  quantity numeric not null default 1,
+  unit_price numeric not null default 0,
+  vat_applicable boolean not null default true
+);
+
+-- actual cash paid against a supplier invoice — feeds Cash Flow and the AP balance
+create table if not exists cc_supplier_invoice_payments (
+  id uuid primary key default gen_random_uuid(),
+  supplier_invoice_id uuid not null references cc_supplier_invoices(id) on delete cascade,
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  payment_date date not null default current_date,
+  amount numeric not null,
+  notes text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now()
+);
+
+-- ============ SUPPLIER CREDIT NOTES (mirrors customer credit notes) ============
+create table if not exists cc_supplier_credit_notes (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  supplier_id uuid references cc_suppliers(id) on delete set null,
+  supplier_invoice_id uuid references cc_supplier_invoices(id) on delete set null,
+  credit_note_number text not null,
+  issue_date date not null default current_date,
+  reason text,
+  status text not null default 'draft' check (status in ('draft','issued')),
+  approval_status text not null default 'approved' check (approval_status in ('pending','approved','rejected')),
+  created_by uuid references auth.users(id),
+  approved_by uuid references auth.users(id),
+  approved_at timestamptz,
+  rejection_note text,
+  notes text,
+  created_at timestamptz default now()
+);
+
+create table if not exists cc_supplier_credit_note_items (
+  id uuid primary key default gen_random_uuid(),
+  supplier_credit_note_id uuid not null references cc_supplier_credit_notes(id) on delete cascade,
+  description text not null,
+  quantity numeric not null default 1,
+  unit_price numeric not null default 0,
+  vat_applicable boolean not null default true
+);
+
+-- ============ CUSTOMER INVOICE PAYMENTS (accounts receivable subledger) ============
+create table if not exists cc_invoice_payments (
+  id uuid primary key default gen_random_uuid(),
+  invoice_id uuid not null references cc_invoices(id) on delete cascade,
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  payment_date date not null default current_date,
+  amount numeric not null,
+  notes text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now()
+);
+
+-- ============ ACCRUAL LINKAGE: revenue/expense entries auto-created from invoices ============
+-- When set, the entry is an accrual recognized at invoice issue/approval time, not an
+-- actual cash movement — Cash Flow and the Balance Sheet's cash figure exclude it and
+-- use the real cc_invoice_payments / cc_supplier_invoice_payments instead (same pattern
+-- already used to exclude non-cash depreciation).
+alter table cc_entries add column if not exists source_invoice_id uuid references cc_invoices(id) on delete cascade;
+alter table cc_entries add column if not exists source_supplier_invoice_id uuid references cc_supplier_invoices(id) on delete cascade;
+
+-- ============ COMPANY INVOICE BRANDING ============
+alter table cc_companies add column if not exists logo_data_url text;
+
+-- ============ ROW LEVEL SECURITY ============
+alter table cc_suppliers enable row level security;
+alter table cc_supplier_invoices enable row level security;
+alter table cc_supplier_invoice_items enable row level security;
+alter table cc_supplier_invoice_payments enable row level security;
+alter table cc_supplier_credit_notes enable row level security;
+alter table cc_supplier_credit_note_items enable row level security;
+alter table cc_invoice_payments enable row level security;
+
+-- suppliers: module-scoped ('supplier_invoices')
+drop policy if exists "members select suppliers" on cc_suppliers;
+create policy "members select suppliers" on cc_suppliers for select using (cc_is_member(company_id));
+drop policy if exists "scoped write suppliers" on cc_suppliers;
+create policy "scoped write suppliers" on cc_suppliers for insert with check (cc_has_module(company_id, 'supplier_invoices'));
+drop policy if exists "scoped update suppliers" on cc_suppliers;
+create policy "scoped update suppliers" on cc_suppliers for update using (cc_has_module(company_id, 'supplier_invoices'));
+drop policy if exists "scoped delete suppliers" on cc_suppliers;
+create policy "scoped delete suppliers" on cc_suppliers for delete using (cc_has_module(company_id, 'supplier_invoices'));
+
+-- supplier invoices: module-scoped create + approval workflow (mirrors cc_invoices)
+drop policy if exists "members select supplier invoices" on cc_supplier_invoices;
+create policy "members select supplier invoices" on cc_supplier_invoices for select using (cc_is_member(company_id));
+drop policy if exists "scoped write supplier invoices" on cc_supplier_invoices;
+create policy "scoped write supplier invoices" on cc_supplier_invoices for insert with check (cc_has_module(company_id, 'supplier_invoices'));
+drop policy if exists "management update supplier invoices" on cc_supplier_invoices;
+create policy "management update supplier invoices" on cc_supplier_invoices for update using (cc_can_approve(company_id));
+drop policy if exists "creator edit pending supplier invoice" on cc_supplier_invoices;
+create policy "creator edit pending supplier invoice" on cc_supplier_invoices for update
+  using (created_by = auth.uid() and approval_status = 'pending')
+  with check (created_by = auth.uid() and approval_status = 'pending');
+drop policy if exists "management delete supplier invoices" on cc_supplier_invoices;
+create policy "management delete supplier invoices" on cc_supplier_invoices for delete using (cc_can_approve(company_id));
+drop policy if exists "creator delete pending supplier invoice" on cc_supplier_invoices;
+create policy "creator delete pending supplier invoice" on cc_supplier_invoices for delete using (created_by = auth.uid() and approval_status = 'pending');
+
+drop policy if exists "members select supplier invoice items" on cc_supplier_invoice_items;
+create policy "members select supplier invoice items" on cc_supplier_invoice_items for select using (
+  cc_is_member((select company_id from cc_supplier_invoices where id = supplier_invoice_id))
+);
+drop policy if exists "scoped write supplier invoice items" on cc_supplier_invoice_items;
+create policy "scoped write supplier invoice items" on cc_supplier_invoice_items for insert with check (
+  cc_has_module((select company_id from cc_supplier_invoices where id = supplier_invoice_id), 'supplier_invoices')
+);
+drop policy if exists "scoped update supplier invoice items" on cc_supplier_invoice_items;
+create policy "scoped update supplier invoice items" on cc_supplier_invoice_items for update using (
+  cc_can_approve((select company_id from cc_supplier_invoices where id = supplier_invoice_id))
+  or exists (select 1 from cc_supplier_invoices b where b.id = supplier_invoice_id and b.created_by = auth.uid() and b.approval_status = 'pending')
+);
+drop policy if exists "scoped delete supplier invoice items" on cc_supplier_invoice_items;
+create policy "scoped delete supplier invoice items" on cc_supplier_invoice_items for delete using (
+  cc_can_approve((select company_id from cc_supplier_invoices where id = supplier_invoice_id))
+  or exists (select 1 from cc_supplier_invoices b where b.id = supplier_invoice_id and b.created_by = auth.uid() and b.approval_status = 'pending')
+);
+
+-- supplier invoice payments: module-scoped, plain CRUD (no approval workflow — same as payroll payments)
+drop policy if exists "members select supplier invoice payments" on cc_supplier_invoice_payments;
+create policy "members select supplier invoice payments" on cc_supplier_invoice_payments for select using (cc_is_member(company_id));
+drop policy if exists "scoped write supplier invoice payments" on cc_supplier_invoice_payments;
+create policy "scoped write supplier invoice payments" on cc_supplier_invoice_payments for insert with check (cc_has_module(company_id, 'supplier_invoices'));
+drop policy if exists "scoped update supplier invoice payments" on cc_supplier_invoice_payments;
+create policy "scoped update supplier invoice payments" on cc_supplier_invoice_payments for update using (cc_has_module(company_id, 'supplier_invoices'));
+drop policy if exists "scoped delete supplier invoice payments" on cc_supplier_invoice_payments;
+create policy "scoped delete supplier invoice payments" on cc_supplier_invoice_payments for delete using (cc_has_module(company_id, 'supplier_invoices'));
+
+-- supplier credit notes: module-scoped create + approval workflow (mirrors cc_credit_notes)
+drop policy if exists "members select supplier credit notes" on cc_supplier_credit_notes;
+create policy "members select supplier credit notes" on cc_supplier_credit_notes for select using (cc_is_member(company_id));
+drop policy if exists "scoped write supplier credit notes" on cc_supplier_credit_notes;
+create policy "scoped write supplier credit notes" on cc_supplier_credit_notes for insert with check (cc_has_module(company_id, 'supplier_invoices'));
+drop policy if exists "management update supplier credit notes" on cc_supplier_credit_notes;
+create policy "management update supplier credit notes" on cc_supplier_credit_notes for update using (cc_can_approve(company_id));
+drop policy if exists "creator edit pending supplier credit note" on cc_supplier_credit_notes;
+create policy "creator edit pending supplier credit note" on cc_supplier_credit_notes for update
+  using (created_by = auth.uid() and approval_status = 'pending')
+  with check (created_by = auth.uid() and approval_status = 'pending');
+drop policy if exists "management delete supplier credit notes" on cc_supplier_credit_notes;
+create policy "management delete supplier credit notes" on cc_supplier_credit_notes for delete using (cc_can_approve(company_id));
+drop policy if exists "creator delete pending supplier credit note" on cc_supplier_credit_notes;
+create policy "creator delete pending supplier credit note" on cc_supplier_credit_notes for delete using (created_by = auth.uid() and approval_status = 'pending');
+
+drop policy if exists "members select supplier credit note items" on cc_supplier_credit_note_items;
+create policy "members select supplier credit note items" on cc_supplier_credit_note_items for select using (
+  cc_is_member((select company_id from cc_supplier_credit_notes where id = supplier_credit_note_id))
+);
+drop policy if exists "scoped write supplier credit note items" on cc_supplier_credit_note_items;
+create policy "scoped write supplier credit note items" on cc_supplier_credit_note_items for insert with check (
+  cc_has_module((select company_id from cc_supplier_credit_notes where id = supplier_credit_note_id), 'supplier_invoices')
+);
+drop policy if exists "scoped update supplier credit note items" on cc_supplier_credit_note_items;
+create policy "scoped update supplier credit note items" on cc_supplier_credit_note_items for update using (
+  cc_can_approve((select company_id from cc_supplier_credit_notes where id = supplier_credit_note_id))
+  or exists (select 1 from cc_supplier_credit_notes c where c.id = supplier_credit_note_id and c.created_by = auth.uid() and c.approval_status = 'pending')
+);
+drop policy if exists "scoped delete supplier credit note items" on cc_supplier_credit_note_items;
+create policy "scoped delete supplier credit note items" on cc_supplier_credit_note_items for delete using (
+  cc_can_approve((select company_id from cc_supplier_credit_notes where id = supplier_credit_note_id))
+  or exists (select 1 from cc_supplier_credit_notes c where c.id = supplier_credit_note_id and c.created_by = auth.uid() and c.approval_status = 'pending')
+);
+
+-- customer invoice payments: module-scoped ('invoices'), plain CRUD
+drop policy if exists "members select invoice payments" on cc_invoice_payments;
+create policy "members select invoice payments" on cc_invoice_payments for select using (cc_is_member(company_id));
+drop policy if exists "scoped write invoice payments" on cc_invoice_payments;
+create policy "scoped write invoice payments" on cc_invoice_payments for insert with check (cc_has_module(company_id, 'invoices'));
+drop policy if exists "scoped update invoice payments" on cc_invoice_payments;
+create policy "scoped update invoice payments" on cc_invoice_payments for update using (cc_has_module(company_id, 'invoices'));
+drop policy if exists "scoped delete invoice payments" on cc_invoice_payments;
+create policy "scoped delete invoice payments" on cc_invoice_payments for delete using (cc_has_module(company_id, 'invoices'));
+
+-- ---------- verify ----------
+select tablename, count(*) as policy_count
+from pg_policies
+where tablename in ('cc_suppliers','cc_supplier_invoices','cc_supplier_invoice_items','cc_supplier_invoice_payments','cc_supplier_credit_notes','cc_supplier_credit_note_items','cc_invoice_payments')
+group by tablename
+order by tablename;
+
+-- ============ WAVE 23: VAT REGISTRATION STATUS & COMPANY ADDRESS ============
+alter table cc_companies add column if not exists vat_registered boolean not null default true;
+alter table cc_companies add column if not exists address text;

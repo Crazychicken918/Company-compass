@@ -15,7 +15,7 @@
     --c-dashboard:#7c5cff; --c-revenue:#0fb981; --c-expenses:#f4406a; --c-assets:#06b6d4;
     --c-liabilities:#f5a524; --c-clients:#a855f7; --c-invoices:#6366f1; --c-creditnotes:#ec4899;
     --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b; --c-reports:#1d4ed8;
-    --c-scenarios:#059669;
+    --c-scenarios:#059669; --c-supplierinvoices:#0ea5e9;
     --grid-line: rgba(25,26,35,.03);
   }
   /* Dark mode: follows the OS setting by default; a manual toggle (data-theme)
@@ -108,6 +108,7 @@
   #sidebar nav button[data-view="reports"]{--dot:var(--c-reports);}
   #sidebar nav button[data-view="team"]{--dot:var(--c-team);}
   #sidebar nav button[data-view="scenarios"]{--dot:var(--c-scenarios);}
+  #sidebar nav button[data-view="supplierinvoices"]{--dot:var(--c-supplierinvoices);}
   #sidebar .logout{margin-top:10px;font-size:.8rem;color:var(--muted);background:none;border:none;text-align:left;padding:9px 10px;}
 
   #main{flex:1;padding:26px 32px;max-width:1100px;}
@@ -171,6 +172,9 @@
   #legal-content p{margin:0 0 10px 0;color:var(--muted);}
   .role-badge{font-size:.72rem;padding:2px 8px;border-radius:999px;background:var(--panel2);border:1px solid var(--border);}
   .invoice-items-table input{width:100%;}
+  .invoice-logo-preview{max-height:56px;max-width:220px;display:block;margin-bottom:8px;border-radius:6px;}
+  .payment-list{font-size:.85rem;}
+  .payment-list td{padding:4px 8px;}
   #toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:#fff;padding:10px 16px;border-radius:10px;font-size:.85rem;z-index:99;display:none;box-shadow:0 8px 24px -8px rgba(30,20,60,.4);}
   .muted-link{color:var(--muted);text-decoration:underline;cursor:pointer;font-size:.8rem;}
   #theme-toggle-global{position:fixed;top:16px;right:16px;z-index:50;background:var(--bg-elev);border:1px solid var(--border);color:var(--text);
@@ -225,6 +229,7 @@
       <button data-view="expenses"><span class="dot"></span>Expenses</button>
       <button data-view="assets"><span class="dot"></span>Assets</button>
       <button data-view="liabilities"><span class="dot"></span>Liabilities</button>
+      <button data-view="supplierinvoices"><span class="dot"></span>Supplier Invoices</button>
       <button data-view="clients"><span class="dot"></span>Clients</button>
       <button data-view="invoices"><span class="dot"></span>Invoices</button>
       <button data-view="creditnotes"><span class="dot"></span>Credit Notes</button>
@@ -415,7 +420,7 @@ function generateSupplierCashflows(supplier, periodsCount, periodUnit){
 /* ========================= STATE ========================= */
 let state = {
   user: null,
-  company: null,      // {id, name, vat_number, registration_number, owner_id}
+  company: null,      // {id, name, vat_number, registration_number, owner_id, vat_registered, address}
   membership: null,   // {role, status}
   members: [],
   accounts: [],
@@ -427,6 +432,13 @@ let state = {
   invoiceItems: {},   // invoiceId -> items[]
   creditNotes: [],
   creditNoteItems: {}, // creditNoteId -> items[]
+  invoicePayments: [], // actual cash received against customer invoices
+  suppliers: [],
+  supplierInvoices: [],
+  supplierInvoiceItems: {}, // supplierInvoiceId -> items[]
+  supplierInvoicePayments: [], // actual cash paid against supplier invoices
+  supplierCreditNotes: [],
+  supplierCreditNoteItems: {}, // supplierCreditNoteId -> items[]
   employees: [],
   payrollPayments: [],
   employeeTasks: [],
@@ -483,7 +495,7 @@ function roleLabel(m){
   }
   return m.role;
 }
-const MODULE_LABELS = {revenue:'Revenue', expenses:'Expenses', assets:'Assets', liabilities:'Liabilities', clients:'Clients', invoices:'Invoices', credit_notes:'Credit Notes', payroll:'Payroll'};
+const MODULE_LABELS = {revenue:'Revenue', expenses:'Expenses', assets:'Assets', liabilities:'Liabilities', clients:'Clients', invoices:'Invoices', credit_notes:'Credit Notes', payroll:'Payroll', supplier_invoices:'Supplier Invoices'};
 function moduleLabel(k){ return MODULE_LABELS[k] || k; }
 
 /* ========================= AUTH ========================= */
@@ -715,14 +727,35 @@ async function refreshAll(){
   state.scenarioCashflows = {};
   (cashflowsRes.data||[]).forEach(row=>{ (state.scenarioCashflows[row.scenario_id] = state.scenarioCashflows[row.scenario_id]||[]).push(row); });
 
+  const [suppliersRes, supplierInvoicesRes, supplierCreditNotesRes, invoicePaymentsRes] = await Promise.all([
+    sb.from('cc_suppliers').select('*').eq('company_id', cid),
+    sb.from('cc_supplier_invoices').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
+    sb.from('cc_supplier_credit_notes').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
+    sb.from('cc_invoice_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false})
+  ]);
+  state.suppliers = suppliersRes.data || [];
+  state.supplierInvoices = supplierInvoicesRes.data || [];
+  state.supplierCreditNotes = supplierCreditNotesRes.data || [];
+  state.invoicePayments = invoicePaymentsRes.data || [];
+
   const invoiceIds = state.invoices.map(i=>i.id);
   const creditNoteIds = state.creditNotes.map(cn=>cn.id);
-  const [invItemsRes, cnItemsRes] = await Promise.all([
+  const supplierInvoiceIds = state.supplierInvoices.map(b=>b.id);
+  const supplierCreditNoteIds = state.supplierCreditNotes.map(cn=>cn.id);
+  const [invItemsRes, cnItemsRes, supInvItemsRes, supCnItemsRes, supInvPaymentsRes] = await Promise.all([
     invoiceIds.length ? sb.from('cc_invoice_items').select('*').in('invoice_id', invoiceIds) : Promise.resolve({data:[]}),
-    creditNoteIds.length ? sb.from('cc_credit_note_items').select('*').in('credit_note_id', creditNoteIds) : Promise.resolve({data:[]})
+    creditNoteIds.length ? sb.from('cc_credit_note_items').select('*').in('credit_note_id', creditNoteIds) : Promise.resolve({data:[]}),
+    supplierInvoiceIds.length ? sb.from('cc_supplier_invoice_items').select('*').in('supplier_invoice_id', supplierInvoiceIds) : Promise.resolve({data:[]}),
+    supplierCreditNoteIds.length ? sb.from('cc_supplier_credit_note_items').select('*').in('supplier_credit_note_id', supplierCreditNoteIds) : Promise.resolve({data:[]}),
+    supplierInvoiceIds.length ? sb.from('cc_supplier_invoice_payments').select('*').in('supplier_invoice_id', supplierInvoiceIds).order('payment_date', {ascending:false}) : Promise.resolve({data:[]})
   ]);
   state.invoiceItems = {};
   (invItemsRes.data||[]).forEach(it=>{ (state.invoiceItems[it.invoice_id] = state.invoiceItems[it.invoice_id]||[]).push(it); });
+  state.supplierInvoiceItems = {};
+  (supInvItemsRes.data||[]).forEach(it=>{ (state.supplierInvoiceItems[it.supplier_invoice_id] = state.supplierInvoiceItems[it.supplier_invoice_id]||[]).push(it); });
+  state.supplierCreditNoteItems = {};
+  (supCnItemsRes.data||[]).forEach(it=>{ (state.supplierCreditNoteItems[it.supplier_credit_note_id] = state.supplierCreditNoteItems[it.supplier_credit_note_id]||[]).push(it); });
+  state.supplierInvoicePayments = supInvPaymentsRes.data || [];
   state.creditNoteItems = {};
   (cnItemsRes.data||[]).forEach(it=>{ (state.creditNoteItems[it.credit_note_id] = state.creditNoteItems[it.credit_note_id]||[]).push(it); });
 }
@@ -744,6 +777,7 @@ function render(){
     case 'expenses': main.innerHTML = renderEntries('expense'); attachEntryHandlers('expense'); break;
     case 'assets': main.innerHTML = renderAssets(); attachAssetHandlers(); break;
     case 'liabilities': main.innerHTML = renderLiabilities(); attachLiabilityHandlers(); break;
+    case 'supplierinvoices': main.innerHTML = renderSupplierInvoices(); attachSupplierInvoiceHandlers(); break;
     case 'clients': main.innerHTML = renderClients(); attachClientHandlers(); break;
     case 'invoices': main.innerHTML = renderInvoices(); attachInvoiceHandlers(); break;
     case 'creditnotes': main.innerHTML = renderCreditNotes(); attachCreditNoteHandlers(); break;
@@ -773,12 +807,19 @@ function attachDashboardHandlers(){
 }
 
 /* ========================= CALCULATIONS ========================= */
+function isNonCashEntry(e){
+  // Depreciation is a book expense; invoice-linked entries are accrual revenue/expense
+  // recognized at invoice time. None of these are actual cash movements.
+  return (e.tags||[]).includes('depreciation') || !!e.source_invoice_id || !!e.source_supplier_invoice_id;
+}
 function totalsFor(){
-  const revenue = state.entries.filter(e=>e.type==='revenue').reduce((s,e)=>s+Number(e.amount),0);
-  const expenses = state.entries.filter(e=>e.type==='expense').reduce((s,e)=>s+Number(e.amount),0);
+  const revenue = state.entries.filter(e=>e.type==='revenue' && !isNonCashEntry(e)).reduce((s,e)=>s+Number(e.amount),0);
+  const expenses = state.entries.filter(e=>e.type==='expense' && !isNonCashEntry(e)).reduce((s,e)=>s+Number(e.amount),0);
   const startingBalance = state.accounts.reduce((s,a)=>s+Number(a.starting_balance||0),0);
   const payrollPaid = state.payrollPayments.filter(p=>p.paid).reduce((s,p)=>s+Number(p.net),0);
-  const predictedBalance = startingBalance + revenue - expenses - payrollPaid;
+  const invoicePaymentsIn = (state.invoicePayments||[]).reduce((s,p)=>s+Number(p.amount),0);
+  const supplierPaymentsOut = (state.supplierInvoicePayments||[]).reduce((s,p)=>s+Number(p.amount),0);
+  const predictedBalance = startingBalance + revenue - expenses - payrollPaid + invoicePaymentsIn - supplierPaymentsOut;
   const totalAssets = state.assets.reduce((s,a)=>s+Number(a.value),0);
   const totalLiabilities = state.liabilities.reduce((s,l)=>s+Number(l.amount),0);
   const netWorth = totalAssets + predictedBalance - totalLiabilities;
@@ -858,6 +899,10 @@ function renderDashboard(){
 function clientName(id){
   const c = state.clients.find(c=>c.id===id);
   return c ? c.name : '—';
+}
+function supplierName(id){
+  const s = (state.suppliers||[]).find(s=>s.id===id);
+  return s ? s.name : '—';
 }
 
 /* ========================= REVENUE / EXPENSES ========================= */
@@ -1168,6 +1213,499 @@ function attachLiabilityHandlers(){
   });
 }
 
+/* ========================= SUPPLIER INVOICES (accounts payable) ========================= */
+function nextSupplierBillNumber(){
+  const year = new Date().getFullYear();
+  const nums = (state.supplierInvoices||[])
+    .map(b=>b.bill_number)
+    .filter(n=>n && n.startsWith('BILL-'+year))
+    .map(n=>parseInt(n.split('-').pop())||0);
+  const next = (nums.length ? Math.max(...nums) : 0) + 1;
+  return `BILL-${year}-${String(next).padStart(3,'0')}`;
+}
+function nextSupplierCreditNoteNumber(){
+  const year = new Date().getFullYear();
+  const nums = (state.supplierCreditNotes||[])
+    .map(n=>n.credit_note_number)
+    .filter(n=>n && n.startsWith('SCN-'+year))
+    .map(n=>parseInt(n.split('-').pop())||0);
+  const next = (nums.length ? Math.max(...nums) : 0) + 1;
+  return `SCN-${year}-${String(next).padStart(3,'0')}`;
+}
+// Recognizes the expense at the moment a supplier bill is captured/approved: posts a
+// linked cc_entries row (accrual) dated the bill's issue date. Cash Flow and the
+// Balance Sheet exclude this entry from cash and use actual
+// cc_supplier_invoice_payments instead (see isNonCashEntry / computeCashFlow / computeBS).
+async function recognizeSupplierInvoiceExpense(bill, items){
+  const total = docTotal(items);
+  if(total <= 0) return;
+  const anyVat = (items||[]).some(it=>it.vat_applicable);
+  await sb.from('cc_entries').insert({
+    company_id: state.company.id,
+    type: 'expense',
+    description: `Bill ${bill.bill_number} — ${supplierName(bill.supplier_id)}`,
+    amount: total,
+    entry_date: bill.issue_date,
+    tags: ['supplier_invoice'],
+    vat_applicable: anyVat,
+    expense_category: bill.expense_category || 'operating',
+    created_by: bill.created_by || state.user.id,
+    source_supplier_invoice_id: bill.id
+  });
+}
+function billBalance(bill){
+  const total = docTotal(state.supplierInvoiceItems[bill.id]);
+  const paid = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===bill.id).reduce((s,p)=>s+Number(p.amount),0);
+  return {total, paid, balance: Math.max(0, total - paid)};
+}
+function renderSupplierInvoices(){
+  const canEdit = hasModule('supplier_invoices');
+  const pendingCount = state.supplierInvoices.filter(b=>b.approval_status==='pending').length;
+  const totalOutstanding = state.supplierInvoices
+    .filter(b=>b.approval_status==='approved')
+    .reduce((s,b)=>s+billBalance(b).balance, 0);
+  return `
+    <div class="section-header" style="--accent-c:var(--c-supplierinvoices);"><h1>Supplier Invoices</h1>${canEdit ? `<button class="btn" id="add-supplier-btn">+ Add Supplier</button> <button class="btn" id="add-supplier-invoice-btn">+ New Supplier Invoice</button>` : ''}</div>
+    <p class="section-caption">Bills you've received from suppliers, the payments you've allocated against them, and supplier credit notes.</p>
+    <div class="grid"><div class="card" style="--accent-c:var(--c-supplierinvoices);"><h3>Outstanding to Suppliers</h3><div class="value negative">${fmt(totalOutstanding)}</div></div></div>
+    ${pendingCount ? `<div class="panel" style="border-top:3px solid var(--warn);"><h3 style="margin-top:0;color:var(--warn);">Pending approval (${pendingCount})</h3><p style="color:var(--muted);font-size:.85rem;margin-bottom:0;">${canApprove() ? 'Open one below to approve or reject it.' : 'Waiting on management or an approver to review.'}</p></div>` : ''}
+    <div class="panel">
+      <h3 style="margin-top:0;">Suppliers</h3>
+      ${state.suppliers.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.suppliers.map(s=>`<tr><td>${s.name}</td><td>${s.email||'—'}</td><td>${s.phone||'—'}</td>${canEdit?`<td><button class="btn small danger" data-del-supplier="${s.id}">Delete</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No suppliers yet.</div>`}
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Bills</h3>
+      ${state.supplierInvoices.length ? `<table><thead><tr><th>Bill #</th><th>Supplier</th><th>Issue Date</th><th>Due</th><th>Approval</th><th>Total</th><th>Balance</th><th></th></tr></thead><tbody>
+        ${state.supplierInvoices.map(b=>{
+          const bal = billBalance(b);
+          return `<tr>
+          <td>${b.bill_number}</td><td>${supplierName(b.supplier_id)}</td><td>${b.issue_date}</td><td>${b.due_date||'—'}</td>
+          <td>${approvalPill(b)}</td>
+          <td>${fmt(bal.total)}</td>
+          <td class="${bal.balance<=0.005?'positive':''}">${bal.balance<=0.005?'Paid':fmt(bal.balance)}</td>
+          <td>
+            <button class="btn small secondary" data-view-supplier-invoice="${b.id}">View</button>
+            ${(canApprove() || (b.created_by===state.user.id && b.approval_status==='pending'))?`<button class="btn small danger" data-del-supplier-invoice="${b.id}">Delete</button>`:''}
+          </td>
+        </tr>`;}).join('')}
+      </tbody></table>` : `<div class="empty">No supplier invoices captured yet.</div>`}
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;display:flex;align-items:center;justify-content:space-between;">Supplier Credit Notes ${canEdit ? `<button class="btn small secondary" id="add-supplier-creditnote-btn">+ New Supplier Credit Note</button>` : ''}</h3>
+      ${state.supplierCreditNotes.length ? `<table><thead><tr><th>Number</th><th>Supplier</th><th>Issue Date</th><th>Against</th><th>Status</th><th>Approval</th><th>Total</th><th></th></tr></thead><tbody>
+        ${state.supplierCreditNotes.map(n=>`<tr>
+          <td>${n.credit_note_number}</td><td>${supplierName(n.supplier_id)}</td><td>${n.issue_date}</td>
+          <td>${n.supplier_invoice_id ? (state.supplierInvoices.find(b=>b.id===n.supplier_invoice_id)?.bill_number || '—') : '—'}</td>
+          <td><span class="status-pill status-${n.status==='issued'?'issued':'draft'}">${n.status}</span></td>
+          <td>${approvalPill(n)}</td>
+          <td id="scn-total-${n.id}">…</td>
+          <td>
+            <button class="btn small secondary" data-view-supplier-creditnote="${n.id}">View</button>
+            ${(canApprove() || (n.created_by===state.user.id && n.approval_status==='pending'))?`<button class="btn small danger" data-del-supplier-creditnote="${n.id}">Delete</button>`:''}
+          </td>
+        </tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No supplier credit notes yet.</div>`}
+    </div>
+    ${canEdit ? `
+    <div class="modal-backdrop hidden" id="supplier-modal-backdrop"><div class="modal">
+      <button class="close-x" id="supplier-modal-close">✕</button>
+      <h2>Add Supplier</h2>
+      <form id="supplier-form">
+        <div class="field"><label>Name</label><input type="text" id="supplier-name" required></div>
+        <div class="field"><label>Email</label><input type="email" id="supplier-email"></div>
+        <div class="field"><label>Phone</label><input type="text" id="supplier-phone"></div>
+        <div class="field"><label>Address</label><textarea id="supplier-address" rows="2"></textarea></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="supplier-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
+      </form>
+    </div></div>
+    ${supplierInvoiceModal()}
+    ${supplierCreditNoteModal()}` : ''}
+    <div class="modal-backdrop hidden" id="supplier-invoice-view-backdrop"><div class="modal" id="supplier-invoice-view-content"></div></div>
+    <div class="modal-backdrop hidden" id="supplier-creditnote-view-backdrop"><div class="modal" id="supplier-creditnote-view-content"></div></div>
+  `;
+}
+function supplierInvoiceModal(){
+  return `
+  <div class="modal-backdrop hidden" id="supplier-invoice-modal-backdrop">
+    <div class="modal" style="max-width:600px;">
+      <button class="close-x" id="supplier-invoice-modal-close">✕</button>
+      <h2>New Supplier Invoice</h2>
+      <form id="supplier-invoice-form">
+        <div class="row">
+          <div class="field"><label>Bill #</label><input type="text" id="supplier-invoice-number" required></div>
+          <div class="field"><label>Supplier</label><select id="supplier-invoice-supplier">${state.suppliers.map(s=>`<option value="${s.id}">${s.name}</option>`).join('') || '<option value="">Add a supplier first</option>'}</select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Issue date</label><input type="date" id="supplier-invoice-issue-date" required></div>
+          <div class="field"><label>Due date</label><input type="date" id="supplier-invoice-due-date"></div>
+        </div>
+        <div class="field"><label>Category</label><select id="supplier-invoice-category">
+          <option value="operating">Operating Expense</option>
+          <option value="cost_of_sales">Cost of Sales (COS)</option>
+        </select></div>
+        <h3 style="margin-bottom:6px;">Line items</h3>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+          <tbody id="supplier-invoice-items-body"></tbody>
+        </table>
+        <button type="button" class="btn secondary small" id="supplier-invoice-add-item" style="margin-top:8px;">+ Add line</button>
+        <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="supplier-invoice-notes" rows="2"></textarea></div>
+        <div class="modal-actions">
+          <button type="button" class="btn secondary" id="supplier-invoice-cancel">Cancel</button>
+          <button type="submit" class="btn">Save Supplier Invoice</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+function supplierCreditNoteModal(){
+  return `
+  <div class="modal-backdrop hidden" id="supplier-creditnote-modal-backdrop">
+    <div class="modal" style="max-width:600px;">
+      <button class="close-x" id="supplier-creditnote-modal-close">✕</button>
+      <h2>New Supplier Credit Note</h2>
+      <form id="supplier-creditnote-form">
+        <div class="row">
+          <div class="field"><label>Credit note #</label><input type="text" id="supplier-creditnote-number" required></div>
+          <div class="field"><label>Supplier</label><select id="supplier-creditnote-supplier">${state.suppliers.map(s=>`<option value="${s.id}">${s.name}</option>`).join('') || '<option value="">Add a supplier first</option>'}</select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Issue date</label><input type="date" id="supplier-creditnote-issue-date" required></div>
+          <div class="field"><label>Against bill (optional)</label><select id="supplier-creditnote-invoice"><option value="">—</option>${state.supplierInvoices.map(b=>`<option value="${b.id}">${b.bill_number}</option>`).join('')}</select></div>
+        </div>
+        <div class="field"><label>Reason</label><input type="text" id="supplier-creditnote-reason" placeholder="e.g. returned goods, billing correction"></div>
+        <h3 style="margin-bottom:6px;">Line items</h3>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+          <tbody id="supplier-creditnote-items-body"></tbody>
+        </table>
+        <button type="button" class="btn secondary small" id="supplier-creditnote-add-item" style="margin-top:8px;">+ Add line</button>
+        <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="supplier-creditnote-notes" rows="2"></textarea></div>
+        <div class="modal-actions">
+          <button type="button" class="btn secondary" id="supplier-creditnote-cancel">Cancel</button>
+          <button type="submit" class="btn">Save Credit Note</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+function attachSupplierInvoiceHandlers(){
+  const canEdit = hasModule('supplier_invoices');
+  // ---- Suppliers ----
+  const supplierBackdrop = document.getElementById('supplier-modal-backdrop');
+  document.getElementById('add-supplier-btn')?.addEventListener('click', ()=>supplierBackdrop.classList.remove('hidden'));
+  document.getElementById('supplier-cancel')?.addEventListener('click', ()=>supplierBackdrop.classList.add('hidden'));
+  document.getElementById('supplier-modal-close')?.addEventListener('click', ()=>supplierBackdrop.classList.add('hidden'));
+  document.getElementById('supplier-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const {error} = await sb.from('cc_suppliers').insert({
+      company_id: state.company.id,
+      name: document.getElementById('supplier-name').value.trim(),
+      email: document.getElementById('supplier-email').value.trim() || null,
+      phone: document.getElementById('supplier-phone').value.trim() || null,
+      address: document.getElementById('supplier-address').value.trim() || null
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Supplier saved.');
+  });
+  document.querySelectorAll('[data-del-supplier]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this supplier?')) return;
+      await sb.from('cc_suppliers').delete().eq('id', btn.dataset.delSupplier);
+      await refreshAll(); render();
+    });
+  });
+  // ---- Supplier Invoices (bills) ----
+  const invBackdrop = document.getElementById('supplier-invoice-modal-backdrop');
+  document.getElementById('add-supplier-invoice-btn')?.addEventListener('click', ()=>{
+    if(!state.suppliers.length){ toast('Add a supplier first.'); return; }
+    document.getElementById('supplier-invoice-number').value = nextSupplierBillNumber();
+    document.getElementById('supplier-invoice-issue-date').value = new Date().toISOString().slice(0,10);
+    document.getElementById('supplier-invoice-items-body').innerHTML = invoiceItemRow();
+    invBackdrop.classList.remove('hidden');
+  });
+  document.getElementById('supplier-invoice-cancel')?.addEventListener('click', ()=>invBackdrop.classList.add('hidden'));
+  document.getElementById('supplier-invoice-modal-close')?.addEventListener('click', ()=>invBackdrop.classList.add('hidden'));
+  document.getElementById('supplier-invoice-add-item')?.addEventListener('click', ()=>{
+    document.getElementById('supplier-invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRow());
+  });
+  document.getElementById('supplier-invoice-items-body')?.addEventListener('click', (e)=>{
+    if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
+  });
+  document.getElementById('supplier-invoice-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const supplierId = document.getElementById('supplier-invoice-supplier').value;
+    if(!supplierId){ toast('Add a supplier first.'); return; }
+    const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const {data: bill, error} = await sb.from('cc_supplier_invoices').insert({
+      company_id: state.company.id,
+      supplier_id: supplierId,
+      bill_number: document.getElementById('supplier-invoice-number').value.trim(),
+      issue_date: document.getElementById('supplier-invoice-issue-date').value,
+      due_date: document.getElementById('supplier-invoice-due-date').value || null,
+      expense_category: document.getElementById('supplier-invoice-category').value,
+      notes: document.getElementById('supplier-invoice-notes').value.trim() || null,
+      created_by: state.user.id,
+      approval_status: approvalStatus
+    }).select().single();
+    if(error){ toast(error.message); return; }
+    const rows = [...document.querySelectorAll('#supplier-invoice-items-body tr')].map(tr=>({
+      supplier_invoice_id: bill.id,
+      description: tr.querySelector('.ii-desc').value.trim(),
+      quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
+      unit_price: parseFloat(tr.querySelector('.ii-price').value)||0,
+      vat_applicable: tr.querySelector('.ii-vat').checked
+    })).filter(r=>r.description);
+    if(rows.length) await sb.from('cc_supplier_invoice_items').insert(rows);
+    if(approvalStatus === 'approved'){
+      await recognizeSupplierInvoiceExpense(bill, rows);
+    }
+    await refreshAll(); render();
+    toast(approvalStatus === 'pending' ? 'Supplier invoice submitted for approval.' : 'Supplier invoice captured.');
+  });
+  document.querySelectorAll('[data-del-supplier-invoice]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this supplier invoice? Its linked expense entry will also be removed.')) return;
+      const {error} = await sb.from('cc_supplier_invoices').delete().eq('id', btn.dataset.delSupplierInvoice);
+      if(error){ toast(error.message); return; }
+      await refreshAll(); render();
+    });
+  });
+  document.querySelectorAll('[data-view-supplier-invoice]').forEach(btn=>{
+    btn.addEventListener('click', ()=>openSupplierInvoiceView(btn.dataset.viewSupplierInvoice));
+  });
+  // ---- Supplier Credit Notes ----
+  const cnBackdrop = document.getElementById('supplier-creditnote-modal-backdrop');
+  document.getElementById('add-supplier-creditnote-btn')?.addEventListener('click', ()=>{
+    if(!state.suppliers.length){ toast('Add a supplier first.'); return; }
+    document.getElementById('supplier-creditnote-number').value = nextSupplierCreditNoteNumber();
+    document.getElementById('supplier-creditnote-issue-date').value = new Date().toISOString().slice(0,10);
+    document.getElementById('supplier-creditnote-items-body').innerHTML = invoiceItemRow();
+    cnBackdrop.classList.remove('hidden');
+  });
+  document.getElementById('supplier-creditnote-cancel')?.addEventListener('click', ()=>cnBackdrop.classList.add('hidden'));
+  document.getElementById('supplier-creditnote-modal-close')?.addEventListener('click', ()=>cnBackdrop.classList.add('hidden'));
+  document.getElementById('supplier-creditnote-add-item')?.addEventListener('click', ()=>{
+    document.getElementById('supplier-creditnote-items-body').insertAdjacentHTML('beforeend', invoiceItemRow());
+  });
+  document.getElementById('supplier-creditnote-items-body')?.addEventListener('click', (e)=>{
+    if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
+  });
+  document.getElementById('supplier-creditnote-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const supplierId = document.getElementById('supplier-creditnote-supplier').value;
+    if(!supplierId){ toast('Add a supplier first.'); return; }
+    const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const {data: note, error} = await sb.from('cc_supplier_credit_notes').insert({
+      company_id: state.company.id,
+      supplier_id: supplierId,
+      supplier_invoice_id: document.getElementById('supplier-creditnote-invoice').value || null,
+      credit_note_number: document.getElementById('supplier-creditnote-number').value.trim(),
+      issue_date: document.getElementById('supplier-creditnote-issue-date').value,
+      reason: document.getElementById('supplier-creditnote-reason').value.trim() || null,
+      status: 'draft',
+      notes: document.getElementById('supplier-creditnote-notes').value.trim() || null,
+      created_by: state.user.id,
+      approval_status: approvalStatus
+    }).select().single();
+    if(error){ toast(error.message); return; }
+    const rows = [...document.querySelectorAll('#supplier-creditnote-items-body tr')].map(tr=>({
+      supplier_credit_note_id: note.id,
+      description: tr.querySelector('.ii-desc').value.trim(),
+      quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
+      unit_price: parseFloat(tr.querySelector('.ii-price').value)||0,
+      vat_applicable: tr.querySelector('.ii-vat').checked
+    })).filter(r=>r.description);
+    if(rows.length) await sb.from('cc_supplier_credit_note_items').insert(rows);
+    await refreshAll(); render();
+    toast(approvalStatus === 'pending' ? 'Supplier credit note submitted for approval.' : 'Supplier credit note created.');
+  });
+  document.querySelectorAll('[data-del-supplier-creditnote]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this supplier credit note?')) return;
+      const {error} = await sb.from('cc_supplier_credit_notes').delete().eq('id', btn.dataset.delSupplierCreditnote);
+      if(error){ toast(error.message); return; }
+      await refreshAll(); render();
+    });
+  });
+  document.querySelectorAll('[data-view-supplier-creditnote]').forEach(btn=>{
+    btn.addEventListener('click', ()=>openSupplierCreditNoteView(btn.dataset.viewSupplierCreditnote));
+  });
+  state.supplierCreditNotes.forEach(async (note)=>{
+    const {data: items} = await sb.from('cc_supplier_credit_note_items').select('*').eq('supplier_credit_note_id', note.id);
+    state.supplierCreditNoteItems[note.id] = items || [];
+    const total = (items||[]).reduce((s,it)=>s+it.quantity*it.unit_price,0);
+    const el = document.getElementById('scn-total-'+note.id);
+    if(el) el.textContent = fmt(total);
+  });
+}
+async function openSupplierInvoiceView(billId){
+  const bill = state.supplierInvoices.find(b=>b.id===billId);
+  const {data: items} = await sb.from('cc_supplier_invoice_items').select('*').eq('supplier_invoice_id', billId);
+  const {data: paymentsData} = await sb.from('cc_supplier_invoice_payments').select('*').eq('supplier_invoice_id', billId).order('payment_date', {ascending:false});
+  const payments = paymentsData || [];
+  const supplier = state.suppliers.find(s=>s.id===bill.supplier_id);
+  const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
+  const vatTotal = items.reduce((s,it)=> s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
+  const total = items.reduce((s,it)=>s+it.quantity*it.unit_price,0);
+  const totalPaid = payments.reduce((s,p)=>s+Number(p.amount),0);
+  const balance = Math.max(0, total - totalPaid);
+  const canRecordPayment = hasModule('supplier_invoices') && bill.approval_status === 'approved';
+  const backdrop = document.getElementById('supplier-invoice-view-backdrop');
+  document.getElementById('supplier-invoice-view-content').innerHTML = `
+    <button class="close-x" id="supplier-invoice-view-close">✕</button>
+    <h2>${bill.bill_number} ${approvalPill(bill)}</h2>
+    <p><strong>Supplier:</strong> ${supplier ? supplier.name : '—'}${supplier && supplier.email ? ' ('+supplier.email+')' : ''}</p>
+    <p style="font-size:.85rem;color:var(--muted);">Issued ${bill.issue_date}${bill.due_date?' · Due '+bill.due_date:''} · ${bill.expense_category==='cost_of_sales'?'Cost of Sales':'Operating'}</p>
+    <table><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr></thead><tbody>
+      ${items.map(it=>`<tr><td>${it.description}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
+    </tbody></table>
+    <div style="text-align:right;margin-top:10px;font-size:.9rem;">
+      <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
+      <div>VAT (15%): ${fmt(vatTotal)}</div>
+      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmt(total)}</div>
+      ${totalPaid ? `<div style="color:var(--accent2);">Paid: ${fmt(totalPaid)}</div><div style="font-weight:700;">Balance due: ${fmt(balance)}</div>` : ''}
+    </div>
+    ${bill.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${bill.notes}</p>` : ''}
+    ${bill.approval_status === 'rejected' && bill.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${bill.rejection_note}</p>` : ''}
+    ${bill.approval_status === 'approved' ? `
+    <div class="panel" style="margin-top:14px;">
+      <h3 style="margin-top:0;">Payments made</h3>
+      ${payments.length ? `<table class="payment-list"><thead><tr><th>Date</th><th>Amount</th><th>Notes</th>${canRecordPayment?'<th></th>':''}</tr></thead><tbody>
+        ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.amount)}</td><td>${p.notes||'—'}</td>${canRecordPayment?`<td><button class="btn small danger" data-del-supplier-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
+      ${canRecordPayment ? `<button type="button" class="btn secondary small" id="add-supplier-payment-btn" style="margin-top:10px;">+ Record Payment</button>
+      <form id="supplier-payment-form" class="hidden" style="margin-top:10px;">
+        <div class="row">
+          <div class="field"><label>Date</label><input type="date" id="supplier-payment-date" required></div>
+          <div class="field"><label>Amount (R)</label><input type="number" step="0.01" id="supplier-payment-amount" value="${balance.toFixed(2)}" required></div>
+        </div>
+        <div class="field"><label>Notes (optional)</label><input type="text" id="supplier-payment-notes"></div>
+        <div class="modal-actions"><button type="submit" class="btn small">Save Payment</button></div>
+      </form>` : ''}
+    </div>` : ''}
+    ${(bill.approval_status === 'pending' && canApprove()) ? `
+    <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
+      <span style="font-size:.8rem;color:var(--muted);align-self:center;">This supplier invoice needs approval:</span>
+      <button class="btn small" data-approve-doc="supplierinvoice">Approve</button>
+      <button class="btn small danger" data-reject-doc="supplierinvoice">Reject</button>
+    </div>` : ''}
+    <div class="modal-actions"><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
+  `;
+  backdrop.classList.remove('hidden');
+  document.getElementById('supplier-invoice-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('add-supplier-payment-btn')?.addEventListener('click', ()=>{
+    document.getElementById('supplier-payment-date').value = new Date().toISOString().slice(0,10);
+    document.getElementById('supplier-payment-form').classList.remove('hidden');
+  });
+  document.getElementById('supplier-payment-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const amount = parseFloat(document.getElementById('supplier-payment-amount').value) || 0;
+    if(amount <= 0){ toast('Enter a payment amount.'); return; }
+    const {error} = await sb.from('cc_supplier_invoice_payments').insert({
+      supplier_invoice_id: bill.id,
+      company_id: state.company.id,
+      payment_date: document.getElementById('supplier-payment-date').value,
+      amount,
+      notes: document.getElementById('supplier-payment-notes').value.trim() || null,
+      created_by: state.user.id
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render();
+    openSupplierInvoiceView(bill.id);
+    toast('Payment recorded.');
+  });
+  document.querySelectorAll('[data-del-supplier-payment]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this payment?')) return;
+      await sb.from('cc_supplier_invoice_payments').delete().eq('id', btn.dataset.delSupplierPayment);
+      await refreshAll(); render();
+      openSupplierInvoiceView(bill.id);
+    });
+  });
+  document.querySelector('[data-approve-doc="supplierinvoice"]')?.addEventListener('click', async ()=>{
+    const {error} = await sb.from('cc_supplier_invoices').update({approval_status:'approved', approved_by: state.user.id, approved_at: new Date().toISOString()}).eq('id', bill.id);
+    if(error){ toast(error.message); return; }
+    await recognizeSupplierInvoiceExpense(bill, items);
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Supplier invoice approved.');
+  });
+  document.querySelector('[data-reject-doc="supplierinvoice"]')?.addEventListener('click', async ()=>{
+    const note = prompt('Reason for rejecting this supplier invoice (optional):') || null;
+    const {error} = await sb.from('cc_supplier_invoices').update({approval_status:'rejected', approved_by: state.user.id, approved_at: new Date().toISOString(), rejection_note: note}).eq('id', bill.id);
+    if(error){ toast(error.message); return; }
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Supplier invoice rejected.');
+  });
+}
+async function openSupplierCreditNoteView(noteId){
+  const note = state.supplierCreditNotes.find(n=>n.id===noteId);
+  const {data: items} = await sb.from('cc_supplier_credit_note_items').select('*').eq('supplier_credit_note_id', noteId);
+  const supplier = state.suppliers.find(s=>s.id===note.supplier_id);
+  const linkedBill = note.supplier_invoice_id ? state.supplierInvoices.find(b=>b.id===note.supplier_invoice_id) : null;
+  const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
+  const vatTotal = items.reduce((s,it)=> s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
+  const total = items.reduce((s,it)=>s+it.quantity*it.unit_price,0);
+  const backdrop = document.getElementById('supplier-creditnote-view-backdrop');
+  document.getElementById('supplier-creditnote-view-content').innerHTML = `
+    <button class="close-x" id="supplier-creditnote-view-close">✕</button>
+    <h2>${note.credit_note_number} ${approvalPill(note)}</h2>
+    <p><strong>Supplier:</strong> ${supplier ? supplier.name : '—'}${supplier && supplier.email ? ' ('+supplier.email+')' : ''}</p>
+    <p style="font-size:.85rem;color:var(--muted);">Issued ${note.issue_date}${linkedBill ? ' · Against '+linkedBill.bill_number : ''}${note.reason ? ' · '+note.reason : ''}</p>
+    <table><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr></thead><tbody>
+      ${items.map(it=>`<tr><td>${it.description}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
+    </tbody></table>
+    <div style="text-align:right;margin-top:10px;font-size:.9rem;">
+      <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
+      <div>VAT (15%): ${fmt(vatTotal)}</div>
+      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmt(total)}</div>
+    </div>
+    ${note.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${note.notes}</p>` : ''}
+    ${note.approval_status === 'rejected' && note.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${note.rejection_note}</p>` : ''}
+    ${(note.approval_status === 'pending' && canApprove()) ? `
+    <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
+      <span style="font-size:.8rem;color:var(--muted);align-self:center;">This credit note needs approval:</span>
+      <button class="btn small" data-approve-doc="supplierCreditNote">Approve</button>
+      <button class="btn small danger" data-reject-doc="supplierCreditNote">Reject</button>
+    </div>` : ''}
+    ${(canApprove() && note.approval_status !== 'pending') ? `
+    <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
+      <span style="font-size:.8rem;color:var(--muted);align-self:center;">Mark as:</span>
+      <button class="btn small secondary" data-set-scn-status="draft">Draft</button>
+      <button class="btn small secondary" data-set-scn-status="issued">Issued</button>
+    </div>` : ''}
+    <div class="modal-actions"><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
+  `;
+  backdrop.classList.remove('hidden');
+  document.getElementById('supplier-creditnote-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.querySelectorAll('[data-set-scn-status]').forEach(b=>{
+    b.addEventListener('click', async ()=>{
+      const {error} = await sb.from('cc_supplier_credit_notes').update({status:b.dataset.setScnStatus}).eq('id', note.id);
+      if(error){ toast(error.message); return; }
+      backdrop.classList.add('hidden');
+      await refreshAll(); render();
+      toast('Supplier credit note updated.');
+    });
+  });
+  document.querySelector('[data-approve-doc="supplierCreditNote"]')?.addEventListener('click', async ()=>{
+    const {error} = await sb.from('cc_supplier_credit_notes').update({approval_status:'approved', approved_by: state.user.id, approved_at: new Date().toISOString()}).eq('id', note.id);
+    if(error){ toast(error.message); return; }
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Supplier credit note approved.');
+  });
+  document.querySelector('[data-reject-doc="supplierCreditNote"]')?.addEventListener('click', async ()=>{
+    const rNote = prompt('Reason for rejecting this credit note (optional):') || null;
+    const {error} = await sb.from('cc_supplier_credit_notes').update({approval_status:'rejected', approved_by: state.user.id, approved_at: new Date().toISOString(), rejection_note: rNote}).eq('id', note.id);
+    if(error){ toast(error.message); return; }
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Supplier credit note rejected.');
+  });
+}
+
 /* ========================= CLIENTS ========================= */
 function renderClients(){
   const canEdit = hasModule('clients');
@@ -1293,6 +1831,9 @@ async function generateDueRecurringInvoices(){
         vat_applicable: it.vat_applicable
       })));
     }
+    if(approvalStatus === 'approved'){
+      await recognizeInvoiceRevenue(created, srcItems || []);
+    }
     // Advance the source invoice's schedule so it isn't regenerated on the next refresh.
     const advanced = nextRecurrenceDate(src.recurrence_next_date, src.recurrence_frequency);
     const stillActive = !src.recurrence_end_date || advanced <= src.recurrence_end_date;
@@ -1306,6 +1847,27 @@ async function generateDueRecurringInvoices(){
 }
 function canManageDoc(doc){
   return canApprove() || (doc.created_by === state.user.id && doc.approval_status === 'pending');
+}
+// Recognizes revenue at the moment a customer invoice is issued/approved: posts a
+// linked cc_entries row (accrual) dated the invoice's issue date. Cash Flow and the
+// Balance Sheet exclude this entry from cash and use actual cc_invoice_payments
+// instead (see isNonCashEntry / computeCashFlow / computeBS).
+async function recognizeInvoiceRevenue(invoice, items){
+  const total = docTotal(items);
+  if(total <= 0) return;
+  const anyVat = (items||[]).some(it=>it.vat_applicable);
+  await sb.from('cc_entries').insert({
+    company_id: state.company.id,
+    client_id: invoice.client_id || null,
+    type: 'revenue',
+    description: `Invoice ${invoice.invoice_number} — ${clientName(invoice.client_id)}`,
+    amount: total,
+    entry_date: invoice.issue_date,
+    tags: ['invoice'],
+    vat_applicable: anyVat,
+    created_by: invoice.created_by || state.user.id,
+    source_invoice_id: invoice.id
+  });
 }
 function approvalPill(doc){
   if(doc.approval_status === 'pending') return `<span class="status-pill status-pending">pending approval</span>`;
@@ -1344,6 +1906,12 @@ function invoiceModal(){
     <div class="modal" style="max-width:600px;">
       <button class="close-x" id="invoice-modal-close">✕</button>
       <h2>New Invoice</h2>
+      <div class="field">
+        <label>Company logo (used on this and every future invoice)</label>
+        ${state.company.logo_data_url ? `<img class="invoice-logo-preview" src="${state.company.logo_data_url}">` : ''}
+        <input type="file" id="invoice-logo-input" accept="image/*">
+        ${state.company.logo_data_url ? `<button type="button" class="btn secondary small" id="invoice-logo-remove" style="margin-top:6px;">Remove logo</button>` : ''}
+      </div>
       <form id="invoice-form">
         <div class="row">
           <div class="field"><label>Invoice #</label><input type="text" id="invoice-number" required></div>
@@ -1364,7 +1932,7 @@ function invoiceModal(){
           <div class="field"><label>Stop after (optional)</label><input type="date" id="invoice-recurrence-end"></div>
         </div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:70px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
           <tbody id="invoice-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="invoice-add-item" style="margin-top:8px;">+ Add line</button>
@@ -1378,28 +1946,55 @@ function invoiceModal(){
   </div>`;
 }
 
-function invoiceItemRow(){
+function invoiceItemRow(vatEditable){
+  if(vatEditable === undefined) vatEditable = true;
+  const vatCell = vatEditable
+    ? `<input type="checkbox" class="ii-vat" checked style="width:auto;">`
+    : `<input type="checkbox" class="ii-vat" disabled title="Not VAT registered" style="width:auto;">`;
   return `<tr>
     <td><input type="text" class="ii-desc" required></td>
     <td><input type="number" class="ii-qty" value="1" step="0.01"></td>
     <td><input type="number" class="ii-price" value="0" step="0.01"></td>
-    <td style="text-align:center;"><input type="checkbox" class="ii-vat" checked style="width:auto;"></td>
+    <td style="text-align:center;">${vatCell}</td>
     <td><button type="button" class="btn small danger ii-remove">✕</button></td>
   </tr>`;
 }
+// Our own company can only charge VAT on customer-facing documents (invoices,
+// credit notes) if it's actually VAT registered. Defaults to true so existing
+// companies (registered before this field existed) keep behaving as before.
+function weAreVatRegistered(){
+  return state.company.vat_registered !== false;
+}
 
+// Reads an image file and stores it as the company's invoice logo (a data URL on
+// cc_companies.logo_data_url), so it appears on every invoice from then on.
+function uploadInvoiceLogo(file){
+  return new Promise((resolve)=>{
+    if(file.size > 700*1024){ toast('Logo is too large — please use an image under 700KB.'); resolve(); return; }
+    const reader = new FileReader();
+    reader.onload = async ()=>{
+      const dataUrl = reader.result;
+      const {error} = await sb.from('cc_companies').update({logo_data_url: dataUrl}).eq('id', state.company.id);
+      if(error){ toast(error.message); resolve(); return; }
+      state.company.logo_data_url = dataUrl;
+      resolve();
+    };
+    reader.onerror = ()=>resolve();
+    reader.readAsDataURL(file);
+  });
+}
 function attachInvoiceHandlers(){
   const backdrop = document.getElementById('invoice-modal-backdrop');
   document.getElementById('add-invoice-btn')?.addEventListener('click', ()=>{
     document.getElementById('invoice-number').value = nextInvoiceNumber();
     document.getElementById('invoice-issue-date').value = new Date().toISOString().slice(0,10);
-    document.getElementById('invoice-items-body').innerHTML = invoiceItemRow();
+    document.getElementById('invoice-items-body').innerHTML = invoiceItemRow(weAreVatRegistered());
     backdrop.classList.remove('hidden');
   });
   document.getElementById('invoice-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('invoice-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('invoice-add-item')?.addEventListener('click', ()=>{
-    document.getElementById('invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRow());
+    document.getElementById('invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRow(weAreVatRegistered()));
   });
   document.getElementById('invoice-recurring')?.addEventListener('change', (e)=>{
     document.getElementById('invoice-recurrence-fields').classList.toggle('hidden', !e.target.checked);
@@ -1439,8 +2034,23 @@ function attachInvoiceHandlers(){
       vat_applicable: tr.querySelector('.ii-vat').checked
     })).filter(r=>r.description);
     if(rows.length) await sb.from('cc_invoice_items').insert(rows);
+    if(approvalStatus === 'approved'){
+      await recognizeInvoiceRevenue(invoice, rows);
+    }
+    const logoFile = document.getElementById('invoice-logo-input')?.files?.[0];
+    if(logoFile) await uploadInvoiceLogo(logoFile);
     await refreshAll(); render();
     toast(approvalStatus === 'pending' ? 'Invoice submitted for approval.' : 'Invoice created.');
+  });
+  document.getElementById('invoice-logo-input')?.addEventListener('change', async (e)=>{
+    const file = e.target.files?.[0];
+    if(file) await uploadInvoiceLogo(file);
+  });
+  document.getElementById('invoice-logo-remove')?.addEventListener('click', async ()=>{
+    const {error} = await sb.from('cc_companies').update({logo_data_url: null}).eq('id', state.company.id);
+    if(error){ toast(error.message); return; }
+    state.company.logo_data_url = null;
+    render(); toast('Logo removed.');
   });
   document.querySelectorAll('[data-del-invoice]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
@@ -1466,15 +2076,24 @@ function attachInvoiceHandlers(){
 async function openInvoiceView(invoiceId){
   const inv = state.invoices.find(i=>i.id===invoiceId);
   const {data: items} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', invoiceId);
+  const {data: paymentsData} = await sb.from('cc_invoice_payments').select('*').eq('invoice_id', invoiceId).order('payment_date', {ascending:false});
+  const payments = paymentsData || [];
   const client = state.clients.find(c=>c.id===inv.client_id);
   const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
   const vatTotal = items.reduce((s,it)=> s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
   const total = items.reduce((s,it)=>s+it.quantity*it.unit_price,0);
+  const totalPaid = payments.reduce((s,p)=>s+Number(p.amount),0);
+  const balance = Math.max(0, total - totalPaid);
+  const canRecordPayment = hasModule('invoices') && inv.approval_status === 'approved';
+  const mailtoSubject = encodeURIComponent(`Invoice ${inv.invoice_number} from ${state.company.name}`);
+  const mailtoBody = encodeURIComponent(`Hi ${client?client.name:''},\n\nPlease find invoice ${inv.invoice_number} for ${fmt(total)}, ${inv.due_date?('due '+inv.due_date):'due on receipt'}.\n\n(Use "Print / Save PDF" first and attach it — this just opens a pre-filled email, it can't attach the file for you.)\n\nThanks,\n${state.company.name}`);
   const backdrop = document.getElementById('invoice-view-backdrop');
   document.getElementById('invoice-view-content').innerHTML = `
     <button class="close-x" id="invoice-view-close">✕</button>
+    ${state.company.logo_data_url ? `<img class="invoice-logo-preview" src="${state.company.logo_data_url}">` : ''}
     <h2>${inv.invoice_number} ${approvalPill(inv)}</h2>
-    <p style="color:var(--muted);margin-top:-8px;">${state.company.name}${state.company.vat_number?' · VAT '+state.company.vat_number:''}</p>
+    <p style="color:var(--muted);margin-top:-8px;">${state.company.name}${weAreVatRegistered() && state.company.vat_number?' · VAT '+state.company.vat_number:''}</p>
+    ${state.company.address ? `<p style="color:var(--muted);white-space:pre-line;font-size:.85rem;">${state.company.address}</p>` : ''}
     <p><strong>Bill to:</strong> ${client ? client.name : '—'}${client && client.email ? ' ('+client.email+')' : ''}</p>
     <p style="font-size:.85rem;color:var(--muted);">Issued ${inv.issue_date}${inv.due_date?' · Due '+inv.due_date:''}</p>
     <table><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr></thead><tbody>
@@ -1482,11 +2101,28 @@ async function openInvoiceView(invoiceId){
     </tbody></table>
     <div style="text-align:right;margin-top:10px;font-size:.9rem;">
       <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
-      <div>VAT (15%): ${fmt(vatTotal)}</div>
+      ${weAreVatRegistered() ? `<div>VAT (15%): ${fmt(vatTotal)}</div>` : ''}
       <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmt(total)}</div>
+      ${totalPaid ? `<div style="color:var(--accent2);">Paid: ${fmt(totalPaid)}</div><div style="font-weight:700;">Balance due: ${fmt(balance)}</div>` : ''}
     </div>
     ${inv.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${inv.notes}</p>` : ''}
     ${inv.approval_status === 'rejected' && inv.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${inv.rejection_note}</p>` : ''}
+    ${inv.approval_status === 'approved' ? `
+    <div class="panel" style="margin-top:14px;">
+      <h3 style="margin-top:0;">Payments received</h3>
+      ${payments.length ? `<table class="payment-list"><thead><tr><th>Date</th><th>Amount</th><th>Notes</th>${canRecordPayment?'<th></th>':''}</tr></thead><tbody>
+        ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.amount)}</td><td>${p.notes||'—'}</td>${canRecordPayment?`<td><button class="btn small danger" data-del-invoice-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
+      ${canRecordPayment ? `<button type="button" class="btn secondary small" id="add-invoice-payment-btn" style="margin-top:10px;">+ Record Payment</button>
+      <form id="invoice-payment-form" class="hidden" style="margin-top:10px;">
+        <div class="row">
+          <div class="field"><label>Date</label><input type="date" id="invoice-payment-date" required></div>
+          <div class="field"><label>Amount (R)</label><input type="number" step="0.01" id="invoice-payment-amount" value="${balance.toFixed(2)}" required></div>
+        </div>
+        <div class="field"><label>Notes (optional)</label><input type="text" id="invoice-payment-notes"></div>
+        <div class="modal-actions"><button type="submit" class="btn small">Save Payment</button></div>
+      </form>` : ''}
+    </div>` : ''}
     ${(inv.approval_status === 'pending' && canApprove()) ? `
     <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
       <span style="font-size:.8rem;color:var(--muted);align-self:center;">This invoice needs approval:</span>
@@ -1501,7 +2137,10 @@ async function openInvoiceView(invoiceId){
       <button class="btn small secondary" data-set-status="paid">Paid</button>
       <button class="btn small secondary" data-set-status="overdue">Overdue</button>
     </div>` : ''}
-    <div class="modal-actions"><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
+    <div class="modal-actions">
+      <button class="btn secondary" onclick="window.print()">Print / Save PDF</button>
+      <a class="btn secondary" href="mailto:${client&&client.email?client.email:''}?subject=${mailtoSubject}&body=${mailtoBody}">✉ Send (email)</a>
+    </div>
   `;
   backdrop.classList.remove('hidden');
   document.getElementById('invoice-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
@@ -1514,9 +2153,39 @@ async function openInvoiceView(invoiceId){
       toast('Invoice updated.');
     });
   });
+  document.getElementById('add-invoice-payment-btn')?.addEventListener('click', ()=>{
+    document.getElementById('invoice-payment-date').value = new Date().toISOString().slice(0,10);
+    document.getElementById('invoice-payment-form').classList.remove('hidden');
+  });
+  document.getElementById('invoice-payment-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const amount = parseFloat(document.getElementById('invoice-payment-amount').value) || 0;
+    if(amount <= 0){ toast('Enter a payment amount.'); return; }
+    const {error} = await sb.from('cc_invoice_payments').insert({
+      invoice_id: inv.id,
+      company_id: state.company.id,
+      payment_date: document.getElementById('invoice-payment-date').value,
+      amount,
+      notes: document.getElementById('invoice-payment-notes').value.trim() || null,
+      created_by: state.user.id
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render();
+    openInvoiceView(inv.id);
+    toast('Payment recorded.');
+  });
+  document.querySelectorAll('[data-del-invoice-payment]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this payment?')) return;
+      await sb.from('cc_invoice_payments').delete().eq('id', btn.dataset.delInvoicePayment);
+      await refreshAll(); render();
+      openInvoiceView(inv.id);
+    });
+  });
   document.querySelector('[data-approve-doc]')?.addEventListener('click', async ()=>{
     const {error} = await sb.from('cc_invoices').update({approval_status:'approved', approved_by: state.user.id, approved_at: new Date().toISOString()}).eq('id', inv.id);
     if(error){ toast(error.message); return; }
+    await recognizeInvoiceRevenue(inv, items);
     backdrop.classList.add('hidden');
     await refreshAll(); render();
     toast('Invoice approved.');
@@ -1587,7 +2256,7 @@ function creditNoteModal(){
         </div>
         <div class="field"><label>Reason</label><input type="text" id="creditnote-reason" placeholder="e.g. returned goods, billing correction"></div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:70px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
           <tbody id="creditnote-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="creditnote-add-item" style="margin-top:8px;">+ Add line</button>
@@ -1606,13 +2275,13 @@ function attachCreditNoteHandlers(){
   document.getElementById('add-creditnote-btn')?.addEventListener('click', ()=>{
     document.getElementById('creditnote-number').value = nextCreditNoteNumber();
     document.getElementById('creditnote-issue-date').value = new Date().toISOString().slice(0,10);
-    document.getElementById('creditnote-items-body').innerHTML = invoiceItemRow();
+    document.getElementById('creditnote-items-body').innerHTML = invoiceItemRow(weAreVatRegistered());
     backdrop.classList.remove('hidden');
   });
   document.getElementById('creditnote-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('creditnote-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('creditnote-add-item')?.addEventListener('click', ()=>{
-    document.getElementById('creditnote-items-body').insertAdjacentHTML('beforeend', invoiceItemRow());
+    document.getElementById('creditnote-items-body').insertAdjacentHTML('beforeend', invoiceItemRow(weAreVatRegistered()));
   });
   document.getElementById('creditnote-items-body')?.addEventListener('click', (e)=>{
     if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
@@ -1678,7 +2347,8 @@ async function openCreditNoteView(noteId){
   document.getElementById('creditnote-view-content').innerHTML = `
     <button class="close-x" id="creditnote-view-close">✕</button>
     <h2>${note.credit_note_number} ${approvalPill(note)}</h2>
-    <p style="color:var(--muted);margin-top:-8px;">${state.company.name}${state.company.vat_number?' · VAT '+state.company.vat_number:''}</p>
+    <p style="color:var(--muted);margin-top:-8px;">${state.company.name}${weAreVatRegistered() && state.company.vat_number?' · VAT '+state.company.vat_number:''}</p>
+    ${state.company.address ? `<p style="color:var(--muted);white-space:pre-line;font-size:.85rem;">${state.company.address}</p>` : ''}
     <p><strong>Client:</strong> ${client ? client.name : '—'}${client && client.email ? ' ('+client.email+')' : ''}</p>
     <p style="font-size:.85rem;color:var(--muted);">Issued ${note.issue_date}${linkedInvoice ? ' · Against '+linkedInvoice.invoice_number : ''}${note.reason ? ' · '+note.reason : ''}</p>
     <table><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr></thead><tbody>
@@ -1686,7 +2356,7 @@ async function openCreditNoteView(noteId){
     </tbody></table>
     <div style="text-align:right;margin-top:10px;font-size:.9rem;">
       <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
-      <div>VAT (15%): ${fmt(vatTotal)}</div>
+      ${weAreVatRegistered() ? `<div>VAT (15%): ${fmt(vatTotal)}</div>` : ''}
       <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmt(total)}</div>
     </div>
     ${note.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${note.notes}</p>` : ''}
@@ -1946,14 +2616,24 @@ function docTotal(items){ return (items||[]).reduce((s,it)=>s+Number(it.quantity
 
 function computeBS(asOf){
   const upTo = d => d <= asOf;
-  const revenue = state.entries.filter(e=>e.type==='revenue' && upTo(e.entry_date)).reduce((s,e)=>s+Number(e.amount),0);
-  const expenses = state.entries.filter(e=>e.type==='expense' && upTo(e.entry_date)).reduce((s,e)=>s+Number(e.amount),0);
+  // Depreciation and invoice-linked accrual entries are excluded from the cash figure;
+  // real cash movements against invoices/bills come from the payment-allocation tables.
+  const revenue = state.entries.filter(e=>e.type==='revenue' && upTo(e.entry_date) && !isNonCashEntry(e)).reduce((s,e)=>s+Number(e.amount),0);
+  const expenses = state.entries.filter(e=>e.type==='expense' && upTo(e.entry_date) && !isNonCashEntry(e)).reduce((s,e)=>s+Number(e.amount),0);
   const startingBalance = state.accounts.reduce((s,a)=>s+Number(a.starting_balance||0),0);
   const payrollPaid = state.payrollPayments.filter(p=>p.paid && upTo(p.pay_date)).reduce((s,p)=>s+Number(p.net),0);
-  const cash = startingBalance + revenue - expenses - payrollPaid;
+  const invoicePaymentsReceived = (state.invoicePayments||[]).filter(p=>upTo(p.payment_date)).reduce((s,p)=>s+Number(p.amount),0);
+  const supplierPaymentsMade = (state.supplierInvoicePayments||[]).filter(p=>upTo(p.payment_date)).reduce((s,p)=>s+Number(p.amount),0);
+  const cash = startingBalance + revenue - expenses - payrollPaid + invoicePaymentsReceived - supplierPaymentsMade;
 
-  const arInvoices = state.invoices.filter(i=> i.approval_status==='approved' && (i.status==='sent'||i.status==='overdue') && upTo(i.issue_date));
-  const accountsReceivableGross = arInvoices.reduce((s,i)=>s+docTotal(state.invoiceItems[i.id]),0);
+  // Accounts Receivable: invoice total minus what's actually been paid on it (not just
+  // its status), so partial payments are reflected correctly.
+  const arInvoices = state.invoices.filter(i=> i.approval_status==='approved' && i.status!=='draft' && upTo(i.issue_date));
+  const accountsReceivableGross = arInvoices.reduce((s,i)=>{
+    const total = docTotal(state.invoiceItems[i.id]);
+    const paid = (state.invoicePayments||[]).filter(p=>p.invoice_id===i.id && upTo(p.payment_date)).reduce((s2,p)=>s2+Number(p.amount),0);
+    return s + Math.max(0, total - paid);
+  }, 0);
   const issuedCreditNotes = state.creditNotes.filter(cn=> cn.approval_status==='approved' && cn.status==='issued' && upTo(cn.issue_date));
   const creditNoteTotal = issuedCreditNotes.reduce((s,cn)=>s+docTotal(state.creditNoteItems[cn.id]),0);
   const accountsReceivable = Math.max(0, accountsReceivableGross - creditNoteTotal);
@@ -1969,7 +2649,19 @@ function computeBS(asOf){
   const currentAssets = cash + accountsReceivable + otherCurrentAssets + vatReceivableAmt;
   const totalAssets = currentAssets + fixedAssets;
 
-  const currentLiabOther = state.liabilities.filter(l=>l.is_current).reduce((s,l)=>s+Number(l.amount),0);
+  // Accounts Payable: supplier bill totals minus what's actually been paid on them,
+  // added alongside the existing free-form Liabilities entries.
+  const apBills = (state.supplierInvoices||[]).filter(b=> b.approval_status==='approved' && upTo(b.issue_date));
+  const accountsPayableFromBillsGross = apBills.reduce((s,b)=>{
+    const total = docTotal(state.supplierInvoiceItems[b.id]);
+    const paid = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===b.id && upTo(p.payment_date)).reduce((s2,p)=>s2+Number(p.amount),0);
+    return s + Math.max(0, total - paid);
+  }, 0);
+  const issuedSupplierCreditNotes = (state.supplierCreditNotes||[]).filter(cn=> cn.approval_status==='approved' && cn.status==='issued' && upTo(cn.issue_date));
+  const supplierCreditNoteTotal = issuedSupplierCreditNotes.reduce((s,cn)=>s+docTotal(state.supplierCreditNoteItems[cn.id]),0);
+  const accountsPayableFromBills = Math.max(0, accountsPayableFromBillsGross - supplierCreditNoteTotal);
+
+  const currentLiabOther = state.liabilities.filter(l=>l.is_current).reduce((s,l)=>s+Number(l.amount),0) + accountsPayableFromBills;
   const nonCurrentLiab = state.liabilities.filter(l=>!l.is_current).reduce((s,l)=>s+Number(l.amount),0);
   const currentLiabilities = currentLiabOther + vatPayableAmt;
   const totalLiabilities = currentLiabilities + nonCurrentLiab;
@@ -1978,7 +2670,7 @@ function computeBS(asOf){
 
   return {
     asOf, cash, accountsReceivable, vatReceivableAmt, otherCurrentAssets, currentAssets, fixedAssets, totalAssets,
-    vatPayableAmt, currentLiabOther, currentLiabilities, nonCurrentLiab, totalLiabilities, equity, inventoryValue
+    vatPayableAmt, currentLiabOther, accountsPayableFromBills, currentLiabilities, nonCurrentLiab, totalLiabilities, equity, inventoryValue
   };
 }
 
@@ -2007,18 +2699,28 @@ function computeCashFlow(start, end){
   const inRange = (d) => d && d >= start && d <= end;
 
   // Operating activities — cash-basis revenue and expenses recorded in the period,
-  // plus payroll actually paid in the period. Depreciation is a book expense, not a
-  // cash movement, so entries tagged 'depreciation' (posted by "Run Depreciation"
-  // under Assets) are excluded here even though they correctly reduce Net Profit
-  // on the P&L.
-  const cashFromRevenue = state.entries.filter(e=>e.type==='revenue' && inRange(e.entry_date)).reduce((s,e)=>s+Number(e.amount),0);
-  const isNonCash = e => (e.tags||[]).includes('depreciation');
-  const expenseRows = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date) && !isNonCash(e));
+  // plus payroll actually paid in the period. Depreciation (a book expense) and
+  // invoice-linked accrual entries (recognized at invoice time, not when cash moves)
+  // are excluded here even though they correctly affect Net Profit on the P&L —
+  // actual cash received/paid against invoices comes from the payment-allocation
+  // tables instead, added back in below.
+  const cashFromRevenue = state.entries.filter(e=>e.type==='revenue' && inRange(e.entry_date) && !isNonCashEntry(e)).reduce((s,e)=>s+Number(e.amount),0);
+  const isDepreciation = e => (e.tags||[]).includes('depreciation');
+  const expenseRows = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date) && !isNonCashEntry(e));
   const cosOut = expenseRows.filter(e=>e.expense_category==='cost_of_sales').reduce((s,e)=>s+Number(e.amount),0);
   const opexOut = expenseRows.filter(e=>e.expense_category!=='cost_of_sales').reduce((s,e)=>s+Number(e.amount),0);
   const payrollOut = state.payrollPayments.filter(p=>p.paid && inRange(p.pay_date)).reduce((s,p)=>s+Number(p.net),0);
-  const depreciationExcluded = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date) && isNonCash(e)).reduce((s,e)=>s+Number(e.amount),0);
-  const netOperating = cashFromRevenue - cosOut - opexOut - payrollOut;
+  const depreciationExcluded = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date) && isDepreciation(e)).reduce((s,e)=>s+Number(e.amount),0);
+  const invoiceAccrualExcluded = state.entries.filter(e=>e.type==='revenue' && inRange(e.entry_date) && e.source_invoice_id).reduce((s,e)=>s+Number(e.amount),0);
+  const supplierInvoiceAccrualExcluded = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date) && e.source_supplier_invoice_id).reduce((s,e)=>s+Number(e.amount),0);
+
+  // Actual cash received against customer invoices / paid against supplier invoices
+  // during the period — this is the real cash counterpart to the accrual entries above.
+  const invoicePaymentsIn = (state.invoicePayments||[]).filter(p=>inRange(p.payment_date)).reduce((s,p)=>s+Number(p.amount),0);
+  const supplierPaymentsOut = (state.supplierInvoicePayments||[]).filter(p=>inRange(p.payment_date)).reduce((s,p)=>s+Number(p.amount),0);
+  const cashFromRevenueTotal = cashFromRevenue + invoicePaymentsIn;
+
+  const netOperating = cashFromRevenueTotal - cosOut - opexOut - supplierPaymentsOut - payrollOut;
 
   // Investing activities — assets purchased (cash out) during the period. Only assets
   // with a purchase date recorded are included; older assets without one are excluded.
@@ -2036,7 +2738,8 @@ function computeCashFlow(start, end){
   const closingCashDerived = openingCash + netChange;
 
   return {
-    start, end, cashFromRevenue, cosOut, opexOut, payrollOut, netOperating, depreciationExcluded,
+    start, end, cashFromRevenue: cashFromRevenueTotal, invoicePaymentsIn, cosOut, opexOut, supplierPaymentsOut, payrollOut, netOperating,
+    depreciationExcluded, invoiceAccrualExcluded, supplierInvoiceAccrualExcluded,
     assetPurchases, netInvesting, liabilityDraws, netFinancing,
     netChange, openingCash, closingCashDerived, closingCashActual,
     reconciles: Math.abs(closingCashDerived - closingCashActual) < 0.01
@@ -2047,12 +2750,16 @@ function renderCF(cf){
   <div class="panel">
     <table class="report-table"><tbody>
       <tr style="font-weight:600;"><td colspan="2">Operating Activities</td></tr>
-      <tr><td>Cash received from revenue</td><td style="text-align:right;">${fmt(cf.cashFromRevenue)}</td></tr>
+      <tr><td>Cash received from revenue</td><td style="text-align:right;">${fmt(cf.cashFromRevenue - cf.invoicePaymentsIn)}</td></tr>
+      ${cf.invoicePaymentsIn ? `<tr><td>Cash received — customer invoice payments</td><td style="text-align:right;">${fmt(cf.invoicePaymentsIn)}</td></tr>` : ''}
       <tr><td>Cash paid — cost of sales</td><td style="text-align:right;">(${fmt(cf.cosOut)})</td></tr>
       <tr><td>Cash paid — operating expenses</td><td style="text-align:right;">(${fmt(cf.opexOut)})</td></tr>
+      ${cf.supplierPaymentsOut ? `<tr><td>Cash paid — supplier invoice payments</td><td style="text-align:right;">(${fmt(cf.supplierPaymentsOut)})</td></tr>` : ''}
       <tr><td>Cash paid — payroll</td><td style="text-align:right;">(${fmt(cf.payrollOut)})</td></tr>
       <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Net cash from operating activities</td><td style="text-align:right;" class="${cf.netOperating<0?'negative':'positive'}">${fmt(cf.netOperating)}</td></tr>
       ${cf.depreciationExcluded ? `<tr><td style="color:var(--muted);font-size:.8rem;">Depreciation charged this period (non-cash, excluded above)</td><td style="text-align:right;color:var(--muted);font-size:.8rem;">${fmt(cf.depreciationExcluded)}</td></tr>` : ''}
+      ${cf.invoiceAccrualExcluded ? `<tr><td style="color:var(--muted);font-size:.8rem;">Revenue recognized on customer invoices this period (accrual, excluded above)</td><td style="text-align:right;color:var(--muted);font-size:.8rem;">${fmt(cf.invoiceAccrualExcluded)}</td></tr>` : ''}
+      ${cf.supplierInvoiceAccrualExcluded ? `<tr><td style="color:var(--muted);font-size:.8rem;">Expense recognized on supplier invoices this period (accrual, excluded above)</td><td style="text-align:right;color:var(--muted);font-size:.8rem;">${fmt(cf.supplierInvoiceAccrualExcluded)}</td></tr>` : ''}
 
       <tr style="font-weight:600;"><td colspan="2" style="padding-top:16px;">Investing Activities</td></tr>
       <tr><td>Purchase of fixed assets</td><td style="text-align:right;">${cf.assetPurchases?`(${fmt(cf.assetPurchases)})`:fmt(0)}</td></tr>
@@ -2068,7 +2775,7 @@ function renderCF(cf){
     </tbody></table>
   </div>
   ${cf.reconciles ? '' : `<div class="alert-banner due">Note: this statement's derived closing cash (${fmt(cf.closingCashDerived)}) doesn't quite match the balance sheet's cash figure (${fmt(cf.closingCashActual)}) as of ${cf.end} — usually because some entries or asset/liability dates fall outside how this method attributes cash. Treat the balance sheet as the source of truth for the cash balance.</div>`}
-  <p style="color:var(--muted);font-size:.8rem;">Direct method — cash actually received and paid during ${cf.start} to ${cf.end}, drawn from Revenue/Expense entries, paid payroll, asset purchase dates, and liability start dates.</p>
+  <p style="color:var(--muted);font-size:.8rem;">Direct method — cash actually received and paid during ${cf.start} to ${cf.end}, drawn from Revenue/Expense entries, invoice &amp; supplier-invoice payments, paid payroll, asset purchase dates, and liability start dates.</p>
   `;
 }
 function computeAssetRegister(start, end){
@@ -2104,25 +2811,44 @@ function agingBucketLabel(daysOverdue){
 }
 function computeARAging(){
   const today = todayIso();
+  // Remaining balance = invoice total minus actual payments received against it, so a
+  // partially (or fully) paid invoice ages correctly instead of always showing its
+  // full original amount.
   const rows = state.invoices
     .filter(i=>i.approval_status==='approved' && (i.status==='sent'||i.status==='overdue') && i.due_date)
     .map(i=>{
       const daysOverdue = daysBetween(i.due_date, today);
       const total = docTotal(state.invoiceItems[i.id]);
-      return {id:i.id, number:i.invoice_number, client:clientName(i.client_id), due_date:i.due_date, daysOverdue, bucket: agingBucketLabel(daysOverdue), total};
-    });
+      const paid = (state.invoicePayments||[]).filter(p=>p.invoice_id===i.id).reduce((s,p)=>s+Number(p.amount),0);
+      const balance = Math.max(0, total - paid);
+      return {id:i.id, number:i.invoice_number, client:clientName(i.client_id), due_date:i.due_date, daysOverdue, bucket: agingBucketLabel(daysOverdue), total: balance};
+    })
+    .filter(r=>r.total > 0.005);
   const buckets = {not_due:0, '0-30':0, '31-60':0, '61-90':0, '90+':0};
   rows.forEach(r=>{ buckets[r.bucket] += r.total; });
   return {rows: rows.sort((a,b)=>b.daysOverdue-a.daysOverdue), buckets};
 }
 function computeAPAging(){
   const today = todayIso();
-  const rows = state.liabilities
+  const liabRows = state.liabilities
     .filter(l=>l.is_current && l.due_date)
     .map(l=>{
       const daysOverdue = daysBetween(l.due_date, today);
-      return {id:l.id, description:l.description, due_date:l.due_date, daysOverdue, bucket: agingBucketLabel(daysOverdue), amount:Number(l.amount)};
+      return {id:'liab-'+l.id, description:l.description, due_date:l.due_date, daysOverdue, bucket: agingBucketLabel(daysOverdue), amount:Number(l.amount)};
     });
+  // Supplier invoices (bills) with an outstanding balance, alongside the free-form
+  // Liabilities entries above.
+  const billRows = (state.supplierInvoices||[])
+    .filter(b=>b.approval_status==='approved' && b.due_date)
+    .map(b=>{
+      const total = docTotal(state.supplierInvoiceItems[b.id]);
+      const paid = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===b.id).reduce((s,p)=>s+Number(p.amount),0);
+      const balance = Math.max(0, total - paid);
+      const daysOverdue = daysBetween(b.due_date, today);
+      return {id:'bill-'+b.id, description: `${supplierName(b.supplier_id)} — ${b.bill_number}`, due_date:b.due_date, daysOverdue, bucket: agingBucketLabel(daysOverdue), amount: balance};
+    })
+    .filter(r=>r.amount > 0.005);
+  const rows = [...liabRows, ...billRows];
   const buckets = {not_due:0, '0-30':0, '31-60':0, '61-90':0, '90+':0};
   rows.forEach(r=>{ buckets[r.bucket] += r.amount; });
   return {rows: rows.sort((a,b)=>b.daysOverdue-a.daysOverdue), buckets};
@@ -2596,8 +3322,12 @@ function renderVat(){
       <div class="card"><h3>VAT Payable</h3><div class="value ${v.vatPayable<0?'negative':''}">${fmt(v.vatPayable)}</div><div class="sub">Collected − paid. Negative = refund due to you.</div></div>
     </div>
     <div class="panel">
+      ${weAreVatRegistered() ? `
       <p style="color:var(--muted);font-size:.85rem;">Standard South African VAT rate of ${(VAT_RATE*100).toFixed(0)}% is used to back out VAT from amounts you've marked as VAT-inclusive on Revenue and Expense entries. This is a running total across all entries — not scoped to a specific 2-month VAT201 period yet. This is not tax advice; confirm figures with your accountant or SARS eFiling before submitting a return.</p>
       ${state.company.vat_number ? `<p style="font-size:.85rem;">Registered VAT number: <strong>${state.company.vat_number}</strong></p>` : `<p style="font-size:.85rem;color:var(--muted);">No VAT number on file for this company yet.</p>`}
+      ` : `
+      <p style="font-size:.85rem;"><strong>This company is not registered for VAT.</strong> VAT can't be charged on customer invoices or credit notes, and the figures above should stay at zero. You can change this under Team → Company Details if that's changed.</p>
+      `}
     </div>
   `;
 }
@@ -2607,6 +3337,17 @@ function renderTeam(){
   return `
     <div class="section-header" style="--accent-c:var(--c-team);"><h1>Team</h1>${isAdmin() ? `<button class="btn" id="add-member-btn">+ Invite Member</button>` : ''}</div>
     <p style="color:var(--muted);font-size:.85rem;margin-top:-10px;">Management (owner/admin) has full access everywhere. Staff members only see and edit the modules you grant them below; invoices and credit notes they create wait for approval unless they're also marked as an approver.</p>
+    ${isAdmin() ? `
+    <div class="panel">
+      <h3 style="margin-top:0;">Company Details</h3>
+      <p style="color:var(--muted);font-size:.85rem;">Your registered address is required on tax invoices by SARS. VAT can only be charged on customer invoices and credit notes if you're registered for VAT.</p>
+      <form id="company-details-form" style="display:flex;flex-direction:column;gap:12px;max-width:480px;">
+        <div class="field"><label>Company address (for tax invoices)</label><textarea id="company-address" rows="3" placeholder="Street, suburb, city, postal code">${state.company.address || ''}</textarea></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-vat-registered" style="width:auto;" ${weAreVatRegistered()?'checked':''}> Registered for VAT</label>
+        <div class="field" id="company-vat-number-field" style="${weAreVatRegistered()?'':'display:none;'}"><label>VAT number</label><input type="text" id="company-vat-number" value="${state.company.vat_number || ''}"></div>
+        <div class="modal-actions" style="justify-content:flex-start;"><button type="submit" class="btn small">Save Company Details</button></div>
+      </form>
+    </div>` : ''}
     <div class="panel">
       <h3 style="margin-top:0;">App access</h3>
       <table><thead><tr><th>Email</th><th>Role &amp; permissions</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
@@ -2648,6 +3389,7 @@ function renderTeam(){
           <label><input type="checkbox" class="member-module" value="invoices"> Invoices</label>
           <label><input type="checkbox" class="member-module" value="credit_notes"> Credit Notes</label>
           <label><input type="checkbox" class="member-module" value="payroll"> Payroll</label>
+          <label><input type="checkbox" class="member-module" value="supplier_invoices"> Supplier Invoices</label>
             <hr>
             <label><input type="checkbox" id="member-can-approve"> Can approve invoices &amp; credit notes (e.g. an accountant)</label>
           </div>
@@ -2674,6 +3416,22 @@ function resetMemberForm(){
   toggleMemberPermFields();
 }
 function attachTeamHandlers(){
+  document.getElementById('company-vat-registered')?.addEventListener('change', (e)=>{
+    document.getElementById('company-vat-number-field').style.display = e.target.checked ? '' : 'none';
+  });
+  document.getElementById('company-details-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const address = document.getElementById('company-address').value.trim() || null;
+    const vat_registered = document.getElementById('company-vat-registered').checked;
+    const vat_number = vat_registered ? (document.getElementById('company-vat-number').value.trim() || null) : null;
+    const {error} = await sb.from('cc_companies').update({ address, vat_registered, vat_number }).eq('id', state.company.id);
+    if(error){ toast(error.message); return; }
+    state.company.address = address;
+    state.company.vat_registered = vat_registered;
+    state.company.vat_number = vat_number;
+    render();
+    toast('Company details saved.');
+  });
   const backdrop = document.getElementById('member-modal-backdrop');
   document.getElementById('add-member-btn')?.addEventListener('click', ()=>{
     resetMemberForm();
