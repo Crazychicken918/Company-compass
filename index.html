@@ -15,7 +15,7 @@
     --c-dashboard:#7c5cff; --c-revenue:#0fb981; --c-expenses:#f4406a; --c-assets:#06b6d4;
     --c-liabilities:#f5a524; --c-clients:#a855f7; --c-invoices:#6366f1; --c-creditnotes:#ec4899;
     --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b; --c-reports:#1d4ed8;
-    --c-scenarios:#059669; --c-supplierinvoices:#0ea5e9;
+    --c-scenarios:#059669; --c-supplierinvoices:#0ea5e9; --c-tasks:#7c3aed;
     --grid-line: rgba(25,26,35,.03);
   }
   /* Dark mode: follows the OS setting by default; a manual toggle (data-theme)
@@ -104,6 +104,7 @@
   #sidebar nav button[data-view="invoices"]{--dot:var(--c-invoices);}
   #sidebar nav button[data-view="creditnotes"]{--dot:var(--c-creditnotes);}
   #sidebar nav button[data-view="payroll"]{--dot:var(--c-payroll);}
+  #sidebar nav button[data-view="tasks"]{--dot:var(--c-tasks);}
   #sidebar nav button[data-view="vat"]{--dot:var(--c-vat);}
   #sidebar nav button[data-view="reports"]{--dot:var(--c-reports);}
   #sidebar nav button[data-view="team"]{--dot:var(--c-team);}
@@ -234,6 +235,7 @@
       <button data-view="invoices"><span class="dot"></span>Invoices</button>
       <button data-view="creditnotes"><span class="dot"></span>Credit Notes</button>
       <button data-view="payroll"><span class="dot"></span>Payroll</button>
+      <button data-view="tasks"><span class="dot"></span>Tasks</button>
       <button data-view="vat"><span class="dot"></span>VAT</button>
       <button data-view="reports"><span class="dot"></span>Reports</button>
       <button data-view="scenarios"><span class="dot"></span>Scenarios</button>
@@ -628,6 +630,8 @@ let state = {
   employees: [],
   payrollPayments: [],
   employeeTasks: [],
+  taskNotes: [],       // notes logged against employee tasks (cc_task_notes)
+  taskDetailId: null,  // task id currently open in the Task Detail modal, or null = closed
   leaveBalances: [],   // one row per employee per leave type (annual/sick/compassionate/study)
   leaveEntries: [],    // audit log of leave taken
   scenarios: [],
@@ -672,6 +676,37 @@ function canApprove(){
   if(m.role === 'staff') return !!(m.permissions && m.permissions.can_approve);
   return false;
 }
+// Every tab in the sidebar, in nav order. Used both to render the nav and to gate access.
+const ALL_VIEWS = [
+  ['dashboard','Dashboard'], ['revenue','Revenue'], ['expenses','Expenses'], ['assets','Assets'],
+  ['liabilities','Liabilities'], ['supplierinvoices','Supplier Invoices'], ['clients','Clients'],
+  ['invoices','Invoices'], ['creditnotes','Credit Notes'], ['payroll','Payroll'], ['tasks','Tasks'],
+  ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['team','Team'],
+];
+// Owner/admin/viewer always see every tab. A staff member sees every tab UNLESS an admin has
+// explicitly restricted them to a specific list (m.permissions.tabs) via the Team page — so
+// existing staff members keep behaving exactly as before unless an admin opts them in to the
+// restriction (e.g. a floor assistant who should only ever see the Tasks tab).
+function canSeeTab(view){
+  const m = state.membership;
+  if(!m) return false;
+  if(m.role === 'owner' || m.role === 'admin' || m.role === 'viewer') return true;
+  if(m.role === 'staff'){
+    const tabs = m.permissions && m.permissions.tabs;
+    if(!Array.isArray(tabs)) return true;
+    return tabs.includes(view);
+  }
+  return false;
+}
+function firstAllowedView(){
+  const found = ALL_VIEWS.find(([k])=>canSeeTab(k));
+  return found ? found[0] : 'tasks';
+}
+function applyNavVisibility(){
+  document.querySelectorAll('#nav button[data-view]').forEach(btn=>{
+    btn.classList.toggle('hidden', !canSeeTab(btn.dataset.view));
+  });
+}
 function roleLabel(m){
   if(m.role === 'owner') return 'Owner';
   if(m.role === 'admin') return 'Management';
@@ -679,7 +714,9 @@ function roleLabel(m){
   if(m.role === 'staff'){
     const mods = (m.permissions && m.permissions.modules) || [];
     const approve = m.permissions && m.permissions.can_approve;
-    return 'Staff' + (mods.length ? ' · ' + mods.map(moduleLabel).join(', ') : '') + (approve ? ' · can approve' : '');
+    const tabs = m.permissions && m.permissions.tabs;
+    const tabsNote = Array.isArray(tabs) ? ' · sees ' + (tabs.length ? tabs.map(t=>(ALL_VIEWS.find(v=>v[0]===t)||[,t])[1]).join(', ') : 'nothing yet') : '';
+    return 'Staff' + (mods.length ? ' · ' + mods.map(moduleLabel).join(', ') : '') + (approve ? ' · can approve' : '') + tabsNote;
   }
   return m.role;
 }
@@ -875,6 +912,10 @@ async function loadCompany(){
   state.company = company;
   document.getElementById('sidebar-company-name').textContent = company.name + (isAdmin() ? '' : ' (' + roleLabel(state.membership).toLowerCase() + ')');
 
+  applyNavVisibility();
+  if(!canSeeTab(state.view)) state.view = firstAllowedView();
+  document.querySelectorAll('#nav button[data-view]').forEach(b=>b.classList.toggle('active', b.dataset.view === state.view));
+
   await refreshAll();
   render();
 }
@@ -915,13 +956,14 @@ async function refreshAll(){
   state.scenarioCashflows = {};
   (cashflowsRes.data||[]).forEach(row=>{ (state.scenarioCashflows[row.scenario_id] = state.scenarioCashflows[row.scenario_id]||[]).push(row); });
 
-  const [suppliersRes, supplierInvoicesRes, supplierCreditNotesRes, invoicePaymentsRes, leaveBalancesRes, leaveEntriesRes] = await Promise.all([
+  const [suppliersRes, supplierInvoicesRes, supplierCreditNotesRes, invoicePaymentsRes, leaveBalancesRes, leaveEntriesRes, taskNotesRes] = await Promise.all([
     sb.from('cc_suppliers').select('*').eq('company_id', cid),
     sb.from('cc_supplier_invoices').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
     sb.from('cc_supplier_credit_notes').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
     sb.from('cc_invoice_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false}),
     sb.from('cc_leave_balances').select('*').eq('company_id', cid),
-    sb.from('cc_leave_entries').select('*').eq('company_id', cid).order('start_date', {ascending:false})
+    sb.from('cc_leave_entries').select('*').eq('company_id', cid).order('start_date', {ascending:false}),
+    sb.from('cc_task_notes').select('*').eq('company_id', cid).order('created_at', {ascending:true})
   ]);
   state.suppliers = suppliersRes.data || [];
   state.supplierInvoices = supplierInvoicesRes.data || [];
@@ -929,6 +971,7 @@ async function refreshAll(){
   state.invoicePayments = invoicePaymentsRes.data || [];
   state.leaveBalances = leaveBalancesRes.data || [];
   state.leaveEntries = leaveEntriesRes.data || [];
+  state.taskNotes = taskNotesRes.data || [];
 
   const invoiceIds = state.invoices.map(i=>i.id);
   const creditNoteIds = state.creditNotes.map(cn=>cn.id);
@@ -974,6 +1017,7 @@ function render(){
     case 'invoices': main.innerHTML = renderInvoices(); attachInvoiceHandlers(); break;
     case 'creditnotes': main.innerHTML = renderCreditNotes(); attachCreditNoteHandlers(); break;
     case 'payroll': main.innerHTML = renderPayroll(); attachPayrollHandlers(); break;
+    case 'tasks': main.innerHTML = renderTasks(); attachTasksHandlers(); break;
     case 'vat': main.innerHTML = renderVat(); break;
     case 'reports': main.innerHTML = renderReports(); attachReportsHandlers(); break;
     case 'scenarios': main.innerHTML = renderScenarios(); attachScenarioHandlers(); break;
@@ -3971,6 +4015,21 @@ function renderTeam(){
             <label><input type="checkbox" id="member-can-approve"> Can approve invoices &amp; credit notes (e.g. an accountant)</label>
           </div>
         </div>
+        <div class="field hidden" id="member-employee-link-field">
+          <label>Link to employee (optional)</label>
+          <select id="member-employee-id">
+            <option value="">— Not linked —</option>
+            ${state.employees.filter(e=>e.active).map(e=>`<option value="${e.id}">${e.name}</option>`).join('')}
+          </select>
+          <p style="font-size:.76rem;color:var(--muted);margin:2px 0 0;">Lets this login see just their own tasks on the Tasks tab — needed for a restricted member like a floor assistant.</p>
+        </div>
+        <div class="field hidden" id="member-tabs-restrict-field">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="member-restrict-tabs" style="width:auto;"> Restrict which tabs this member can see</label>
+          <div class="perm-box hidden" id="member-tabs-box">
+            ${ALL_VIEWS.map(([k,l])=>`<label><input type="checkbox" class="member-tab" value="${k}"> ${l}</label>`).join('')}
+          </div>
+          <p style="font-size:.76rem;color:var(--muted);margin:4px 0 0;">Unchecked = this member sees every tab, same as today. Tick the box and pick tabs to limit them — e.g. Tasks only for a floor assistant.</p>
+        </div>
         <div class="modal-actions"><button type="button" class="btn secondary" id="member-cancel">Cancel</button><button type="submit" class="btn" id="member-submit">Invite</button></div>
       </form>
     </div></div>` : ''}
@@ -3979,6 +4038,12 @@ function renderTeam(){
 function toggleMemberPermFields(){
   const isStaffRole = document.getElementById('member-role').value === 'staff';
   document.getElementById('member-permissions-field').classList.toggle('hidden', !isStaffRole);
+  document.getElementById('member-employee-link-field').classList.toggle('hidden', !isStaffRole);
+  document.getElementById('member-tabs-restrict-field').classList.toggle('hidden', !isStaffRole);
+}
+function toggleMemberTabsBox(){
+  const restrict = document.getElementById('member-restrict-tabs').checked;
+  document.getElementById('member-tabs-box').classList.toggle('hidden', !restrict);
 }
 function resetMemberForm(){
   document.getElementById('member-edit-id').value = '';
@@ -3987,10 +4052,14 @@ function resetMemberForm(){
   document.getElementById('member-role').value = 'staff';
   document.querySelectorAll('.member-module').forEach(cb=>cb.checked=false);
   document.getElementById('member-can-approve').checked = false;
+  document.getElementById('member-employee-id').value = '';
+  document.getElementById('member-restrict-tabs').checked = false;
+  document.querySelectorAll('.member-tab').forEach(cb=>cb.checked=false);
   document.getElementById('member-modal-title').textContent = 'Invite Member';
   document.getElementById('member-modal-hint').textContent = "Enter the email they'll sign up (or already have an account) with. They'll get access automatically next time they log in.";
   document.getElementById('member-submit').textContent = 'Invite';
   toggleMemberPermFields();
+  toggleMemberTabsBox();
 }
 function attachTeamHandlers(){
   document.getElementById('company-vat-registered')?.addEventListener('change', (e)=>{
@@ -4017,6 +4086,7 @@ function attachTeamHandlers(){
   document.getElementById('member-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('member-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('member-role')?.addEventListener('change', toggleMemberPermFields);
+  document.getElementById('member-restrict-tabs')?.addEventListener('change', toggleMemberTabsBox);
   document.querySelectorAll('[data-edit-member]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const m = state.members.find(x=>x.id===btn.dataset.editMember);
@@ -4029,10 +4099,15 @@ function attachTeamHandlers(){
       const mods = (m.permissions && m.permissions.modules) || [];
       document.querySelectorAll('.member-module').forEach(cb=>{ cb.checked = mods.includes(cb.value); });
       document.getElementById('member-can-approve').checked = !!(m.permissions && m.permissions.can_approve);
+      document.getElementById('member-employee-id').value = m.employee_id || '';
+      const tabs = m.permissions && m.permissions.tabs;
+      document.getElementById('member-restrict-tabs').checked = Array.isArray(tabs);
+      document.querySelectorAll('.member-tab').forEach(cb=>{ cb.checked = Array.isArray(tabs) && tabs.includes(cb.value); });
       document.getElementById('member-modal-title').textContent = 'Manage ' + m.email;
-      document.getElementById('member-modal-hint').textContent = "Update this member's role and, if they're staff, which modules they can access.";
+      document.getElementById('member-modal-hint').textContent = "Update this member's role and, if they're staff, which modules and tabs they can access.";
       document.getElementById('member-submit').textContent = 'Save Changes';
       toggleMemberPermFields();
+      toggleMemberTabsBox();
       backdrop.classList.remove('hidden');
     });
   });
@@ -4041,19 +4116,24 @@ function attachTeamHandlers(){
     const role = document.getElementById('member-role').value;
     const editId = document.getElementById('member-edit-id').value;
     let permissions = {};
+    let employee_id = null;
     if(role === 'staff'){
       const modules = [...document.querySelectorAll('.member-module:checked')].map(cb=>cb.value);
       permissions = { modules, can_approve: document.getElementById('member-can-approve').checked };
+      if(document.getElementById('member-restrict-tabs').checked){
+        permissions.tabs = [...document.querySelectorAll('.member-tab:checked')].map(cb=>cb.value);
+      }
+      employee_id = document.getElementById('member-employee-id').value || null;
     }
     if(editId){
-      const {error} = await sb.from('cc_company_members').update({ role, permissions }).eq('id', editId);
+      const {error} = await sb.from('cc_company_members').update({ role, permissions, employee_id }).eq('id', editId);
       if(error){ toast(error.message); return; }
       await refreshAll(); render(); toast('Member updated.');
     } else {
       const {error} = await sb.from('cc_company_members').insert({
         company_id: state.company.id,
         email: document.getElementById('member-email').value.trim().toLowerCase(),
-        role, permissions,
+        role, permissions, employee_id,
         status: 'pending'
       });
       if(error){ toast(error.message); return; }
@@ -4068,6 +4148,185 @@ function attachTeamHandlers(){
       await refreshAll(); render();
     });
   });
+}
+
+
+/* ========================= TASKS ========================= */
+function myEmployeeId(){ return state.membership && state.membership.employee_id; }
+function canManageTasks(){ return isAdmin() || hasModule('payroll'); }
+
+function renderTasks(){
+  const canManage = canManageTasks();
+  const myEmpId = myEmployeeId();
+  const visibleTasks = canManage ? state.employeeTasks : state.employeeTasks.filter(t=>t.employee_id === myEmpId);
+  const noEmployeeLink = !canManage && !myEmpId;
+  return `
+    <div class="section-header" style="--accent-c:var(--c-tasks);"><h1>Tasks</h1>${canManage ? `<button class="btn" id="new-task-btn">+ Assign Task</button>` : ''}</div>
+    <p class="section-caption">${canManage ? 'Every task assigned across the team. Open a task to update its status or add a note.' : 'Your assigned tasks. Update the status and add notes as you work through them.'}</p>
+    <div class="panel">
+      ${noEmployeeLink ? `<div class="empty">Your login isn't linked to an employee record yet — ask an admin to link it under Team so your tasks show up here.</div>` : (visibleTasks.length ? `
+      <table><thead><tr>${canManage?'<th>Employee</th>':''}<th>Task</th><th>Status</th><th>Notes</th><th></th></tr></thead><tbody>
+        ${visibleTasks.map(t=>{
+          const noteCount = state.taskNotes.filter(n=>n.task_id===t.id).length;
+          return `<tr>${canManage?`<td>${state.employees.find(e=>e.id===t.employee_id)?.name||'—'}</td>`:''}
+          <td>${t.description}</td>
+          <td><span class="status-pill status-${t.status==='done'?'paid':(t.status==='in_progress'?'sent':'draft')}">${t.status.replace('_',' ')}</span></td>
+          <td>${noteCount}</td>
+          <td><button class="btn small secondary" data-open-task="${t.id}">Open</button></td>
+          </tr>`;
+        }).join('')}
+      </tbody></table>` : `<div class="empty">${canManage ? 'No tasks assigned yet.' : 'No tasks assigned to you yet.'}</div>`)}
+    </div>
+    ${canManage ? `
+    <div class="modal-backdrop hidden" id="tasktab-new-modal-backdrop"><div class="modal">
+      <button class="close-x" id="tasktab-new-modal-close">✕</button>
+      <h2>Assign Task</h2>
+      <form id="tasktab-new-form">
+        <div class="field"><label>Employee</label><select id="tasktab-new-employee" required>
+          <option value="">Select an employee…</option>
+          ${state.employees.filter(e=>e.active).map(e=>`<option value="${e.id}">${e.name}</option>`).join('')}
+        </select></div>
+        <div class="field"><label>Task</label><input type="text" id="tasktab-new-description" required></div>
+        <div class="field"><label>Status</label><select id="tasktab-new-status">
+          <option value="todo">To do</option>
+          <option value="in_progress" selected>In progress</option>
+          <option value="done">Done</option>
+        </select></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="tasktab-new-cancel">Cancel</button><button type="submit" class="btn">Assign</button></div>
+      </form>
+    </div></div>` : ''}
+    <div class="modal-backdrop hidden" id="task-detail-modal-backdrop"><div class="modal">
+      <button class="close-x" id="task-detail-modal-close">✕</button>
+      <div id="task-detail-body"></div>
+    </div></div>
+  `;
+}
+
+function renderTaskDetailBody(){
+  const t = state.employeeTasks.find(x=>x.id===state.taskDetailId);
+  if(!t) return '<p class="empty">This task could not be found.</p>';
+  const canManage = canManageTasks();
+  const myEmpId = myEmployeeId();
+  const isOwnTask = !!(myEmpId && t.employee_id === myEmpId);
+  const canChangeStatus = canManage || isOwnTask;
+  const notes = state.taskNotes.filter(n=>n.task_id===t.id);
+  const emp = state.employees.find(e=>e.id===t.employee_id);
+  return `
+    <h2 style="margin-top:0;">${t.description}</h2>
+    <p style="color:var(--muted);font-size:.85rem;margin-top:-8px;">${emp ? 'Assigned to ' + emp.name : ''}</p>
+    <div class="field" style="max-width:220px;">
+      <label>Status</label>
+      <select id="task-detail-status" ${canChangeStatus ? '' : 'disabled'}>
+        <option value="todo" ${t.status==='todo'?'selected':''}>To do</option>
+        <option value="in_progress" ${t.status==='in_progress'?'selected':''}>In progress</option>
+        <option value="done" ${t.status==='done'?'selected':''}>Done</option>
+      </select>
+    </div>
+    <h3 style="margin-bottom:6px;">Notes</h3>
+    <div style="display:flex;flex-direction:column;gap:8px;max-height:260px;overflow-y:auto;margin-bottom:12px;">
+      ${notes.length ? notes.map(n=>`
+        <div class="panel" style="margin:0;padding:10px 12px;">
+          <div style="display:flex;justify-content:space-between;gap:8px;font-size:.76rem;color:var(--muted);margin-bottom:4px;">
+            <span>${n.author_email || 'Unknown'}</span>
+            <span style="display:flex;gap:8px;align-items:center;">${new Date(n.created_at).toLocaleString('en-ZA')}${(isAdmin() || n.author_email === state.user.email) ? `<button type="button" class="btn small danger" style="padding:1px 7px;font-size:.68rem;" data-del-note="${n.id}">Delete</button>` : ''}</span>
+          </div>
+          <div style="white-space:pre-wrap;font-size:.88rem;">${n.note}</div>
+        </div>
+      `).join('') : '<div class="empty">No notes yet.</div>'}
+    </div>
+    <form id="task-note-form" style="display:flex;flex-direction:column;gap:8px;">
+      <textarea id="task-note-text" rows="2" placeholder="Add a note…" required></textarea>
+      <div class="modal-actions" style="justify-content:space-between;">
+        ${canManage ? `<button type="button" class="btn small danger" id="task-detail-delete">Delete Task</button>` : '<span></span>'}
+        <button type="submit" class="btn small">Add Note</button>
+      </div>
+    </form>
+  `;
+}
+
+function attachTasksHandlers(){
+  const newBackdrop = document.getElementById('tasktab-new-modal-backdrop');
+  document.getElementById('new-task-btn')?.addEventListener('click', ()=>{
+    document.getElementById('tasktab-new-employee').value = '';
+    document.getElementById('tasktab-new-description').value = '';
+    document.getElementById('tasktab-new-status').value = 'in_progress';
+    newBackdrop.classList.remove('hidden');
+  });
+  document.getElementById('tasktab-new-cancel')?.addEventListener('click', ()=>newBackdrop.classList.add('hidden'));
+  document.getElementById('tasktab-new-modal-close')?.addEventListener('click', ()=>newBackdrop.classList.add('hidden'));
+  document.getElementById('tasktab-new-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const {error} = await sb.from('cc_employee_tasks').insert({
+      company_id: state.company.id,
+      employee_id: document.getElementById('tasktab-new-employee').value,
+      description: document.getElementById('tasktab-new-description').value.trim(),
+      status: document.getElementById('tasktab-new-status').value
+    });
+    if(error){ toast(error.message); return; }
+    newBackdrop.classList.add('hidden');
+    await refreshAll(); render(); toast('Task assigned.');
+  });
+
+  const detailBackdrop = document.getElementById('task-detail-modal-backdrop');
+  function openTaskDetail(taskId){
+    state.taskDetailId = taskId;
+    document.getElementById('task-detail-body').innerHTML = renderTaskDetailBody();
+    attachTaskDetailHandlers();
+    detailBackdrop.classList.remove('hidden');
+  }
+  document.querySelectorAll('[data-open-task]').forEach(btn=>{
+    btn.addEventListener('click', ()=>openTaskDetail(btn.dataset.openTask));
+  });
+  document.getElementById('task-detail-modal-close')?.addEventListener('click', ()=>{
+    detailBackdrop.classList.add('hidden');
+    state.taskDetailId = null;
+    render();
+  });
+
+  function attachTaskDetailHandlers(){
+    document.getElementById('task-detail-status')?.addEventListener('change', async (e)=>{
+      const newStatus = e.target.value;
+      const {error} = await sb.from('cc_employee_tasks').update({status:newStatus}).eq('id', state.taskDetailId);
+      if(error){ toast(error.message); return; }
+      const t = state.employeeTasks.find(x=>x.id===state.taskDetailId);
+      if(t) t.status = newStatus;
+      toast('Status updated.');
+    });
+    document.getElementById('task-note-form')?.addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const text = document.getElementById('task-note-text').value.trim();
+      if(!text) return;
+      const {error} = await sb.from('cc_task_notes').insert({
+        company_id: state.company.id,
+        task_id: state.taskDetailId,
+        author_email: state.user.email,
+        note: text
+      });
+      if(error){ toast(error.message); return; }
+      const {data} = await sb.from('cc_task_notes').select('*').eq('company_id', state.company.id).order('created_at', {ascending:true});
+      state.taskNotes = data || [];
+      document.getElementById('task-detail-body').innerHTML = renderTaskDetailBody();
+      attachTaskDetailHandlers();
+      toast('Note added.');
+    });
+    document.querySelectorAll('[data-del-note]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        if(!confirm('Delete this note?')) return;
+        await sb.from('cc_task_notes').delete().eq('id', btn.dataset.delNote);
+        const {data} = await sb.from('cc_task_notes').select('*').eq('company_id', state.company.id).order('created_at', {ascending:true});
+        state.taskNotes = data || [];
+        document.getElementById('task-detail-body').innerHTML = renderTaskDetailBody();
+        attachTaskDetailHandlers();
+      });
+    });
+    document.getElementById('task-detail-delete')?.addEventListener('click', async ()=>{
+      if(!confirm('Delete this task? This also deletes its notes.')) return;
+      await sb.from('cc_employee_tasks').delete().eq('id', state.taskDetailId);
+      detailBackdrop.classList.add('hidden');
+      state.taskDetailId = null;
+      await refreshAll(); render(); toast('Task deleted.');
+    });
+  }
 }
 
 /* ========================= SCENARIO PLANNER ========================= */

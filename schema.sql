@@ -799,3 +799,53 @@ create policy "admin delete leave entries" on cc_leave_entries for delete using 
 
 -- ---------- verify ----------
 select tablename, count(*) as policy_count from pg_policies where tablename in ('cc_leave_balances','cc_leave_entries') group by tablename order by tablename;
+
+-- ============ WAVE 25: task notes + restricted tab access + employee-linked logins ============
+
+-- Link a login (cc_company_members) to a payroll employee record, so a restricted staff
+-- member can be shown just their own tasks on the Tasks tab.
+alter table cc_company_members add column if not exists employee_id uuid references cc_employees(id) on delete set null;
+
+-- An append-only note log against a task (employees can add notes as they work through it).
+create table if not exists cc_task_notes (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  task_id uuid not null references cc_employee_tasks(id) on delete cascade,
+  author_email text,
+  note text not null,
+  created_at timestamptz default now()
+);
+alter table cc_task_notes enable row level security;
+
+drop policy if exists "members select task notes" on cc_task_notes;
+create policy "members select task notes" on cc_task_notes for select using (cc_is_member(company_id));
+drop policy if exists "members insert task notes" on cc_task_notes;
+create policy "members insert task notes" on cc_task_notes for insert with check (cc_is_member(company_id));
+drop policy if exists "author or admin delete task notes" on cc_task_notes;
+create policy "author or admin delete task notes" on cc_task_notes for delete using (
+  cc_is_admin(company_id) or author_email = auth.jwt() ->> 'email'
+);
+
+-- Returns the employee_id linked to the calling user's active membership of a company, or
+-- null if their login isn't linked to an employee record. Used to scope a restricted staff
+-- member's Tasks-tab access to just their own tasks.
+create or replace function cc_my_employee_id(target_company_id uuid)
+returns uuid
+language sql
+security definer
+stable
+as $$
+  select employee_id from cc_company_members
+  where company_id = target_company_id and user_id = auth.uid() and status = 'active'
+  limit 1;
+$$;
+
+-- Additive to the existing "scoped update employee tasks" (payroll-module) policy: lets an
+-- employee update the status of their own task even without payroll module access.
+drop policy if exists "own task status update" on cc_employee_tasks;
+create policy "own task status update" on cc_employee_tasks for update using (
+  employee_id = cc_my_employee_id(company_id)
+);
+
+-- ---------- verify ----------
+select tablename, count(*) as policy_count from pg_policies where tablename in ('cc_task_notes','cc_employee_tasks') group by tablename order by tablename;
