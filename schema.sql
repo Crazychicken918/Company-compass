@@ -725,3 +725,77 @@ order by tablename;
 -- on tax invoices by SARS.
 alter table cc_companies add column if not exists vat_registered boolean not null default true;
 alter table cc_companies add column if not exists address text;
+
+-- ============ WAVE 24: PAYE/UIF/SDL, leave balances, payslip breakdown, IRP5 ============
+
+-- Employee tax profile fields
+alter table cc_employees add column if not exists id_number text;
+alter table cc_employees add column if not exists tax_number text;
+alter table cc_employees add column if not exists date_of_birth date;
+alter table cc_employees add column if not exists travel_allowance numeric not null default 0;
+alter table cc_employees add column if not exists retirement_contribution numeric not null default 0;
+alter table cc_employees add column if not exists medical_aid_contribution numeric not null default 0;
+alter table cc_employees add column if not exists medical_aid_dependants integer not null default 0;
+
+-- Payslip breakdown columns on cc_payroll_payments (in addition to existing gross/deductions/net)
+alter table cc_payroll_payments add column if not exists basic_salary numeric not null default 0;
+alter table cc_payroll_payments add column if not exists travel_allowance numeric not null default 0;
+alter table cc_payroll_payments add column if not exists bonus numeric not null default 0;
+alter table cc_payroll_payments add column if not exists commission numeric not null default 0;
+alter table cc_payroll_payments add column if not exists retirement_deduction numeric not null default 0;
+alter table cc_payroll_payments add column if not exists medical_deduction numeric not null default 0;
+alter table cc_payroll_payments add column if not exists paye numeric not null default 0;
+alter table cc_payroll_payments add column if not exists uif_employee numeric not null default 0;
+alter table cc_payroll_payments add column if not exists uif_employer numeric not null default 0;
+alter table cc_payroll_payments add column if not exists medical_credit numeric not null default 0;
+alter table cc_payroll_payments add column if not exists other_deduction numeric not null default 0;
+alter table cc_payroll_payments add column if not exists other_deduction_note text;
+
+-- Leave balances: one row per employee per leave type, set/adjusted directly by an admin
+create table if not exists cc_leave_balances (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  employee_id uuid not null references cc_employees(id) on delete cascade,
+  leave_type text not null check (leave_type in ('annual','sick','compassionate','study')),
+  balance_days numeric not null default 0,
+  updated_at timestamptz default now(),
+  unique(employee_id, leave_type)
+);
+
+-- Leave entries: an audit log of leave taken (or balance adjustments), decrementing/adjusting the balance
+create table if not exists cc_leave_entries (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  employee_id uuid not null references cc_employees(id) on delete cascade,
+  leave_type text not null check (leave_type in ('annual','sick','compassionate','study')),
+  start_date date not null,
+  end_date date not null,
+  days numeric not null,
+  notes text,
+  created_by uuid,
+  created_at timestamptz default now()
+);
+
+alter table cc_leave_balances enable row level security;
+alter table cc_leave_entries enable row level security;
+
+drop policy if exists "members select leave balances" on cc_leave_balances;
+create policy "members select leave balances" on cc_leave_balances for select using (cc_is_member(company_id));
+drop policy if exists "admin write leave balances" on cc_leave_balances;
+create policy "admin write leave balances" on cc_leave_balances for insert with check (cc_is_admin(company_id));
+drop policy if exists "admin update leave balances" on cc_leave_balances;
+create policy "admin update leave balances" on cc_leave_balances for update using (cc_is_admin(company_id));
+drop policy if exists "admin delete leave balances" on cc_leave_balances;
+create policy "admin delete leave balances" on cc_leave_balances for delete using (cc_is_admin(company_id));
+
+drop policy if exists "members select leave entries" on cc_leave_entries;
+create policy "members select leave entries" on cc_leave_entries for select using (cc_is_member(company_id));
+drop policy if exists "admin write leave entries" on cc_leave_entries;
+create policy "admin write leave entries" on cc_leave_entries for insert with check (cc_is_admin(company_id));
+drop policy if exists "admin update leave entries" on cc_leave_entries;
+create policy "admin update leave entries" on cc_leave_entries for update using (cc_is_admin(company_id));
+drop policy if exists "admin delete leave entries" on cc_leave_entries;
+create policy "admin delete leave entries" on cc_leave_entries for delete using (cc_is_admin(company_id));
+
+-- ---------- verify ----------
+select tablename, count(*) as policy_count from pg_policies where tablename in ('cc_leave_balances','cc_leave_entries') group by tablename order by tablename;

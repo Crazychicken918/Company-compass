@@ -264,6 +264,192 @@ const SUPABASE_URL = 'https://fejcuijyskosvdxkgupo.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable__WQYy168UXfdP4WmZOFQPQ_asRpInsR';
 const VAT_RATE = 0.15; // South Africa standard VAT rate
 
+/* ========================= PAYROLL TAX ENGINE (SARS, 2027 tax year) =========================
+   Figures below are for the 2027 tax year (1 March 2026 - 28 February 2027), the current tax
+   year as of this build. They change every Budget (usually effective 1 March) and will need
+   updating for future tax years — this is NOT tax advice; confirm with SARS/your accountant
+   before relying on these figures for filing. Sources: SARS 2027 tax deduction tables & rate
+   tables, SARS medical tax credit rates, SARS UIF/SDL guidance, and the 2026 Budget (retirement
+   deduction cap increase to R430,000). */
+const PAYE_BRACKETS_2027 = [
+  { min: 0,       rate: 0.18, base: 0 },
+  { min: 245100,  rate: 0.26, base: 44118 },
+  { min: 383100,  rate: 0.31, base: 79998 },
+  { min: 530200,  rate: 0.36, base: 125599 },
+  { min: 695800,  rate: 0.39, base: 185215 },
+  { min: 887000,  rate: 0.41, base: 259783 },
+  { min: 1878600, rate: 0.45, base: 666339 },
+];
+const PAYE_PRIMARY_REBATE_2027 = 17820;   // all taxpayers
+const PAYE_SECONDARY_REBATE_2027 = 9765;  // additional, age 65+
+const PAYE_TERTIARY_REBATE_2027 = 3249;   // additional, age 75+
+const MEDICAL_CREDIT_MEMBER_2027 = 376;      // per month: main member, and the first dependant
+const MEDICAL_CREDIT_ADDITIONAL_2027 = 254;  // per month: each dependant after the first
+const UIF_RATE = 0.01;                    // employee 1% + employer 1% = 2% total
+const UIF_CEILING_MONTHLY = 17712;        // remuneration above this isn't subject to UIF
+const SDL_RATE = 0.01;                    // employer-only levy
+const SDL_ANNUAL_THRESHOLD = 500000;      // employers with an annual payroll at or below this are exempt
+const RETIREMENT_DEDUCTION_RATE = 0.275;  // 27.5% of remuneration/taxable income, whichever cap binds first
+const RETIREMENT_DEDUCTION_ANNUAL_CAP = 430000; // per 2026 Budget, effective 1 March 2026
+const TRAVEL_ALLOWANCE_TAXABLE_PORTION = 0.8; // SARS default inclusion rate (no employer business-use certificate)
+
+function round2(n){ return Math.round((n + Number.EPSILON) * 100) / 100; }
+
+function payPeriodsPerYear(freq){
+  return freq === 'weekly' ? 52 : (freq === 'biweekly' ? 26 : 12);
+}
+
+function ageOn(dob, onDate){
+  if(!dob) return null;
+  const d = new Date(dob + 'T00:00:00');
+  const o = new Date((onDate || new Date().toISOString().slice(0,10)) + 'T00:00:00');
+  if(isNaN(d) || isNaN(o)) return null;
+  let age = o.getFullYear() - d.getFullYear();
+  const m = o.getMonth() - d.getMonth();
+  if(m < 0 || (m === 0 && o.getDate() < d.getDate())) age--;
+  return age;
+}
+
+function payeAnnualTaxGross(annualTaxableIncome){
+  const income = Math.max(0, annualTaxableIncome);
+  let applicable = PAYE_BRACKETS_2027[0];
+  for(const b of PAYE_BRACKETS_2027){ if(income >= b.min) applicable = b; else break; }
+  return applicable.base + applicable.rate * (income - applicable.min);
+}
+
+function payeTotalRebate(age){
+  let r = PAYE_PRIMARY_REBATE_2027;
+  if(age !== null && age >= 65) r += PAYE_SECONDARY_REBATE_2027;
+  if(age !== null && age >= 75) r += PAYE_TERTIARY_REBATE_2027;
+  return r;
+}
+
+function medicalCreditMonthly(dependantsExcludingSelf){
+  const deps = Math.max(0, Number(dependantsExcludingSelf) || 0);
+  const totalLives = 1 + deps; // main member + dependants
+  let credit = MEDICAL_CREDIT_MEMBER_2027; // main member
+  if(totalLives >= 2) credit += MEDICAL_CREDIT_MEMBER_2027; // first dependant, same rate as the member
+  if(totalLives > 2) credit += MEDICAL_CREDIT_ADDITIONAL_2027 * (totalLives - 2);
+  return credit;
+}
+
+function computeUIF(periodRemuneration, periods){
+  periods = periods || 12;
+  const periodCeiling = (UIF_CEILING_MONTHLY * 12) / periods;
+  const base = Math.min(Math.max(0, periodRemuneration), periodCeiling);
+  return { employee: round2(base * UIF_RATE), employer: round2(base * UIF_RATE), base };
+}
+
+function computeSDL(monthlyLeviablePayroll){
+  const annualProjection = monthlyLeviablePayroll * 12;
+  const applicable = annualProjection > SDL_ANNUAL_THRESHOLD;
+  return { applicable, annualProjection, amount: applicable ? round2(monthlyLeviablePayroll * SDL_RATE) : 0 };
+}
+
+function retirementDeductionAllowed(actualContributionPeriod, preRetirementTaxableIncomePeriod, periods){
+  periods = periods || 12;
+  const percentCap = preRetirementTaxableIncomePeriod * RETIREMENT_DEDUCTION_RATE;
+  const randCapPeriod = RETIREMENT_DEDUCTION_ANNUAL_CAP / periods;
+  return Math.max(0, Math.min(Math.max(0, actualContributionPeriod), percentCap, randCapPeriod));
+}
+
+// Full pay-run calculation for one employee. `opts` can carry once-off amounts for this run
+// (bonus, commission, otherDeduction/otherDeductionNote) and payDate (defaults to today).
+// Returns every figure the payslip view, the statutory summary, and IRP5 generation need.
+function computePayslip(emp, opts){
+  opts = opts || {};
+  const payDate = opts.payDate || new Date().toISOString().slice(0,10);
+  const bonus = Number(opts.bonus) || 0;
+  const commission = Number(opts.commission) || 0;
+  const otherDeduction = Number(opts.otherDeduction) || 0;
+  const otherDeductionNote = opts.otherDeductionNote || null;
+
+  const periods = payPeriodsPerYear(emp.pay_frequency);
+  const basic = Number(emp.salary) || 0;
+  const travelAllowance = Number(emp.travel_allowance) || 0;
+  const retirementContribution = Number(emp.retirement_contribution) || 0;
+  const medicalContribution = Number(emp.medical_aid_contribution) || 0;
+  const medicalDependants = Number(emp.medical_aid_dependants) || 0;
+
+  const grossEarnings = basic + travelAllowance + bonus + commission;
+
+  // Only the SARS-default 80% of a travel allowance is included in taxable remuneration
+  // (the full 100% is used for UIF and for the payslip's Gross Earnings line).
+  const taxableTravelPortion = travelAllowance * TRAVEL_ALLOWANCE_TAXABLE_PORTION;
+  const preRetirementTaxable = basic + taxableTravelPortion + bonus + commission;
+
+  // The FULL retirement contribution is still deducted from pay; only the allowed portion
+  // (capped at 27.5% of remuneration or the annual Rand cap, whichever binds) reduces the
+  // income PAYE is calculated on.
+  const retirementDeduction = retirementDeductionAllowed(retirementContribution, preRetirementTaxable, periods);
+  const taxableIncomePeriod = Math.max(0, preRetirementTaxable - retirementDeduction);
+
+  const annualTaxableIncome = taxableIncomePeriod * periods;
+  const annualTaxGross = payeAnnualTaxGross(annualTaxableIncome);
+  const age = ageOn(emp.date_of_birth, payDate);
+  const rebate = payeTotalRebate(age);
+  const annualTaxAfterRebate = Math.max(0, annualTaxGross - rebate);
+
+  const hasMedicalAid = medicalContribution > 0;
+  const medicalCreditMonthlyAmt = hasMedicalAid ? medicalCreditMonthly(medicalDependants) : 0;
+  const medicalCreditAnnual = medicalCreditMonthlyAmt * 12;
+  const annualTaxFinal = Math.max(0, annualTaxAfterRebate - medicalCreditAnnual);
+  const paye = round2(annualTaxFinal / periods);
+
+  const uif = computeUIF(basic + travelAllowance + bonus + commission, periods);
+
+  const totalDeductions = round2(retirementContribution + medicalContribution + paye + uif.employee + otherDeduction);
+  const netPay = round2(grossEarnings - totalDeductions);
+
+  return {
+    payDate, periods, age,
+    basic, travelAllowance, bonus, commission, grossEarnings,
+    taxableTravelPortion, preRetirementTaxable,
+    retirementContribution, retirementDeduction, taxableIncomePeriod,
+    annualTaxableIncome, annualTaxGross, rebate, annualTaxAfterRebate,
+    medicalContribution, medicalDependants, medicalCreditMonthly: medicalCreditMonthlyAmt,
+    medicalCreditAnnual, medicalCreditPeriod: round2(medicalCreditAnnual / periods),
+    annualTaxFinal, paye,
+    uifEmployee: uif.employee, uifEmployer: uif.employer, uifBase: uif.base,
+    otherDeduction, otherDeductionNote,
+    totalDeductions, netPay,
+  };
+}
+
+// A monthly-normalized copy of an employee record, used for company-wide monthly projections
+// (Statutory Summary, SDL) regardless of that employee's actual pay frequency.
+function monthlyEquivalentEmployee(e){
+  const periods = payPeriodsPerYear(e.pay_frequency);
+  const factor = periods / 12;
+  return Object.assign({}, e, {
+    pay_frequency: 'monthly',
+    salary: (Number(e.salary) || 0) * factor,
+    travel_allowance: (Number(e.travel_allowance) || 0) * factor,
+    retirement_contribution: (Number(e.retirement_contribution) || 0) * factor,
+    medical_aid_contribution: (Number(e.medical_aid_contribution) || 0) * factor,
+  });
+}
+
+// Company-wide statutory summary across active employees: projected monthly PAYE, UIF
+// (employee + employer), and SDL (only payable once projected annual payroll exceeds the
+// R500,000 exemption threshold).
+function computeStatutorySummary(){
+  let totalPaye = 0, totalUifEmployee = 0, totalUifEmployer = 0, totalLeviablePayroll = 0;
+  state.employees.filter(e => e.active).forEach(e => {
+    const me = monthlyEquivalentEmployee(e);
+    const ps = computePayslip(me, {});
+    totalPaye += ps.paye;
+    totalUifEmployee += ps.uifEmployee;
+    totalUifEmployer += ps.uifEmployer;
+    totalLeviablePayroll += me.salary + me.travel_allowance;
+  });
+  const sdl = computeSDL(totalLeviablePayroll);
+  return {
+    totalPaye: round2(totalPaye), totalUifEmployee: round2(totalUifEmployee), totalUifEmployer: round2(totalUifEmployer),
+    totalLeviablePayroll: round2(totalLeviablePayroll), sdl,
+  };
+}
+
 /* ========================= THEME (light / dark) =========================
    Defaults to the OS/browser's light-or-dark setting; a manual toggle
    overrides it and is remembered per browser in localStorage. */
@@ -442,6 +628,8 @@ let state = {
   employees: [],
   payrollPayments: [],
   employeeTasks: [],
+  leaveBalances: [],   // one row per employee per leave type (annual/sick/compassionate/study)
+  leaveEntries: [],    // audit log of leave taken
   scenarios: [],
   scenarioCashflows: {},   // scenarioId -> cashflow rows[], sorted by period_number
   view: 'dashboard',
@@ -727,16 +915,20 @@ async function refreshAll(){
   state.scenarioCashflows = {};
   (cashflowsRes.data||[]).forEach(row=>{ (state.scenarioCashflows[row.scenario_id] = state.scenarioCashflows[row.scenario_id]||[]).push(row); });
 
-  const [suppliersRes, supplierInvoicesRes, supplierCreditNotesRes, invoicePaymentsRes] = await Promise.all([
+  const [suppliersRes, supplierInvoicesRes, supplierCreditNotesRes, invoicePaymentsRes, leaveBalancesRes, leaveEntriesRes] = await Promise.all([
     sb.from('cc_suppliers').select('*').eq('company_id', cid),
     sb.from('cc_supplier_invoices').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
     sb.from('cc_supplier_credit_notes').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
-    sb.from('cc_invoice_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false})
+    sb.from('cc_invoice_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false}),
+    sb.from('cc_leave_balances').select('*').eq('company_id', cid),
+    sb.from('cc_leave_entries').select('*').eq('company_id', cid).order('start_date', {ascending:false})
   ]);
   state.suppliers = suppliersRes.data || [];
   state.supplierInvoices = supplierInvoicesRes.data || [];
   state.supplierCreditNotes = supplierCreditNotesRes.data || [];
   state.invoicePayments = invoicePaymentsRes.data || [];
+  state.leaveBalances = leaveBalancesRes.data || [];
+  state.leaveEntries = leaveEntriesRes.data || [];
 
   const invoiceIds = state.invoices.map(i=>i.id);
   const creditNoteIds = state.creditNotes.map(cn=>cn.id);
@@ -2404,18 +2596,190 @@ async function openCreditNoteView(noteId){
 }
 
 /* ========================= PAYROLL ========================= */
+const LEAVE_TYPES = [['annual','Annual'],['sick','Sick'],['compassionate','Compassionate'],['study','Study']];
+function leaveBalanceFor(empId, type){
+  const row = state.leaveBalances.find(b=>b.employee_id===empId && b.leave_type===type);
+  return row ? Number(row.balance_days) : 0;
+}
+
+// Normalizes either a live computePayslip() result or a saved cc_payroll_payments row
+// into the same shape renderPayslipHTML() expects.
+function normalizePayslipCalc(calc){
+  return {
+    payDate: calc.payDate, basic: calc.basic, travelAllowance: calc.travelAllowance,
+    bonus: calc.bonus, commission: calc.commission, grossEarnings: calc.grossEarnings,
+    retirementContribution: calc.retirementContribution, medicalContribution: calc.medicalContribution,
+    medicalCreditMonthly: calc.medicalCreditPeriod,
+    paye: calc.paye, uifEmployee: calc.uifEmployee, uifEmployer: calc.uifEmployer,
+    otherDeduction: calc.otherDeduction, otherDeductionNote: calc.otherDeductionNote,
+    totalDeductions: calc.totalDeductions, netPay: calc.netPay,
+  };
+}
+function normalizePayslipRow(row){
+  return {
+    payDate: row.pay_date, basic: row.basic_salary, travelAllowance: row.travel_allowance,
+    bonus: row.bonus, commission: row.commission, grossEarnings: row.gross,
+    retirementContribution: row.retirement_deduction, medicalContribution: row.medical_deduction,
+    medicalCreditMonthly: row.medical_credit,
+    paye: row.paye, uifEmployee: row.uif_employee, uifEmployer: row.uif_employer,
+    otherDeduction: row.other_deduction, otherDeductionNote: row.other_deduction_note,
+    totalDeductions: row.deductions, netPay: row.net,
+  };
+}
+function renderPayslipHTML(emp, v){
+  return `
+    <div class="panel" style="margin-top:14px;border-top:3px solid var(--c-payroll);">
+      ${state.company.logo_data_url ? `<img class="invoice-logo-preview" src="${state.company.logo_data_url}">` : ''}
+      <h3 style="margin-top:0;">Payslip — ${emp.name}</h3>
+      <p style="color:var(--muted);margin-top:-8px;font-size:.85rem;">${state.company.name}${state.company.address ? ' · ' + state.company.address : ''}</p>
+      <p style="font-size:.85rem;color:var(--muted);">Pay date: ${v.payDate}${emp.role_title ? ' · ' + emp.role_title : ''}${emp.id_number ? ' · ID ' + emp.id_number : ''}</p>
+      <table><thead><tr><th>Earnings</th><th style="text-align:right;">Amount</th></tr></thead><tbody>
+        <tr><td>Basic Salary</td><td style="text-align:right;">${fmt(v.basic)}</td></tr>
+        ${v.travelAllowance ? `<tr><td>Travel Allowance</td><td style="text-align:right;">${fmt(v.travelAllowance)}</td></tr>` : ''}
+        ${v.bonus ? `<tr><td>Bonus</td><td style="text-align:right;">${fmt(v.bonus)}</td></tr>` : ''}
+        ${v.commission ? `<tr><td>Commission</td><td style="text-align:right;">${fmt(v.commission)}</td></tr>` : ''}
+        <tr style="font-weight:700;"><td>Gross Earnings</td><td style="text-align:right;">${fmt(v.grossEarnings)}</td></tr>
+      </tbody></table>
+      <table style="margin-top:10px;"><thead><tr><th>Deductions</th><th style="text-align:right;">Amount</th></tr></thead><tbody>
+        <tr><td>PAYE (Employees' Tax)</td><td style="text-align:right;">${fmt(v.paye)}</td></tr>
+        <tr><td>UIF Contribution</td><td style="text-align:right;">${fmt(v.uifEmployee)}</td></tr>
+        ${v.retirementContribution ? `<tr><td>Retirement Fund Contribution</td><td style="text-align:right;">${fmt(v.retirementContribution)}</td></tr>` : ''}
+        ${v.medicalContribution ? `<tr><td>Medical Aid Contribution</td><td style="text-align:right;">${fmt(v.medicalContribution)}</td></tr>` : ''}
+        ${v.otherDeduction ? `<tr><td>${v.otherDeductionNote || 'Other Deduction'}</td><td style="text-align:right;">${fmt(v.otherDeduction)}</td></tr>` : ''}
+        <tr style="font-weight:700;"><td>Total Deductions</td><td style="text-align:right;">${fmt(v.totalDeductions)}</td></tr>
+      </tbody></table>
+      <div style="text-align:right;margin-top:10px;font-size:1.1rem;font-weight:700;">Net Pay: ${fmt(v.netPay)}</div>
+      ${v.medicalCreditMonthly ? `<p style="font-size:.78rem;color:var(--muted);margin-top:10px;">Includes a medical scheme fees tax credit of ${fmt(v.medicalCreditMonthly)} already applied to reduce PAYE above.</p>` : ''}
+      <p style="font-size:.78rem;color:var(--muted);">Employer also contributes ${fmt(v.uifEmployer)} in UIF this period (not deducted from pay). Figures use SARS 2027 tax year rates — not tax advice.</p>
+    </div>
+  `;
+}
+
+function isLeapYear(y){ return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0; }
+function taxYearBounds(label){
+  const y = Number(label);
+  const endDay = isLeapYear(y) ? 29 : 28;
+  return { start: `${y-1}-03-01`, end: `${y}-02-${String(endDay).padStart(2,'0')}`, label: `${y} (1 Mar ${y-1} – ${endDay} Feb ${y})` };
+}
+function currentTaxYearLabel(onDate){
+  const d = onDate ? new Date(onDate) : new Date();
+  return d.getMonth() >= 2 ? d.getFullYear() + 1 : d.getFullYear();
+}
+function computeIRP5(employeeId, taxYearLabel){
+  const bounds = taxYearBounds(taxYearLabel);
+  const rows = state.payrollPayments.filter(p => p.employee_id === employeeId && p.pay_date >= bounds.start && p.pay_date <= bounds.end);
+  const sum = (key) => round2(rows.reduce((s, r) => s + (Number(r[key]) || 0), 0));
+  return {
+    bounds, count: rows.length,
+    income3601: sum('basic_salary'), bonus3605: sum('bonus'), commission3606: sum('commission'),
+    travel3701: sum('travel_allowance'), retirement4001: sum('retirement_deduction'),
+    medical4005: sum('medical_deduction'), medicalCredit4116: sum('medical_credit'),
+    paye4102: sum('paye'), uif4141: sum('uif_employee'),
+    grossRemuneration: sum('gross'), netPayTotal: sum('net'),
+  };
+}
+function renderIRP5HTML(emp, irp){
+  return `
+    <div class="panel" style="margin-top:10px;border-top:3px solid var(--c-payroll);">
+      <h3 style="margin-top:0;">IRP5 / IT3(a) Employee Tax Certificate</h3>
+      <p style="font-size:.85rem;color:var(--muted);">Tax year ${irp.bounds.label}</p>
+      <p><strong>Employee:</strong> ${emp.name}${emp.id_number ? ' · ID ' + emp.id_number : ''}${emp.tax_number ? ' · Tax No ' + emp.tax_number : ''}</p>
+      <p><strong>Employer:</strong> ${state.company.name}${state.company.vat_number ? ' · VAT ' + state.company.vat_number : ''}${state.company.registration_number ? ' · Reg ' + state.company.registration_number : ''}</p>
+      ${state.company.address ? `<p style="color:var(--muted);font-size:.85rem;">${state.company.address}</p>` : ''}
+      ${irp.count===0 ? `<div class="empty">No payslips recorded for this employee in this tax year yet.</div>` : `
+      <table><thead><tr><th>Code</th><th>Description</th><th style="text-align:right;">Amount</th></tr></thead><tbody>
+        <tr><td>3601</td><td>Income (basic salary)</td><td style="text-align:right;">${fmt(irp.income3601)}</td></tr>
+        ${irp.bonus3605 ? `<tr><td>3605</td><td>Annual Payment (bonus)</td><td style="text-align:right;">${fmt(irp.bonus3605)}</td></tr>` : ''}
+        ${irp.commission3606 ? `<tr><td>3606</td><td>Commission</td><td style="text-align:right;">${fmt(irp.commission3606)}</td></tr>` : ''}
+        ${irp.travel3701 ? `<tr><td>3701</td><td>Travel Allowance</td><td style="text-align:right;">${fmt(irp.travel3701)}</td></tr>` : ''}
+        ${irp.retirement4001 ? `<tr><td>4001</td><td>Pension/Retirement Fund Contributions</td><td style="text-align:right;">${fmt(irp.retirement4001)}</td></tr>` : ''}
+        ${irp.medical4005 ? `<tr><td>4005</td><td>Medical Aid Contributions</td><td style="text-align:right;">${fmt(irp.medical4005)}</td></tr>` : ''}
+        ${irp.medicalCredit4116 ? `<tr><td>4116</td><td>Medical Scheme Fees Tax Credit</td><td style="text-align:right;">${fmt(irp.medicalCredit4116)}</td></tr>` : ''}
+        <tr><td>4102</td><td>PAYE (Employees' Tax Deducted)</td><td style="text-align:right;">${fmt(irp.paye4102)}</td></tr>
+        <tr><td>4141</td><td>UIF Contribution (employee)</td><td style="text-align:right;">${fmt(irp.uif4141)}</td></tr>
+      </tbody></table>
+      <div style="text-align:right;margin-top:10px;font-size:.95rem;">
+        <div>Gross Remuneration: ${fmt(irp.grossRemuneration)}</div>
+        <div style="font-weight:700;">Net Pay for the year: ${fmt(irp.netPayTotal)}</div>
+      </div>
+      `}
+      <p style="font-size:.75rem;color:var(--muted);margin-top:12px;">This is a simplified certificate using standard SARS IRP5 source codes for reference — it is not generated by, or submission-ready for, SARS e@syFile. Confirm all figures and codes with your accountant before using for tax filing. Employer UIF and SDL contributions are employer costs and aren't shown on the employee's own certificate.</p>
+    </div>
+  `;
+}
+function closePayslipModal(){
+  document.getElementById('payslip-modal-backdrop').classList.add('hidden');
+  document.getElementById('payslip-preview').innerHTML = '';
+}
+function renderLeaveEditor(empId){
+  document.getElementById('leave-balances-editor').innerHTML = `
+    <div class="row">
+      ${LEAVE_TYPES.map(([t,l])=>`<div class="field"><label>${l} (days)</label><input type="number" step="0.5" class="leave-balance-input" data-leave-type="${t}" value="${leaveBalanceFor(empId,t)}"></div>`).join('')}
+    </div>
+    <div class="modal-actions" style="justify-content:flex-start;"><button type="button" class="btn small" id="leave-save-balances">Save Balances</button></div>
+  `;
+  document.getElementById('leave-save-balances')?.addEventListener('click', async ()=>{
+    const updates = [...document.querySelectorAll('.leave-balance-input')].map(inp=>({
+      company_id: state.company.id, employee_id: empId, leave_type: inp.dataset.leaveType,
+      balance_days: parseFloat(inp.value) || 0,
+    }));
+    const {error} = await sb.from('cc_leave_balances').upsert(updates, {onConflict: 'employee_id,leave_type'});
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render();
+    document.getElementById('leave-employee-id').value = empId;
+    document.getElementById('leave-modal-backdrop').classList.remove('hidden');
+    renderLeaveEditor(empId);
+    renderLeaveHistory(empId);
+    toast('Leave balances saved.');
+  });
+}
+function renderLeaveHistory(empId){
+  const entries = state.leaveEntries.filter(l=>l.employee_id===empId).slice(0,10);
+  document.getElementById('leave-history').innerHTML = `
+    <h3>Recent leave taken</h3>
+    ${entries.length ? `<table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Days</th></tr></thead><tbody>
+      ${entries.map(l=>`<tr><td>${LEAVE_TYPES.find(([t])=>t===l.leave_type)?.[1]||l.leave_type}</td><td>${l.start_date}</td><td>${l.end_date}</td><td>${l.days}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No leave logged yet.</div>`}
+  `;
+}
+function renderIRP5For(empId, taxYear){
+  const emp = state.employees.find(e=>e.id===empId);
+  if(!emp) return;
+  document.getElementById('irp5-content').innerHTML = renderIRP5HTML(emp, computeIRP5(empId, taxYear));
+}
 function renderPayroll(){
   const canEdit = hasModule('payroll');
   const totalPayroll = state.employees.filter(e=>e.active).reduce((s,e)=>s+Number(e.salary),0);
+  const stat = computeStatutorySummary();
   return `
     <div class="section-header" style="--accent-c:var(--c-payroll);"><h1>Payroll</h1>${canEdit ? `<button class="btn" id="add-employee-btn">+ Add Employee</button>` : ''}</div>
-    <p class="section-caption">Employees, pay runs, and their current tasks.</p>
-    <div class="grid"><div class="card" style="--accent-c:var(--c-payroll);"><h3>Monthly Payroll (active)</h3><div class="value">${fmt(totalPayroll)}</div></div></div>
+    <p class="section-caption">Employees, pay runs, leave, and their current tasks.</p>
+    <div class="grid">
+      <div class="card" style="--accent-c:var(--c-payroll);"><h3>Monthly Payroll (active)</h3><div class="value">${fmt(totalPayroll)}</div></div>
+      <div class="card"><h3>PAYE (monthly est.)</h3><div class="value">${fmt(stat.totalPaye)}</div></div>
+      <div class="card"><h3>UIF (monthly est.)</h3><div class="value">${fmt(stat.totalUifEmployee + stat.totalUifEmployer)}</div><div class="sub">${fmt(stat.totalUifEmployee)} employee + ${fmt(stat.totalUifEmployer)} employer</div></div>
+      <div class="card"><h3>SDL Payable</h3><div class="value">${stat.sdl.applicable ? fmt(stat.sdl.amount) : 'R0.00'}</div><div class="sub">${stat.sdl.applicable ? 'Projected annual payroll over R500,000' : 'Exempt — projected annual payroll is at or below R500,000'}</div></div>
+    </div>
+    <p style="color:var(--muted);font-size:.78rem;margin-top:-6px;">PAYE/UIF/SDL are estimates from each employee's recurring salary and allowances (once-off bonuses/commission aren't projected forward), using SARS 2027 tax year rates. Not tax advice — confirm with your accountant or SARS before filing.</p>
     <div class="panel">
       <h3 style="margin-top:0;">Employees</h3>
-      ${state.employees.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Salary</th><th>Frequency</th><th>Active</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+      ${state.employees.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Basic Salary</th><th>Frequency</th><th>Active</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${state.employees.map(e=>`<tr><td>${e.name}</td><td>${e.role_title||'—'}</td><td>${fmt(e.salary)}</td><td>${e.pay_frequency}</td><td>${e.active?'Yes':'No'}</td>
-        ${canEdit?`<td><button class="btn small secondary" data-pay-employee="${e.id}">Record Payment</button> <button class="btn small secondary" data-task-employee="${e.id}">Assign Task</button> <button class="btn small danger" data-del-employee="${e.id}">Delete</button></td>`:''}</tr>`).join('')}
+        ${canEdit?`<td style="white-space:nowrap;">
+          <button class="btn small secondary" data-edit-employee="${e.id}">Edit</button>
+          <button class="btn small secondary" data-payslip-employee="${e.id}">Payslip</button>
+          <button class="btn small secondary" data-irp5-employee="${e.id}">IRP5</button>
+          <button class="btn small secondary" data-task-employee="${e.id}">Assign Task</button>
+          <button class="btn small danger" data-del-employee="${e.id}">Delete</button>
+        </td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No employees yet.</div>`}
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Leave Balances</h3>
+      <p style="color:var(--muted);font-size:.82rem;margin-top:0;">Days remaining per leave type. ${isAdmin() ? 'Use Manage Leave to set balances or log leave taken.' : 'Only management can set or adjust leave balances.'}</p>
+      ${state.employees.length ? `<table><thead><tr><th>Employee</th>${LEAVE_TYPES.map(([,l])=>`<th>${l}</th>`).join('')}${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+        ${state.employees.map(e=>`<tr><td>${e.name}</td>${LEAVE_TYPES.map(([t])=>`<td>${leaveBalanceFor(e.id,t)}</td>`).join('')}
+        ${isAdmin()?`<td><button class="btn small secondary" data-leave-employee="${e.id}">Manage Leave</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No employees yet.</div>`}
     </div>
     <div class="panel">
@@ -2429,34 +2793,84 @@ function renderPayroll(){
       </tbody></table>` : `<div class="empty">No tasks assigned yet.</div>`}
     </div>
     <div class="panel">
-      <h3 style="margin-top:0;">Recent payments</h3>
-      ${state.payrollPayments.length ? `<table><thead><tr><th>Date</th><th>Employee</th><th>Gross</th><th>Deductions</th><th>Net</th><th>Paid</th></tr></thead><tbody>
-        ${state.payrollPayments.slice(0,10).map(p=>`<tr><td>${p.pay_date}</td><td>${state.employees.find(e=>e.id===p.employee_id)?.name||'—'}</td><td>${fmt(p.gross)}</td><td>${fmt(p.deductions)}</td><td>${fmt(p.net)}</td><td>${p.paid?'Yes':'No'}</td></tr>`).join('')}
-      </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
+      <h3 style="margin-top:0;">Recent payslips</h3>
+      ${state.payrollPayments.length ? `<table><thead><tr><th>Date</th><th>Employee</th><th>Gross</th><th>PAYE</th><th>UIF (ee)</th><th>Net</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.payrollPayments.slice(0,10).map(p=>`<tr><td>${p.pay_date}</td><td>${state.employees.find(e=>e.id===p.employee_id)?.name||'—'}</td><td>${fmt(p.gross)}</td><td>${fmt(p.paye)}</td><td>${fmt(p.uif_employee)}</td><td>${fmt(p.net)}</td>
+        ${canEdit?`<td><button class="btn small secondary" data-view-payslip="${p.id}">View / Print</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No payslips recorded yet.</div>`}
     </div>
     ${canEdit ? `
     <div class="modal-backdrop hidden" id="employee-modal-backdrop"><div class="modal">
       <button class="close-x" id="employee-modal-close">✕</button>
-      <h2>Add Employee</h2>
+      <h2 id="employee-modal-title">Add Employee</h2>
       <form id="employee-form">
+        <input type="hidden" id="employee-edit-id">
         <div class="field"><label>Name</label><input type="text" id="employee-name" required></div>
         <div class="field"><label>Role</label><input type="text" id="employee-role"></div>
-        <div class="field"><label>Salary (R, per pay period)</label><input type="number" step="0.01" id="employee-salary" required></div>
-        <div class="field"><label>Pay frequency</label><select id="employee-frequency"><option value="monthly">Monthly</option><option value="weekly">Weekly</option><option value="biweekly">Biweekly</option></select></div>
+        <div class="row">
+          <div class="field"><label>Basic Salary (R, per pay period)</label><input type="number" step="0.01" id="employee-salary" required></div>
+          <div class="field"><label>Pay frequency</label><select id="employee-frequency"><option value="monthly">Monthly</option><option value="weekly">Weekly</option><option value="biweekly">Biweekly</option></select></div>
+        </div>
         <div class="field"><label>Start date</label><input type="date" id="employee-start"></div>
-        <div class="modal-actions"><button type="button" class="btn secondary" id="employee-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
+        <h3 style="margin-bottom:2px;">Tax &amp; statutory details</h3>
+        <p style="font-size:.78rem;color:var(--muted);margin-top:0;">Used to calculate PAYE, UIF, and this employee's IRP5.</p>
+        <div class="row">
+          <div class="field"><label>ID number</label><input type="text" id="employee-id-number"></div>
+          <div class="field"><label>Tax number</label><input type="text" id="employee-tax-number"></div>
+        </div>
+        <div class="field"><label>Date of birth</label><input type="date" id="employee-dob"></div>
+        <div class="field"><label>Travel allowance (R, per pay period)</label><input type="number" step="0.01" id="employee-travel-allowance" value="0"></div>
+        <div class="field"><label>Retirement fund contribution (R, per pay period)</label><input type="number" step="0.01" id="employee-retirement" value="0"></div>
+        <div class="row">
+          <div class="field"><label>Medical aid contribution (R, per pay period)</label><input type="number" step="0.01" id="employee-medical" value="0"></div>
+          <div class="field"><label>Medical aid dependants (excl. self)</label><input type="number" step="1" min="0" id="employee-medical-dependants" value="0"></div>
+        </div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="employee-cancel">Cancel</button><button type="submit" class="btn" id="employee-submit">Save</button></div>
       </form>
     </div></div>
-    <div class="modal-backdrop hidden" id="payment-modal-backdrop"><div class="modal">
-      <button class="close-x" id="payment-modal-close">✕</button>
-      <h2>Record Payment</h2>
-      <form id="payment-form">
-        <input type="hidden" id="payment-employee-id">
-        <div class="field"><label>Pay date</label><input type="date" id="payment-date" required></div>
-        <div class="field"><label>Gross (R)</label><input type="number" step="0.01" id="payment-gross" required></div>
-        <div class="field"><label>Deductions (R)</label><input type="number" step="0.01" id="payment-deductions" value="0"></div>
-        <div class="modal-actions"><button type="button" class="btn secondary" id="payment-cancel">Cancel</button><button type="submit" class="btn">Save Payment</button></div>
+    <div class="modal-backdrop hidden" id="payslip-modal-backdrop"><div class="modal">
+      <button class="close-x" id="payslip-modal-close">✕</button>
+      <h2 id="payslip-modal-title">Generate Payslip</h2>
+      <form id="payslip-setup-form">
+        <input type="hidden" id="payslip-employee-id">
+        <div class="field"><label>Pay date</label><input type="date" id="payslip-date" required></div>
+        <div class="row">
+          <div class="field"><label>Once-off bonus (R)</label><input type="number" step="0.01" id="payslip-bonus" value="0"></div>
+          <div class="field"><label>Once-off commission (R)</label><input type="number" step="0.01" id="payslip-commission" value="0"></div>
+        </div>
+        <div class="field"><label>Other deduction (R) — e.g. loan repayment</label><input type="number" step="0.01" id="payslip-other-deduction" value="0"></div>
+        <div class="field"><label>Other deduction note (optional)</label><input type="text" id="payslip-other-note"></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="payslip-setup-cancel">Cancel</button><button type="submit" class="btn">Preview Payslip</button></div>
       </form>
+      <div id="payslip-preview"></div>
+    </div></div>
+    <div class="modal-backdrop hidden" id="leave-modal-backdrop"><div class="modal">
+      <button class="close-x" id="leave-modal-close">✕</button>
+      <h2 id="leave-modal-title">Manage Leave</h2>
+      <input type="hidden" id="leave-employee-id">
+      <div id="leave-balances-editor"></div>
+      <h3>Log leave taken</h3>
+      <form id="leave-entry-form">
+        <div class="field"><label>Leave type</label><select id="leave-entry-type">
+          <option value="annual">Annual</option><option value="sick">Sick</option><option value="compassionate">Compassionate</option><option value="study">Study</option>
+        </select></div>
+        <div class="row">
+          <div class="field"><label>Start date</label><input type="date" id="leave-entry-start" required></div>
+          <div class="field"><label>End date</label><input type="date" id="leave-entry-end" required></div>
+        </div>
+        <div class="field"><label>Days</label><input type="number" step="0.5" id="leave-entry-days" required></div>
+        <div class="field"><label>Notes (optional)</label><input type="text" id="leave-entry-notes"></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="leave-cancel">Close</button><button type="submit" class="btn">Log Leave Taken</button></div>
+      </form>
+      <div id="leave-history"></div>
+    </div></div>
+    <div class="modal-backdrop hidden" id="irp5-modal-backdrop"><div class="modal">
+      <button class="close-x" id="irp5-modal-close">✕</button>
+      <h2>IRP5 Certificate</h2>
+      <input type="hidden" id="irp5-employee-id">
+      <div class="field"><label>Tax year</label><select id="irp5-tax-year"></select></div>
+      <div id="irp5-content"></div>
+      <div class="modal-actions"><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
     </div></div>
     <div class="modal-backdrop hidden" id="task-modal-backdrop"><div class="modal">
       <button class="close-x" id="task-modal-close">✕</button>
@@ -2470,22 +2884,76 @@ function renderPayroll(){
     </div></div>` : ''}
   `;
 }
+function resetEmployeeForm(){
+  document.getElementById('employee-edit-id').value = '';
+  document.getElementById('employee-name').value = '';
+  document.getElementById('employee-role').value = '';
+  document.getElementById('employee-salary').value = '';
+  document.getElementById('employee-frequency').value = 'monthly';
+  document.getElementById('employee-start').value = '';
+  document.getElementById('employee-id-number').value = '';
+  document.getElementById('employee-tax-number').value = '';
+  document.getElementById('employee-dob').value = '';
+  document.getElementById('employee-travel-allowance').value = '0';
+  document.getElementById('employee-retirement').value = '0';
+  document.getElementById('employee-medical').value = '0';
+  document.getElementById('employee-medical-dependants').value = '0';
+  document.getElementById('employee-modal-title').textContent = 'Add Employee';
+  document.getElementById('employee-submit').textContent = 'Save';
+}
 function attachPayrollHandlers(){
   const empBackdrop = document.getElementById('employee-modal-backdrop');
-  document.getElementById('add-employee-btn')?.addEventListener('click', ()=>empBackdrop.classList.remove('hidden'));
+  document.getElementById('add-employee-btn')?.addEventListener('click', ()=>{
+    resetEmployeeForm();
+    empBackdrop.classList.remove('hidden');
+  });
   document.getElementById('employee-cancel')?.addEventListener('click', ()=>empBackdrop.classList.add('hidden'));
   document.getElementById('employee-modal-close')?.addEventListener('click', ()=>empBackdrop.classList.add('hidden'));
+  document.querySelectorAll('[data-edit-employee]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const emp = state.employees.find(e=>e.id===btn.dataset.editEmployee);
+      if(!emp) return;
+      resetEmployeeForm();
+      document.getElementById('employee-edit-id').value = emp.id;
+      document.getElementById('employee-name').value = emp.name;
+      document.getElementById('employee-role').value = emp.role_title || '';
+      document.getElementById('employee-salary').value = emp.salary;
+      document.getElementById('employee-frequency').value = emp.pay_frequency;
+      document.getElementById('employee-start').value = emp.start_date || '';
+      document.getElementById('employee-id-number').value = emp.id_number || '';
+      document.getElementById('employee-tax-number').value = emp.tax_number || '';
+      document.getElementById('employee-dob').value = emp.date_of_birth || '';
+      document.getElementById('employee-travel-allowance').value = emp.travel_allowance || 0;
+      document.getElementById('employee-retirement').value = emp.retirement_contribution || 0;
+      document.getElementById('employee-medical').value = emp.medical_aid_contribution || 0;
+      document.getElementById('employee-medical-dependants').value = emp.medical_aid_dependants || 0;
+      document.getElementById('employee-modal-title').textContent = 'Edit ' + emp.name;
+      document.getElementById('employee-submit').textContent = 'Save Changes';
+      empBackdrop.classList.remove('hidden');
+    });
+  });
   document.getElementById('employee-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
-    const {error} = await sb.from('cc_employees').insert({
-      company_id: state.company.id,
+    const editId = document.getElementById('employee-edit-id').value;
+    const payload = {
       name: document.getElementById('employee-name').value.trim(),
       role_title: document.getElementById('employee-role').value.trim() || null,
       salary: parseFloat(document.getElementById('employee-salary').value),
       pay_frequency: document.getElementById('employee-frequency').value,
-      start_date: document.getElementById('employee-start').value || null
-    });
+      start_date: document.getElementById('employee-start').value || null,
+      id_number: document.getElementById('employee-id-number').value.trim() || null,
+      tax_number: document.getElementById('employee-tax-number').value.trim() || null,
+      date_of_birth: document.getElementById('employee-dob').value || null,
+      travel_allowance: parseFloat(document.getElementById('employee-travel-allowance').value) || 0,
+      retirement_contribution: parseFloat(document.getElementById('employee-retirement').value) || 0,
+      medical_aid_contribution: parseFloat(document.getElementById('employee-medical').value) || 0,
+      medical_aid_dependants: parseInt(document.getElementById('employee-medical-dependants').value, 10) || 0,
+    };
+    const {error} = editId
+      ? await sb.from('cc_employees').update(payload).eq('id', editId)
+      : await sb.from('cc_employees').insert(Object.assign({company_id: state.company.id}, payload));
     if(error){ toast(error.message); return; }
+    empBackdrop.classList.add('hidden');
     await refreshAll(); render(); toast('Saved.');
   });
   document.querySelectorAll('[data-del-employee]').forEach(btn=>{
@@ -2495,32 +2963,141 @@ function attachPayrollHandlers(){
       await refreshAll(); render();
     });
   });
-  const payBackdrop = document.getElementById('payment-modal-backdrop');
-  document.querySelectorAll('[data-pay-employee]').forEach(btn=>{
+
+  /* ---------- Payslips ---------- */
+  const payslipBackdrop = document.getElementById('payslip-modal-backdrop');
+  document.querySelectorAll('[data-payslip-employee]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
-      const emp = state.employees.find(e=>e.id===btn.dataset.payEmployee);
-      document.getElementById('payment-employee-id').value = emp.id;
-      document.getElementById('payment-date').value = new Date().toISOString().slice(0,10);
-      document.getElementById('payment-gross').value = emp.salary;
-      document.getElementById('payment-deductions').value = 0;
-      payBackdrop.classList.remove('hidden');
+      const emp = state.employees.find(e=>e.id===btn.dataset.payslipEmployee);
+      if(!emp) return;
+      document.getElementById('payslip-modal-title').textContent = 'Generate Payslip — ' + emp.name;
+      document.getElementById('payslip-employee-id').value = emp.id;
+      document.getElementById('payslip-date').value = new Date().toISOString().slice(0,10);
+      document.getElementById('payslip-bonus').value = 0;
+      document.getElementById('payslip-commission').value = 0;
+      document.getElementById('payslip-other-deduction').value = 0;
+      document.getElementById('payslip-other-note').value = '';
+      document.getElementById('payslip-setup-form').classList.remove('hidden');
+      document.getElementById('payslip-preview').innerHTML = '';
+      payslipBackdrop.classList.remove('hidden');
     });
   });
-  document.getElementById('payment-cancel')?.addEventListener('click', ()=>payBackdrop.classList.add('hidden'));
-  document.getElementById('payment-modal-close')?.addEventListener('click', ()=>payBackdrop.classList.add('hidden'));
-  document.getElementById('payment-form')?.addEventListener('submit', async (e)=>{
+  document.querySelectorAll('[data-view-payslip]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const row = state.payrollPayments.find(p=>p.id===btn.dataset.viewPayslip);
+      const emp = row && state.employees.find(e=>e.id===row.employee_id);
+      if(!row || !emp) return;
+      document.getElementById('payslip-modal-title').textContent = 'Payslip — ' + emp.name;
+      document.getElementById('payslip-setup-form').classList.add('hidden');
+      document.getElementById('payslip-preview').innerHTML = renderPayslipHTML(emp, normalizePayslipRow(row));
+      payslipBackdrop.classList.remove('hidden');
+    });
+  });
+  document.getElementById('payslip-setup-cancel')?.addEventListener('click', closePayslipModal);
+  document.getElementById('payslip-modal-close')?.addEventListener('click', closePayslipModal);
+  document.getElementById('payslip-setup-form')?.addEventListener('submit', (e)=>{
     e.preventDefault();
-    const gross = parseFloat(document.getElementById('payment-gross').value);
-    const deductions = parseFloat(document.getElementById('payment-deductions').value)||0;
-    const {error} = await sb.from('cc_payroll_payments').insert({
-      employee_id: document.getElementById('payment-employee-id').value,
-      company_id: state.company.id,
-      pay_date: document.getElementById('payment-date').value,
-      gross, deductions, net: gross - deductions, paid: true
+    const emp = state.employees.find(x=>x.id===document.getElementById('payslip-employee-id').value);
+    if(!emp) return;
+    const calc = computePayslip(emp, {
+      payDate: document.getElementById('payslip-date').value,
+      bonus: parseFloat(document.getElementById('payslip-bonus').value) || 0,
+      commission: parseFloat(document.getElementById('payslip-commission').value) || 0,
+      otherDeduction: parseFloat(document.getElementById('payslip-other-deduction').value) || 0,
+      otherDeductionNote: document.getElementById('payslip-other-note').value.trim() || null,
     });
-    if(error){ toast(error.message); return; }
-    await refreshAll(); render(); toast('Payment recorded.');
+    const html = renderPayslipHTML(emp, normalizePayslipCalc(calc))
+      + `<div class="modal-actions"><button type="button" class="btn secondary" id="payslip-print-btn">Print / Save PDF</button><button type="button" class="btn" id="payslip-save-btn">Save Payslip</button></div>`;
+    document.getElementById('payslip-preview').innerHTML = html;
+    document.getElementById('payslip-print-btn')?.addEventListener('click', ()=>window.print());
+    document.getElementById('payslip-save-btn')?.addEventListener('click', async ()=>{
+      const {error} = await sb.from('cc_payroll_payments').insert({
+        employee_id: emp.id, company_id: state.company.id, pay_date: calc.payDate,
+        gross: calc.grossEarnings, deductions: calc.totalDeductions, net: calc.netPay, paid: true,
+        basic_salary: calc.basic, travel_allowance: calc.travelAllowance, bonus: calc.bonus, commission: calc.commission,
+        retirement_deduction: calc.retirementContribution, medical_deduction: calc.medicalContribution,
+        paye: calc.paye, uif_employee: calc.uifEmployee, uif_employer: calc.uifEmployer,
+        medical_credit: calc.medicalCreditPeriod, other_deduction: calc.otherDeduction, other_deduction_note: calc.otherDeductionNote,
+      });
+      if(error){ toast(error.message); return; }
+      closePayslipModal();
+      await refreshAll(); render(); toast('Payslip saved.');
+    });
   });
+
+  /* ---------- Leave ---------- */
+  const leaveBackdrop = document.getElementById('leave-modal-backdrop');
+  document.querySelectorAll('[data-leave-employee]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const empId = btn.dataset.leaveEmployee;
+      const emp = state.employees.find(e=>e.id===empId);
+      if(!emp) return;
+      document.getElementById('leave-modal-title').textContent = 'Manage Leave — ' + emp.name;
+      document.getElementById('leave-employee-id').value = empId;
+      renderLeaveEditor(empId);
+      renderLeaveHistory(empId);
+      document.getElementById('leave-entry-start').value = '';
+      document.getElementById('leave-entry-end').value = '';
+      document.getElementById('leave-entry-days').value = '';
+      document.getElementById('leave-entry-notes').value = '';
+      leaveBackdrop.classList.remove('hidden');
+    });
+  });
+  document.getElementById('leave-cancel')?.addEventListener('click', ()=>leaveBackdrop.classList.add('hidden'));
+  document.getElementById('leave-modal-close')?.addEventListener('click', ()=>leaveBackdrop.classList.add('hidden'));
+  document.getElementById('leave-entry-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const empId = document.getElementById('leave-employee-id').value;
+    const leaveType = document.getElementById('leave-entry-type').value;
+    const days = parseFloat(document.getElementById('leave-entry-days').value) || 0;
+    if(days <= 0){ toast('Enter the number of days taken.'); return; }
+    const {error: entryError} = await sb.from('cc_leave_entries').insert({
+      company_id: state.company.id, employee_id: empId, leave_type: leaveType,
+      start_date: document.getElementById('leave-entry-start').value,
+      end_date: document.getElementById('leave-entry-end').value,
+      days, notes: document.getElementById('leave-entry-notes').value.trim() || null,
+      created_by: state.user.id,
+    });
+    if(entryError){ toast(entryError.message); return; }
+    const newBalance = Math.max(0, leaveBalanceFor(empId, leaveType) - days);
+    const {error: balError} = await sb.from('cc_leave_balances').upsert(
+      [{company_id: state.company.id, employee_id: empId, leave_type: leaveType, balance_days: newBalance}],
+      {onConflict: 'employee_id,leave_type'}
+    );
+    if(balError){ toast(balError.message); return; }
+    await refreshAll(); render();
+    document.getElementById('leave-modal-title').textContent = 'Manage Leave — ' + (state.employees.find(e=>e.id===empId)?.name || '');
+    document.getElementById('leave-employee-id').value = empId;
+    renderLeaveEditor(empId);
+    renderLeaveHistory(empId);
+    document.getElementById('leave-entry-start').value = '';
+    document.getElementById('leave-entry-end').value = '';
+    document.getElementById('leave-entry-days').value = '';
+    document.getElementById('leave-entry-notes').value = '';
+    leaveBackdrop.classList.remove('hidden');
+    toast('Leave logged.');
+  });
+
+  /* ---------- IRP5 ---------- */
+  const irp5Backdrop = document.getElementById('irp5-modal-backdrop');
+  document.querySelectorAll('[data-irp5-employee]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const empId = btn.dataset.irp5Employee;
+      const emp = state.employees.find(e=>e.id===empId);
+      if(!emp) return;
+      document.getElementById('irp5-employee-id').value = empId;
+      const current = currentTaxYearLabel();
+      const select = document.getElementById('irp5-tax-year');
+      select.innerHTML = [current, current-1, current-2].map(y=>`<option value="${y}">${taxYearBounds(y).label}</option>`).join('');
+      select.value = String(current);
+      renderIRP5For(empId, current);
+      irp5Backdrop.classList.remove('hidden');
+    });
+  });
+  document.getElementById('irp5-tax-year')?.addEventListener('change', (e)=>{
+    renderIRP5For(document.getElementById('irp5-employee-id').value, e.target.value);
+  });
+  document.getElementById('irp5-modal-close')?.addEventListener('click', ()=>irp5Backdrop.classList.add('hidden'));
 
   const taskBackdrop = document.getElementById('task-modal-backdrop');
   document.querySelectorAll('[data-task-employee]').forEach(btn=>{
