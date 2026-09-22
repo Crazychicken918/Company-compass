@@ -239,6 +239,8 @@
       <button data-view="vat"><span class="dot"></span>VAT</button>
       <button data-view="reports"><span class="dot"></span>Reports</button>
       <button data-view="scenarios"><span class="dot"></span>Scenarios</button>
+      <button data-view="bankfeed"><span class="dot"></span>Bank Feed</button>
+      <button data-view="activitylog"><span class="dot"></span>Activity Log</button>
       <button data-view="team"><span class="dot"></span>Team</button>
     </nav>
     <div class="legal-links sidebar-legal-links">
@@ -256,6 +258,11 @@
     <button class="btn secondary small" id="legal-tab-privacy" data-legal-tab="privacy">Privacy Policy</button>
   </div>
   <div id="legal-content" style="font-size:.86rem;line-height:1.6;color:var(--text);"></div>
+</div></div>
+
+<div class="modal-backdrop hidden" id="attachments-modal-backdrop"><div class="modal">
+  <button class="close-x" id="attachments-modal-close">✕</button>
+  <div id="attachments-modal-body"></div>
 </div></div>
 
 <div id="toast"></div>
@@ -631,6 +638,11 @@ let state = {
   payrollPayments: [],
   employeeTasks: [],
   taskNotes: [],       // notes logged against employee tasks (cc_task_notes)
+  attachments: [],     // receipts/documents attached to revenue/expense/invoice/supplier_invoice records (cc_attachments)
+  attachmentsCtx: null, // {entityType, entityId, label, canUpload} for the currently-open Attachments modal
+  auditLog: [],        // who created/updated/deleted what (cc_audit_log), newest first
+  bankTransactions: [], // imported bank statement lines awaiting reconciliation (cc_bank_transactions)
+  bankImportPreview: null, // {accountId, rows[]} staged from a CSV before the user confirms the import
   taskDetailId: null,  // task id currently open in the Task Detail modal, or null = closed
   leaveBalances: [],   // one row per employee per leave type (annual/sick/compassionate/study)
   leaveEntries: [],    // audit log of leave taken
@@ -681,7 +693,7 @@ const ALL_VIEWS = [
   ['dashboard','Dashboard'], ['revenue','Revenue'], ['expenses','Expenses'], ['assets','Assets'],
   ['liabilities','Liabilities'], ['supplierinvoices','Supplier Invoices'], ['clients','Clients'],
   ['invoices','Invoices'], ['creditnotes','Credit Notes'], ['payroll','Payroll'], ['tasks','Tasks'],
-  ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['team','Team'],
+  ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'],
 ];
 // Owner/admin/viewer always see every tab. A staff member sees every tab UNLESS an admin has
 // explicitly restricted them to a specific list (m.permissions.tabs) via the Team page — so
@@ -844,6 +856,9 @@ document.getElementById('legal-tab-privacy')?.addEventListener('click', ()=>open
 document.getElementById('legal-modal-close')?.addEventListener('click', ()=>{
   document.getElementById('legal-modal-backdrop').classList.add('hidden');
 });
+document.getElementById('attachments-modal-close')?.addEventListener('click', ()=>{
+  document.getElementById('attachments-modal-backdrop').classList.add('hidden');
+});
 
 
 sb.auth.onAuthStateChange((event, session)=>{
@@ -956,14 +971,15 @@ async function refreshAll(){
   state.scenarioCashflows = {};
   (cashflowsRes.data||[]).forEach(row=>{ (state.scenarioCashflows[row.scenario_id] = state.scenarioCashflows[row.scenario_id]||[]).push(row); });
 
-  const [suppliersRes, supplierInvoicesRes, supplierCreditNotesRes, invoicePaymentsRes, leaveBalancesRes, leaveEntriesRes, taskNotesRes] = await Promise.all([
+  const [suppliersRes, supplierInvoicesRes, supplierCreditNotesRes, invoicePaymentsRes, leaveBalancesRes, leaveEntriesRes, taskNotesRes, attachmentsRes] = await Promise.all([
     sb.from('cc_suppliers').select('*').eq('company_id', cid),
     sb.from('cc_supplier_invoices').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
     sb.from('cc_supplier_credit_notes').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
     sb.from('cc_invoice_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false}),
     sb.from('cc_leave_balances').select('*').eq('company_id', cid),
     sb.from('cc_leave_entries').select('*').eq('company_id', cid).order('start_date', {ascending:false}),
-    sb.from('cc_task_notes').select('*').eq('company_id', cid).order('created_at', {ascending:true})
+    sb.from('cc_task_notes').select('*').eq('company_id', cid).order('created_at', {ascending:true}),
+    sb.from('cc_attachments').select('*').eq('company_id', cid).order('created_at', {ascending:false})
   ]);
   state.suppliers = suppliersRes.data || [];
   state.supplierInvoices = supplierInvoicesRes.data || [];
@@ -972,6 +988,13 @@ async function refreshAll(){
   state.leaveBalances = leaveBalancesRes.data || [];
   state.leaveEntries = leaveEntriesRes.data || [];
   state.taskNotes = taskNotesRes.data || [];
+  state.attachments = attachmentsRes.data || [];
+  const [auditLogRes, bankTxRes] = await Promise.all([
+    sb.from('cc_audit_log').select('*').eq('company_id', cid).order('created_at', {ascending:false}).limit(300),
+    sb.from('cc_bank_transactions').select('*').eq('company_id', cid).order('tx_date', {ascending:false})
+  ]);
+  state.auditLog = auditLogRes.data || [];
+  state.bankTransactions = bankTxRes.data || [];
 
   const invoiceIds = state.invoices.map(i=>i.id);
   const creditNoteIds = state.creditNotes.map(cn=>cn.id);
@@ -993,6 +1016,516 @@ async function refreshAll(){
   state.supplierInvoicePayments = supInvPaymentsRes.data || [];
   state.creditNoteItems = {};
   (cnItemsRes.data||[]).forEach(it=>{ (state.creditNoteItems[it.credit_note_id] = state.creditNoteItems[it.credit_note_id]||[]).push(it); });
+}
+
+
+/* ========================= ATTACHMENTS (receipts/documents) ========================= */
+function attachmentCountFor(entityType, entityId){
+  return state.attachments.filter(a=>a.entity_type===entityType && a.entity_id===entityId).length;
+}
+function openAttachmentsModal(entityType, entityId, label, canUpload){
+  state.attachmentsCtx = { entityType, entityId, label, canUpload };
+  document.getElementById('attachments-modal-body').innerHTML = renderAttachmentsModalBody();
+  attachAttachmentsModalBodyHandlers();
+  document.getElementById('attachments-modal-backdrop').classList.remove('hidden');
+}
+function renderAttachmentsModalBody(){
+  const ctx = state.attachmentsCtx || {};
+  const items = state.attachments.filter(a=>a.entity_type===ctx.entityType && a.entity_id===ctx.entityId);
+  return `
+    <h2 style="margin-top:0;">Attachments${ctx.label ? ' — ' + ctx.label : ''}</h2>
+    <p style="font-size:.8rem;color:var(--muted);margin-top:-8px;">Receipts and supporting documents kept against this record.</p>
+    <div style="display:flex;flex-direction:column;gap:8px;max-height:260px;overflow-y:auto;margin:10px 0;">
+      ${items.length ? items.map(a=>`
+        <div class="panel" style="margin:0;padding:8px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <div>
+            <div style="font-size:.88rem;word-break:break-all;">${a.file_name}</div>
+            <div style="font-size:.74rem;color:var(--muted);">${a.uploaded_by||'Unknown'} · ${new Date(a.created_at).toLocaleString('en-ZA')}</div>
+          </div>
+          <div style="white-space:nowrap;">
+            <button type="button" class="btn small secondary" data-view-attachment="${a.id}">View</button>
+            ${isAdmin() ? `<button type="button" class="btn small danger" data-del-attachment="${a.id}">Delete</button>` : ''}
+          </div>
+        </div>
+      `).join('') : '<div class="empty">No attachments yet.</div>'}
+    </div>
+    ${ctx.canUpload ? `
+    <form id="attachments-upload-form" style="display:flex;gap:8px;align-items:center;">
+      <input type="file" id="attachments-file-input" required style="flex:1;">
+      <button type="submit" class="btn small">Upload</button>
+    </form>` : `<p style="font-size:.76rem;color:var(--muted);">You don't have permission to add attachments here.</p>`}
+  `;
+}
+function attachAttachmentsModalBodyHandlers(){
+  document.getElementById('attachments-upload-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const ctx = state.attachmentsCtx || {};
+    const fileInput = document.getElementById('attachments-file-input');
+    const file = fileInput.files[0];
+    if(!file){ toast('Choose a file.'); return; }
+    const path = `${state.company.id}/${ctx.entityType}/${ctx.entityId}/${Date.now()}_${file.name}`;
+    const {error: upErr} = await sb.storage.from('documents').upload(path, file);
+    if(upErr){ toast(upErr.message); return; }
+    const {error: rowErr} = await sb.from('cc_attachments').insert({
+      company_id: state.company.id, entity_type: ctx.entityType, entity_id: ctx.entityId,
+      file_path: path, file_name: file.name, uploaded_by: state.user.email
+    });
+    if(rowErr){ toast(rowErr.message); return; }
+    const {data} = await sb.from('cc_attachments').select('*').eq('company_id', state.company.id).order('created_at', {ascending:false});
+    state.attachments = data || [];
+    document.getElementById('attachments-modal-body').innerHTML = renderAttachmentsModalBody();
+    attachAttachmentsModalBodyHandlers();
+    toast('Attachment uploaded.');
+  });
+  document.querySelectorAll('[data-view-attachment]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const a = state.attachments.find(x=>x.id===btn.dataset.viewAttachment);
+      if(!a) return;
+      const {data, error} = await sb.storage.from('documents').createSignedUrl(a.file_path, 300);
+      if(error || !data){ toast((error&&error.message)||'Could not open file.'); return; }
+      window.open(data.signedUrl, '_blank');
+    });
+  });
+  document.querySelectorAll('[data-del-attachment]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this attachment?')) return;
+      const a = state.attachments.find(x=>x.id===btn.dataset.delAttachment);
+      await sb.from('cc_attachments').delete().eq('id', btn.dataset.delAttachment);
+      if(a) await sb.storage.from('documents').remove([a.file_path]);
+      state.attachments = state.attachments.filter(x=>x.id!==btn.dataset.delAttachment);
+      document.getElementById('attachments-modal-body').innerHTML = renderAttachmentsModalBody();
+      attachAttachmentsModalBodyHandlers();
+      toast('Attachment deleted.');
+    });
+  });
+}
+function wireAttachmentButtons(canUpload){
+  document.querySelectorAll('[data-attachments]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const [entityType, entityId] = btn.dataset.attachments.split('|');
+      openAttachmentsModal(entityType, entityId, btn.dataset.attachmentsLabel || '', canUpload);
+    });
+  });
+}
+async function deleteAttachmentsForEntity(entityType, entityId){
+  const rows = state.attachments.filter(a=>a.entity_type===entityType && a.entity_id===entityId);
+  if(!rows.length) return;
+  const paths = rows.map(r=>r.file_path);
+  await sb.from('cc_attachments').delete().eq('entity_type', entityType).eq('entity_id', entityId);
+  if(paths.length) await sb.storage.from('documents').remove(paths);
+  state.attachments = state.attachments.filter(a=>!(a.entity_type===entityType && a.entity_id===entityId));
+}
+
+
+/* ========================= ACTIVITY LOG ========================= */
+async function logActivity(action, entityType, entityId, summary){
+  try {
+    await sb.from('cc_audit_log').insert({
+      company_id: state.company.id,
+      user_email: (state.user && state.user.email) || null,
+      action, entity_type: entityType, entity_id: entityId, summary
+    });
+  } catch(e){ /* best-effort — never block the underlying action if logging fails */ }
+}
+const AUDIT_ENTITY_LABELS = {
+  revenue:'Revenue', expense:'Expense', asset:'Asset', liability:'Liability',
+  invoice:'Invoice', supplier_invoice:'Supplier Invoice', credit_note:'Credit Note', supplier_credit_note:'Supplier Credit Note',
+};
+function renderActivityLog(){
+  if(!isAdmin()){
+    return `<h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-team);display:inline-block;"></span>Activity Log</h1>
+    <div class="panel"><p class="empty">The activity log is only visible to management.</p></div>`;
+  }
+  const rows = state.auditLog;
+  return `
+    <h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-team);display:inline-block;"></span>Activity Log</h1>
+    <p class="section-caption">Who created, changed, or deleted records in the books — most recent 300 entries.</p>
+    <div class="panel">
+      ${rows.length ? `<table><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Record</th><th>Details</th></tr></thead><tbody>
+        ${rows.map(r=>`<tr>
+          <td>${new Date(r.created_at).toLocaleString('en-ZA')}</td>
+          <td>${r.user_email||'Unknown'}</td>
+          <td><span class="status-pill status-${r.action==='delete'?'overdue':(r.action==='update'?'sent':'paid')}">${r.action}</span></td>
+          <td>${AUDIT_ENTITY_LABELS[r.entity_type]||r.entity_type}</td>
+          <td>${r.summary||''}</td>
+        </tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No activity recorded yet.</div>`}
+    </div>
+  `;
+}
+function attachActivityLogHandlers(){}
+
+/* ========================= BANK FEED (import + reconciliation) ========================= */
+function normalizeBankDate(s){
+  s = (s||'').trim();
+  if(!s) return '';
+  if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if(m){
+    const [, d, mo, y] = m;
+    return `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`;
+  }
+  return s;
+}
+function buildBankImportPreview(rawRows, dateCol, descCol, amountCol, flipSign){
+  return rawRows.slice(1).filter(r=>r.some(c=>(c||'').trim()!=='')).map(r=>{
+    const dateRaw = (r[dateCol]||'').trim();
+    const description = (r[descCol]||'').trim();
+    const amountRaw = (r[amountCol]||'').trim().replace(/[R,\s]/g,'');
+    let amount = parseFloat(amountRaw);
+    if(!isNaN(amount) && flipSign) amount = -amount;
+    const date = normalizeBankDate(dateRaw);
+    const dateOk = /^\d{4}-\d{2}-\d{2}$/.test(date);
+    const amountOk = amountRaw !== '' && !isNaN(amount);
+    const valid = dateOk && amountOk;
+    const reasons = [];
+    if(!dateOk) reasons.push('date not recognized (expected DD/MM/YYYY or YYYY-MM-DD)');
+    if(!amountOk) reasons.push('amount not a number');
+    return { date, description, amount, valid, reason: reasons.join('; ') };
+  });
+}
+function isDuplicateBankRow(row){
+  return state.bankTransactions.some(t=>t.tx_date===row.date && t.description===row.description && Math.abs(Number(t.amount)-row.amount)<0.005);
+}
+function suggestedMatchesFor(bankTx){
+  const absAmt = Math.abs(Number(bankTx.amount));
+  const wantType = Number(bankTx.amount) >= 0 ? 'revenue' : 'expense';
+  const txDate = new Date(bankTx.tx_date+'T00:00:00');
+  return state.entries.filter(e=>{
+    if(e.type !== wantType) return false;
+    if(Math.abs(Number(e.amount) - absAmt) > 0.01) return false;
+    if(isEntryAlreadyMatched(e.id, wantType)) return false;
+    const d = new Date(e.entry_date+'T00:00:00');
+    const diffDays = Math.abs((d - txDate) / 86400000);
+    return diffDays <= 10;
+  }).slice(0,5);
+}
+function isEntryAlreadyMatched(entryId, type){
+  return state.bankTransactions.some(t=>t.status==='matched' && t.matched_entry_type===type && t.matched_entry_id===entryId);
+}
+async function matchBankTransaction(txId, entryType, entryId){
+  const {error} = await sb.from('cc_bank_transactions').update({status:'matched', matched_entry_type:entryType, matched_entry_id:entryId}).eq('id', txId);
+  if(error){ toast(error.message); return; }
+  await refreshAll(); render(); toast('Matched.');
+}
+async function ignoreBankTransaction(txId){
+  const {error} = await sb.from('cc_bank_transactions').update({status:'ignored', matched_entry_type:null, matched_entry_id:null}).eq('id', txId);
+  if(error){ toast(error.message); return; }
+  await refreshAll(); render(); toast('Ignored.');
+}
+async function unmatchBankTransaction(txId){
+  const {error} = await sb.from('cc_bank_transactions').update({status:'unmatched', matched_entry_type:null, matched_entry_id:null}).eq('id', txId);
+  if(error){ toast(error.message); return; }
+  await refreshAll(); render();
+}
+async function createEntryFromBankTransaction(txId){
+  const tx = state.bankTransactions.find(t=>t.id===txId);
+  if(!tx) return;
+  const type = Number(tx.amount) >= 0 ? 'revenue' : 'expense';
+  const payload = {
+    company_id: state.company.id, type, description: tx.description || (type==='revenue'?'Bank deposit':'Bank payment'),
+    amount: Math.abs(Number(tx.amount)), entry_date: tx.tx_date, tags: ['bank-import'], vat_applicable: false,
+    is_recurring: false, recurrence_frequency: null, created_by: state.user.id,
+  };
+  if(type==='expense') payload.expense_category = 'operating';
+  const {data: savedEntry, error} = await sb.from('cc_entries').insert(payload).select().single();
+  if(error){ toast(error.message); return; }
+  await logActivity('create', type, savedEntry.id, `${payload.description} (${fmt(payload.amount)}) — from bank import`);
+  await matchBankTransaction(txId, type, savedEntry.id);
+}
+function bankTxEntryLabel(tx){
+  if(tx.status !== 'matched' || !tx.matched_entry_id) return '';
+  const e = state.entries.find(x=>x.id===tx.matched_entry_id);
+  return e ? `${e.description} (${fmt(e.amount)})` : 'linked entry no longer exists';
+}
+function renderBankFeed(){
+  const canEdit = isAdmin() || hasModule('revenue') || hasModule('expenses');
+  if(!canEdit){
+    return `<h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-team);display:inline-block;"></span>Bank Feed</h1>
+    <div class="panel"><p class="empty">You need Revenue or Expenses access to reconcile the bank feed.</p></div>`;
+  }
+  const unmatched = state.bankTransactions.filter(t=>t.status==='unmatched');
+  const resolved = state.bankTransactions.filter(t=>t.status!=='unmatched');
+  return `
+    <div class="section-header" style="--accent-c:var(--c-team);"><h1>Bank Feed</h1><button class="btn" id="bankfeed-import-btn">Import Bank Statement CSV</button></div>
+    <p class="section-caption">Import a bank statement export and match each line against what's already recorded, to catch what's missing or duplicated.</p>
+    <div class="grid"><div class="card"><h3>Unmatched lines</h3><div class="value">${unmatched.length}</div></div></div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Unmatched (${unmatched.length})</h3>
+      ${unmatched.length ? unmatched.map(t=>{
+        const suggestions = suggestedMatchesFor(t);
+        return `
+        <div class="panel" style="margin:0 0 10px;padding:10px 12px;border-top:3px solid ${Number(t.amount)>=0?'var(--c-revenue)':'var(--c-expenses)'};">
+          <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+            <div><strong>${t.tx_date}</strong> — ${t.description||'(no description)'}</div>
+            <div style="font-weight:600;">${fmt(Math.abs(Number(t.amount)))} ${Number(t.amount)>=0?'in':'out'}</div>
+          </div>
+          ${suggestions.length ? `
+          <div style="margin-top:8px;font-size:.82rem;color:var(--muted);">Suggested match${suggestions.length>1?'es':''}:</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;">
+            ${suggestions.map(e=>`<button type="button" class="btn small secondary" data-match-tx="${t.id}" data-match-entry-type="${e.type}" data-match-entry-id="${e.id}">${e.entry_date} · ${e.description} (${fmt(e.amount)})</button>`).join('')}
+          </div>` : `<div style="margin-top:8px;font-size:.82rem;color:var(--muted);">No matching entry found within 10 days.</div>`}
+          <div class="modal-actions" style="justify-content:flex-start;margin-top:8px;">
+            <button type="button" class="btn small" data-create-entry-from-tx="${t.id}">Create ${Number(t.amount)>=0?'revenue':'expense'} entry</button>
+            <button type="button" class="btn small secondary" data-ignore-tx="${t.id}">Ignore</button>
+          </div>
+        </div>`;
+      }).join('') : `<div class="empty">No unmatched bank lines. Import a statement to get started.</div>`}
+    </div>
+    <details class="collapsible">
+      <summary>Matched &amp; ignored (${resolved.length})</summary>
+      <div class="panel">
+        ${resolved.length ? `<table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Status</th><th>Linked to</th><th></th></tr></thead><tbody>
+          ${resolved.map(t=>`<tr>
+            <td>${t.tx_date}</td><td>${t.description||''}</td><td>${fmt(Math.abs(Number(t.amount)))} ${Number(t.amount)>=0?'in':'out'}</td>
+            <td><span class="status-pill status-${t.status==='matched'?'paid':'draft'}">${t.status}</span></td>
+            <td>${bankTxEntryLabel(t)}</td>
+            <td><button type="button" class="btn small secondary" data-unmatch-tx="${t.id}">${t.status==='matched'?'Unmatch':'Restore'}</button></td>
+          </tr>`).join('')}
+        </tbody></table>` : `<div class="empty">Nothing here yet.</div>`}
+      </div>
+    </details>
+    <div class="modal-backdrop hidden" id="bankfeed-import-modal-backdrop"><div class="modal" style="max-width:760px;">
+      <button class="close-x" id="bankfeed-import-modal-close">✕</button>
+      <h2>Import Bank Statement CSV</h2>
+      <p style="font-size:.82rem;color:var(--muted);">Export a CSV from your online banking (date, description and amount columns — most SA banks offer this) and upload it here. Pick which column is which below; amounts should be signed (positive = money in, negative = money out) — tick "Flip sign" if your file uses the opposite convention.</p>
+      <input type="file" id="bankfeed-file-input" accept=".csv,text/csv">
+      <div id="bankfeed-import-body" style="margin-top:12px;"></div>
+      <div class="modal-actions" style="justify-content:flex-start;">
+        <button type="button" class="btn" id="bankfeed-import-confirm" disabled>Import rows</button>
+      </div>
+    </div></div>
+  `;
+}
+function renderBankImportMapping(){
+  const p = state.bankImportPreview;
+  if(!p) return '';
+  const preview = buildBankImportPreview(p.rawRows, p.dateCol, p.descCol, p.amountCol, p.flipSign);
+  const newRows = preview.filter(r=>!isDuplicateBankRow(r));
+  const dupCount = preview.length - newRows.length;
+  const validCount = newRows.filter(r=>r.valid).length;
+  state.bankImportPreview.computed = { preview, newRows, validCount };
+  return `
+    <div class="row">
+      <div class="field"><label>Date column</label><select id="bankfeed-date-col">${p.headers.map((h,i)=>`<option value="${i}" ${i===p.dateCol?'selected':''}>${h||'(column '+(i+1)+')'}</option>`).join('')}</select></div>
+      <div class="field"><label>Description column</label><select id="bankfeed-desc-col">${p.headers.map((h,i)=>`<option value="${i}" ${i===p.descCol?'selected':''}>${h||'(column '+(i+1)+')'}</option>`).join('')}</select></div>
+      <div class="field"><label>Amount column</label><select id="bankfeed-amount-col">${p.headers.map((h,i)=>`<option value="${i}" ${i===p.amountCol?'selected':''}>${h||'(column '+(i+1)+')'}</option>`).join('')}</select></div>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="bankfeed-flip-sign" style="width:auto;" ${p.flipSign?'checked':''}> Flip sign (tick if money IN shows as negative in this file)</label>
+    <p style="font-size:.82rem;margin-top:8px;">${validCount} of ${preview.length} row${preview.length===1?'':'s'} look valid.${dupCount?` ${dupCount} already imported and will be skipped.`:''}</p>
+    <table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Status</th></tr></thead><tbody>
+      ${preview.slice(0,50).map(r=>{
+        const dup = isDuplicateBankRow(r);
+        return `<tr>
+        <td>${r.date||'—'}</td><td>${r.description||'—'}</td><td>${isNaN(r.amount)?'—':fmt(r.amount)}</td>
+        <td>${dup ? '<span class="status-pill status-draft">Duplicate</span>' : (r.valid ? '<span class="status-pill status-paid">OK</span>' : `<span class="status-pill status-overdue" title="${r.reason}">Skip — ${r.reason}</span>`)}</td>
+      </tr>`;}).join('')}
+    </tbody></table>
+  `;
+}
+function attachBankFeedHandlers(){
+  document.querySelectorAll('[data-match-tx]').forEach(btn=>{
+    btn.addEventListener('click', ()=>matchBankTransaction(btn.dataset.matchTx, btn.dataset.matchEntryType, btn.dataset.matchEntryId));
+  });
+  document.querySelectorAll('[data-create-entry-from-tx]').forEach(btn=>{
+    btn.addEventListener('click', ()=>createEntryFromBankTransaction(btn.dataset.createEntryFromTx));
+  });
+  document.querySelectorAll('[data-ignore-tx]').forEach(btn=>{
+    btn.addEventListener('click', ()=>ignoreBankTransaction(btn.dataset.ignoreTx));
+  });
+  document.querySelectorAll('[data-unmatch-tx]').forEach(btn=>{
+    btn.addEventListener('click', ()=>unmatchBankTransaction(btn.dataset.unmatchTx));
+  });
+  const importBackdrop = document.getElementById('bankfeed-import-modal-backdrop');
+  document.getElementById('bankfeed-import-btn')?.addEventListener('click', ()=>{
+    state.bankImportPreview = null;
+    document.getElementById('bankfeed-import-body').innerHTML = '';
+    document.getElementById('bankfeed-import-confirm').disabled = true;
+    document.getElementById('bankfeed-file-input').value = '';
+    importBackdrop.classList.remove('hidden');
+  });
+  document.getElementById('bankfeed-import-modal-close')?.addEventListener('click', ()=>importBackdrop.classList.add('hidden'));
+  document.getElementById('bankfeed-file-input')?.addEventListener('change', async (e)=>{
+    const file = e.target.files[0];
+    if(!file) return;
+    const text = await file.text();
+    const rawRows = parseCSV(text);
+    if(!rawRows.length){ toast('That file has no rows.'); return; }
+    const headers = rawRows[0];
+    const guess = (keywords) => { const i = headers.findIndex(h=>keywords.some(k=>(h||'').toLowerCase().includes(k))); return i>=0?i:0; };
+    state.bankImportPreview = {
+      rawRows, headers,
+      dateCol: guess(['date']), descCol: guess(['desc','narrat','detail']), amountCol: guess(['amount','value']),
+      flipSign: false,
+    };
+    renderBankImportBody();
+  });
+  function renderBankImportBody(){
+    document.getElementById('bankfeed-import-body').innerHTML = renderBankImportMapping();
+    document.getElementById('bankfeed-import-confirm').disabled = !(state.bankImportPreview && state.bankImportPreview.computed && state.bankImportPreview.computed.validCount > 0);
+    document.getElementById('bankfeed-date-col')?.addEventListener('change', (e)=>{ state.bankImportPreview.dateCol = Number(e.target.value); renderBankImportBody(); });
+    document.getElementById('bankfeed-desc-col')?.addEventListener('change', (e)=>{ state.bankImportPreview.descCol = Number(e.target.value); renderBankImportBody(); });
+    document.getElementById('bankfeed-amount-col')?.addEventListener('change', (e)=>{ state.bankImportPreview.amountCol = Number(e.target.value); renderBankImportBody(); });
+    document.getElementById('bankfeed-flip-sign')?.addEventListener('change', (e)=>{ state.bankImportPreview.flipSign = e.target.checked; renderBankImportBody(); });
+  }
+  document.getElementById('bankfeed-import-confirm')?.addEventListener('click', async ()=>{
+    const computed = state.bankImportPreview && state.bankImportPreview.computed;
+    if(!computed) return;
+    const rowsToImport = computed.newRows.filter(r=>r.valid);
+    if(!rowsToImport.length) return;
+    const payload = rowsToImport.map(r=>({
+      company_id: state.company.id, tx_date: r.date, description: r.description, amount: r.amount, status: 'unmatched'
+    }));
+    const {error} = await sb.from('cc_bank_transactions').insert(payload);
+    if(error){ toast(error.message); return; }
+    importBackdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast(`Imported ${payload.length} bank line${payload.length===1?'':'s'}.`);
+  });
+}
+
+
+/* ========================= CSV EXPORT / IMPORT ========================= */
+function csvEscape(v){
+  const s = v==null ? '' : String(v);
+  return /[",\n\r]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
+}
+function arrayToCSV(rows, columns){
+  const header = columns.map(c=>csvEscape(c.label)).join(',');
+  const lines = rows.map(r=>columns.map(c=> csvEscape(typeof c.key==='function' ? c.key(r) : r[c.key])).join(','));
+  return [header, ...lines].join('\r\n') + '\r\n';
+}
+function downloadCSV(text, filename){
+  const blob = new Blob([text], {type:'text/csv;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+const CSV_EXPORTS = {
+  revenue: { label:'Revenue', rows: ()=>state.entries.filter(e=>e.type==='revenue'), columns:[
+    {key:'entry_date',label:'Date'}, {key:'description',label:'Description'}, {key:'amount',label:'Amount'},
+    {key:r=>(r.tags||[]).join('; '),label:'Tags'}, {key:r=>r.vat_applicable?'Yes':'No',label:'VAT Inclusive'},
+    {key:r=>clientName(r.client_id),label:'Client'},
+  ]},
+  expenses: { label:'Expenses', rows: ()=>state.entries.filter(e=>e.type==='expense'), columns:[
+    {key:'entry_date',label:'Date'}, {key:'description',label:'Description'},
+    {key:r=>r.expense_category==='cost_of_sales'?'Cost of Sales':'Operating',label:'Category'},
+    {key:'amount',label:'Amount'}, {key:r=>(r.tags||[]).join('; '),label:'Tags'}, {key:r=>r.vat_applicable?'Yes':'No',label:'VAT Inclusive'},
+  ]},
+  assets: { label:'Assets', rows: ()=>state.assets, columns:[
+    {key:'description',label:'Description'}, {key:'category',label:'Category'}, {key:r=>r.is_current?'Current':'Fixed',label:'Type'},
+    {key:'value',label:'Value'}, {key:'purchase_date',label:'Purchase Date'}, {key:r=>r.depreciation_method||'',label:'Depreciation Method'},
+    {key:r=>r.accumulated_depreciation||0,label:'Accumulated Depreciation'},
+  ]},
+  liabilities: { label:'Liabilities', rows: ()=>state.liabilities, columns:[
+    {key:'description',label:'Description'}, {key:'type',label:'Type'}, {key:'amount',label:'Amount'},
+    {key:r=>r.interest_rate||'',label:'Interest Rate'}, {key:'due_date',label:'Due Date'}, {key:r=>r.is_current?'Current':'Non-current',label:'Classification'},
+  ]},
+  clients: { label:'Clients', rows: ()=>state.clients, columns:[
+    {key:'name',label:'Name'}, {key:r=>r.email||'',label:'Email'}, {key:r=>r.phone||'',label:'Phone'}, {key:r=>r.address||'',label:'Address'},
+  ]},
+  invoices: { label:'Invoices', rows: ()=>state.invoices, columns:[
+    {key:'invoice_number',label:'Number'}, {key:r=>clientName(r.client_id),label:'Client'}, {key:'issue_date',label:'Issue Date'},
+    {key:r=>r.due_date||'',label:'Due Date'}, {key:'status',label:'Status'}, {key:'approval_status',label:'Approval'},
+    {key:r=>fmt(docTotal(state.invoiceItems[r.id])),label:'Total'},
+  ]},
+  suppliers: { label:'Suppliers', rows: ()=>state.suppliers, columns:[
+    {key:'name',label:'Name'}, {key:r=>r.email||'',label:'Email'}, {key:r=>r.phone||'',label:'Phone'}, {key:r=>r.address||'',label:'Address'},
+  ]},
+  supplierinvoices: { label:'Supplier Invoices', rows: ()=>state.supplierInvoices, columns:[
+    {key:'bill_number',label:'Number'}, {key:r=>supplierName(r.supplier_id),label:'Supplier'}, {key:'issue_date',label:'Issue Date'},
+    {key:r=>r.due_date||'',label:'Due Date'}, {key:'approval_status',label:'Approval'}, {key:r=>fmt(billBalance(r).total),label:'Total'}, {key:r=>fmt(billBalance(r).balance),label:'Balance'},
+  ]},
+};
+function exportCSV(key){
+  const def = CSV_EXPORTS[key];
+  if(!def) return;
+  const csv = arrayToCSV(def.rows(), def.columns);
+  const companySlug = (state.company.name||'company').replace(/[^a-z0-9]+/gi,'_');
+  downloadCSV(csv, `${companySlug}_${key}_${todayIso()}.csv`);
+}
+
+/* ---- CSV import (Revenue / Expenses) ---- */
+function parseCSV(text){
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for(let i=0;i<text.length;i++){
+    const c = text[i];
+    if(inQuotes){
+      if(c === '"'){
+        if(text[i+1] === '"'){ field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else {
+      if(c === '"') inQuotes = true;
+      else if(c === ','){ row.push(field); field=''; }
+      else if(c === '\n' || c === '\r'){
+        if(c === '\r' && text[i+1] === '\n') i++;
+        row.push(field); field='';
+        if(row.length>1 || row[0]!=='') rows.push(row);
+        row = [];
+      } else field += c;
+    }
+  }
+  if(field !== '' || row.length){ row.push(field); rows.push(row); }
+  return rows;
+}
+function buildImportPreview(type, rawRows){
+  if(!rawRows.length) return [];
+  const header = rawRows[0].map(h=>(h||'').trim().toLowerCase());
+  const idx = {
+    date: header.findIndex(h=>h.includes('date')),
+    description: header.findIndex(h=>h.includes('desc')),
+    amount: header.findIndex(h=>h.includes('amount')),
+    tags: header.findIndex(h=>h.includes('tag')),
+    vat: header.findIndex(h=>h.includes('vat')),
+    category: header.findIndex(h=>h.includes('categ')),
+  };
+  return rawRows.slice(1).filter(r=>r.some(c=>(c||'').trim()!=='')).map(r=>{
+    const date = idx.date>=0 ? (r[idx.date]||'').trim() : '';
+    const description = idx.description>=0 ? (r[idx.description]||'').trim() : '';
+    const amountRaw = idx.amount>=0 ? (r[idx.amount]||'').trim() : '';
+    const amount = parseFloat(amountRaw.replace(/[R,\s]/g,''));
+    const tags = idx.tags>=0 ? (r[idx.tags]||'').split(';').map(t=>t.trim()).filter(Boolean) : [];
+    const vat = idx.vat>=0 ? /^y/i.test((r[idx.vat]||'').trim()) : false;
+    const category = idx.category>=0 ? (r[idx.category]||'').trim().toLowerCase() : '';
+    const dateOk = /^\d{4}-\d{2}-\d{2}$/.test(date);
+    const amountOk = amountRaw !== '' && !isNaN(amount);
+    const descOk = !!description;
+    const valid = dateOk && amountOk && descOk;
+    const reasons = [];
+    if(!dateOk) reasons.push('date must be YYYY-MM-DD');
+    if(!amountOk) reasons.push('amount must be a number');
+    if(!descOk) reasons.push('description required');
+    return { date, description, amount, tags, vat, category, valid, reason: reasons.join('; ') };
+  });
+}
+function importRowsToPayload(type, rows){
+  return rows.filter(r=>r.valid).map(r=>{
+    const p = {
+      company_id: state.company.id, type, description: r.description, amount: r.amount,
+      entry_date: r.date, tags: r.tags, vat_applicable: r.vat, is_recurring: false, recurrence_frequency: null,
+      created_by: state.user.id,
+    };
+    if(type==='expense') p.expense_category = (r.category === 'cost of sales' || r.category === 'cost_of_sales') ? 'cost_of_sales' : 'operating';
+    return p;
+  });
+}
+function renderImportPreviewTable(preview){
+  if(!preview.length) return '<div class="empty">No rows found in that file.</div>';
+  const shown = preview.slice(0,50);
+  const validCount = preview.filter(r=>r.valid).length;
+  return `
+    <p style="font-size:.82rem;">${validCount} of ${preview.length} row${preview.length===1?'':'s'} look valid.${preview.length>50?' Showing first 50.':''}</p>
+    <table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Status</th></tr></thead><tbody>
+      ${shown.map(r=>`<tr>
+        <td>${r.date||'—'}</td><td>${r.description||'—'}</td><td>${isNaN(r.amount)?'—':fmt(r.amount)}</td>
+        <td>${r.valid ? '<span class="status-pill status-paid">OK</span>' : `<span class="status-pill status-overdue" title="${r.reason}">Skip — ${r.reason}</span>`}</td>
+      </tr>`).join('')}
+    </tbody></table>
+  `;
 }
 
 /* ========================= NAV / RENDER ========================= */
@@ -1018,9 +1551,11 @@ function render(){
     case 'creditnotes': main.innerHTML = renderCreditNotes(); attachCreditNoteHandlers(); break;
     case 'payroll': main.innerHTML = renderPayroll(); attachPayrollHandlers(); break;
     case 'tasks': main.innerHTML = renderTasks(); attachTasksHandlers(); break;
-    case 'vat': main.innerHTML = renderVat(); break;
+    case 'vat': main.innerHTML = renderVat(); attachVatHandlers(); break;
     case 'reports': main.innerHTML = renderReports(); attachReportsHandlers(); break;
     case 'scenarios': main.innerHTML = renderScenarios(); attachScenarioHandlers(); break;
+    case 'activitylog': main.innerHTML = renderActivityLog(); attachActivityLogHandlers(); break;
+    case 'bankfeed': main.innerHTML = renderBankFeed(); attachBankFeedHandlers(); break;
     case 'team': main.innerHTML = renderTeam(); attachTeamHandlers(); break;
   }
 }
@@ -1069,6 +1604,33 @@ function vatFor(asOf){
   const vatPaid = state.entries.filter(e=>e.type==='expense' && e.vat_applicable && inRange(e))
     .reduce((s,e)=> s + Number(e.amount) - Number(e.amount)/(1+VAT_RATE), 0);
   return {vatCollected, vatPaid, vatPayable: vatCollected - vatPaid};
+}
+// VAT201 period scoping: SARS Category A periods end Jan/Mar/May/Jul/Sep/Nov, Category B end Feb/Apr/Jun/Aug/Oct/Dec.
+function vatPeriodsFor(category, count){
+  const endMonths = category === 'B' ? [1,3,5,7,9,11] : [0,2,4,6,8,10];
+  const today = new Date();
+  const list = [];
+  for(let y = today.getFullYear() - 1; y <= today.getFullYear() + 1; y++){
+    endMonths.forEach(em => {
+      const endDate = new Date(y, em+1, 0);
+      const startDate = new Date(y, em-1, 1);
+      list.push({ start: startDate.toISOString().slice(0,10), end: endDate.toISOString().slice(0,10), endDate });
+    });
+  }
+  list.sort((a,b)=> b.endDate - a.endDate);
+  const todayIsoVal = today.toISOString().slice(0,10);
+  return list.filter(p => p.start <= todayIsoVal).slice(0, count).map(p => ({
+    start: p.start, end: p.end,
+    label: `${new Date(p.start+'T00:00:00').toLocaleDateString('en-ZA',{month:'short',day:'numeric'})} – ${new Date(p.end+'T00:00:00').toLocaleDateString('en-ZA',{month:'short',day:'numeric',year:'numeric'})}`,
+  }));
+}
+function vatForPeriod(from, to){
+  const inRange = e => (!from || e.entry_date >= from) && (!to || e.entry_date <= to);
+  const vatCollected = round2(state.entries.filter(e=>e.type==='revenue' && e.vat_applicable && inRange(e))
+    .reduce((s,e)=> s + Number(e.amount) - Number(e.amount)/(1+VAT_RATE), 0));
+  const vatPaid = round2(state.entries.filter(e=>e.type==='expense' && e.vat_applicable && inRange(e))
+    .reduce((s,e)=> s + Number(e.amount) - Number(e.amount)/(1+VAT_RATE), 0));
+  return {vatCollected, vatPaid, vatPayable: round2(vatCollected - vatPaid)};
 }
 
 /* ========================= DASHBOARD ========================= */
@@ -1150,11 +1712,11 @@ function renderEntries(type){
   const rows = state.entries.filter(e=>e.type===type);
   const total = rows.reduce((s,e)=>s+Number(e.amount),0);
   return `
-    <div class="section-header" style="--accent-c:${accent};"><h1>${label}</h1>${canEdit ? `<button class="btn" id="add-entry-btn">+ Add ${type==='revenue'?'Revenue':'Expense'}</button>` : ''}</div>
+    <div class="section-header" style="--accent-c:${accent};"><h1>${label}</h1>${canEdit ? `<button class="btn" id="add-entry-btn">+ Add ${type==='revenue'?'Revenue':'Expense'}</button> <button class="btn secondary" id="import-csv-btn">Import CSV</button>` : ''}</div>
     <p class="section-caption">${type==='revenue' ? 'Money coming into the business.' : 'Money going out of the business.'}</p>
     <div class="grid"><div class="card" style="--accent-c:${accent};"><h3>Total ${label}</h3><div class="value">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${rows.length ? `<table><thead><tr><th>Date</th><th>Description</th>${type==='expense'?'<th>Category</th>':''}<th>Amount</th><th>Tags</th><th>VAT</th><th>Recurring</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+      ${rows.length ? `<table><thead><tr><th>Date</th><th>Description</th>${type==='expense'?'<th>Category</th>':''}<th>Amount</th><th>Tags</th><th>VAT</th><th>Recurring</th><th>Docs</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${rows.map(e=>`<tr>
           <td>${e.entry_date}</td>
           <td>${e.description}</td>
@@ -1163,12 +1725,30 @@ function renderEntries(type){
           <td>${(e.tags||[]).map(t=>`<span class="tag-pill">${t}</span>`).join('')}</td>
           <td>${e.vat_applicable?'Yes':'No'}</td>
           <td>${e.is_recurring ? (e.recurrence_frequency||'yes') : '—'}</td>
+          <td><button type="button" class="btn small secondary" data-attachments="${type}|${e.id}" data-attachments-label="${e.description}">${attachmentCountFor(type,e.id) ? attachmentCountFor(type,e.id)+' file'+(attachmentCountFor(type,e.id)>1?'s':'') : 'Attach'}</button></td>
           ${canEdit?`<td><button class="btn small danger" data-del-entry="${e.id}">Delete</button></td>`:''}
         </tr>`).join('')}
       </tbody></table>` : `<div class="empty">No ${label.toLowerCase()} recorded yet.</div>`}
     </div>
     ${canEdit ? entryModal(type) : ''}
+    ${canEdit ? importCsvModal(type, label) : ''}
   `;
+}
+
+function importCsvModal(type, label){
+  return `
+  <div class="modal-backdrop hidden" id="import-csv-modal-backdrop">
+    <div class="modal" style="max-width:720px;">
+      <button class="close-x" id="import-csv-modal-close">✕</button>
+      <h2>Import ${label} from CSV</h2>
+      <p style="font-size:.82rem;color:var(--muted);">Columns expected (any order, header row required): <strong>Date</strong> (YYYY-MM-DD), <strong>Description</strong>, <strong>Amount</strong>${type==='expense'?', <strong>Category</strong> (Operating or Cost of Sales, optional)':''}, <strong>Tags</strong> (optional, semicolon-separated), <strong>VAT Inclusive</strong> (optional, Yes/No). Use this for opening balances or historical transactions.</p>
+      <input type="file" id="import-csv-file-input" accept=".csv,text/csv">
+      <div id="import-csv-preview" style="margin-top:12px;"></div>
+      <div class="modal-actions" style="justify-content:flex-start;">
+        <button type="button" class="btn" id="import-csv-confirm" disabled>Import valid rows</button>
+      </div>
+    </div>
+  </div>`;
 }
 
 function entryModal(type){
@@ -1202,6 +1782,7 @@ function entryModal(type){
 }
 
 function attachEntryHandlers(type){
+  const canEdit = hasModule(type === 'revenue' ? 'revenue' : 'expenses');
   const addBtn = document.getElementById('add-entry-btn');
   const backdrop = document.getElementById('entry-modal-backdrop');
   if(addBtn){
@@ -1238,16 +1819,53 @@ function attachEntryHandlers(type){
     if(type==='expense'){
       payload.expense_category = document.getElementById('entry-expense-category').value;
     }
-    const {error} = await sb.from('cc_entries').insert(payload);
+    const {data: savedEntry, error} = await sb.from('cc_entries').insert(payload).select().single();
     if(error){ toast(error.message); return; }
+    await logActivity('create', type, savedEntry && savedEntry.id, `${payload.description} (${fmt(payload.amount)})`);
     await refreshAll(); render(); toast('Saved.');
   });
   document.querySelectorAll('[data-del-entry]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this entry?')) return;
+      const delEntry = state.entries.find(x=>x.id===btn.dataset.delEntry);
+      await deleteAttachmentsForEntity(type, btn.dataset.delEntry);
       await sb.from('cc_entries').delete().eq('id', btn.dataset.delEntry);
+      await logActivity('delete', type, btn.dataset.delEntry, delEntry ? `${delEntry.description} (${fmt(delEntry.amount)})` : '');
       await refreshAll(); render();
     });
+  });
+  wireAttachmentButtons(canEdit);
+  const importBackdrop = document.getElementById('import-csv-modal-backdrop');
+  document.getElementById('import-csv-btn')?.addEventListener('click', ()=>{
+    document.getElementById('import-csv-preview').innerHTML = '';
+    document.getElementById('import-csv-confirm').disabled = true;
+    document.getElementById('import-csv-file-input').value = '';
+    state.importPreviewRows = null;
+    importBackdrop.classList.remove('hidden');
+  });
+  document.getElementById('import-csv-modal-close')?.addEventListener('click', ()=>importBackdrop.classList.add('hidden'));
+  document.getElementById('import-csv-file-input')?.addEventListener('change', async (e)=>{
+    const file = e.target.files[0];
+    if(!file) return;
+    const text = await file.text();
+    const rawRows = parseCSV(text);
+    const preview = buildImportPreview(type, rawRows);
+    state.importPreviewRows = preview;
+    const validCount = preview.filter(r=>r.valid).length;
+    document.getElementById('import-csv-preview').innerHTML = renderImportPreviewTable(preview);
+    const confirmBtn = document.getElementById('import-csv-confirm');
+    confirmBtn.disabled = validCount === 0;
+    confirmBtn.textContent = `Import ${validCount} valid row${validCount===1?'':'s'}`;
+  });
+  document.getElementById('import-csv-confirm')?.addEventListener('click', async ()=>{
+    const payload = importRowsToPayload(type, state.importPreviewRows || []);
+    if(!payload.length) return;
+    const {error} = await sb.from('cc_entries').insert(payload);
+    if(error){ toast(error.message); return; }
+    await logActivity('create', type, null, `Bulk CSV import: ${payload.length} rows`);
+    importBackdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast(`Imported ${payload.length} ${type==='revenue'?'revenue':'expense'} row${payload.length===1?'':'s'}.`);
   });
 }
 
@@ -1335,25 +1953,30 @@ function attachAssetHandlers(){
     e.preventDefault();
     const isFixed = document.getElementById('asset-type').value === 'fixed';
     const method = document.getElementById('asset-depr-method').value;
-    const {error} = await sb.from('cc_assets').insert({
+    const assetDescription = document.getElementById('asset-description').value.trim();
+    const assetValue = parseFloat(document.getElementById('asset-value').value);
+    const {data: savedAsset, error} = await sb.from('cc_assets').insert({
       company_id: state.company.id,
-      description: document.getElementById('asset-description').value.trim(),
+      description: assetDescription,
       category: document.getElementById('asset-category').value.trim() || null,
-      value: parseFloat(document.getElementById('asset-value').value),
+      value: assetValue,
       is_current: !isFixed,
       purchase_date: document.getElementById('asset-purchase-date').value || null,
       depreciation_method: isFixed ? method : null,
       useful_life_months: (isFixed && method==='straight_line') ? (parseInt(document.getElementById('asset-useful-life').value) || null) : null,
       depreciation_rate: (isFixed && method==='reducing_balance') ? (parseFloat(document.getElementById('asset-depr-rate').value) || null) : null,
       residual_value: isFixed ? (parseFloat(document.getElementById('asset-residual').value) || 0) : 0
-    });
+    }).select().single();
     if(error){ toast(error.message); return; }
+    await logActivity('create', 'asset', savedAsset && savedAsset.id, `${assetDescription} (${fmt(assetValue)})`);
     await refreshAll(); render(); toast('Saved.');
   });
   document.querySelectorAll('[data-del-asset]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this asset?')) return;
+      const delAsset = state.assets.find(a=>a.id===btn.dataset.delAsset);
       await sb.from('cc_assets').delete().eq('id', btn.dataset.delAsset);
+      await logActivity('delete', 'asset', btn.dataset.delAsset, delAsset ? `${delAsset.description} (${fmt(delAsset.value)})` : '');
       await refreshAll(); render();
     });
   });
@@ -1383,6 +2006,7 @@ function attachAssetHandlers(){
         last_depreciation_run: today
       }).eq('id', asset.id);
       if(assetError){ toast(assetError.message); return; }
+      await logActivity('update', 'asset', asset.id, `Depreciation run on ${asset.description}: ${fmt(amount)}`);
       await refreshAll(); render(); toast('Depreciation posted.');
     });
   });
@@ -1426,24 +2050,29 @@ function attachLiabilityHandlers(){
   document.getElementById('liability-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('liability-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
-    const {error} = await sb.from('cc_liabilities').insert({
+    const liabilityDescription = document.getElementById('liability-description').value.trim();
+    const liabilityAmount = parseFloat(document.getElementById('liability-amount').value);
+    const {data: savedLiability, error} = await sb.from('cc_liabilities').insert({
       company_id: state.company.id,
-      description: document.getElementById('liability-description').value.trim(),
+      description: liabilityDescription,
       type: document.getElementById('liability-type').value,
-      amount: parseFloat(document.getElementById('liability-amount').value),
+      amount: liabilityAmount,
       interest_rate: parseFloat(document.getElementById('liability-rate').value) || null,
       term_months: parseInt(document.getElementById('liability-term').value) || null,
       start_date: document.getElementById('liability-start').value || null,
       due_date: document.getElementById('liability-due').value || null,
       is_current: document.getElementById('liability-current').checked
-    });
+    }).select().single();
     if(error){ toast(error.message); return; }
+    await logActivity('create', 'liability', savedLiability && savedLiability.id, `${liabilityDescription} (${fmt(liabilityAmount)})`);
     await refreshAll(); render(); toast('Saved.');
   });
   document.querySelectorAll('[data-del-liability]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this liability?')) return;
+      const delLiability = state.liabilities.find(l=>l.id===btn.dataset.delLiability);
       await sb.from('cc_liabilities').delete().eq('id', btn.dataset.delLiability);
+      await logActivity('delete', 'liability', btn.dataset.delLiability, delLiability ? `${delLiability.description} (${fmt(delLiability.amount)})` : '');
       await refreshAll(); render();
     });
   });
@@ -1523,6 +2152,7 @@ function renderSupplierInvoices(){
           <td class="${bal.balance<=0.005?'positive':''}">${bal.balance<=0.005?'Paid':fmt(bal.balance)}</td>
           <td>
             <button class="btn small secondary" data-view-supplier-invoice="${b.id}">View</button>
+            <button type="button" class="btn small secondary" data-attachments="supplier_invoice|${b.id}" data-attachments-label="Bill ${b.bill_number}">${attachmentCountFor('supplier_invoice',b.id) ? attachmentCountFor('supplier_invoice',b.id)+' file'+(attachmentCountFor('supplier_invoice',b.id)>1?'s':'') : 'Attach'}</button>
             ${(canApprove() || (b.created_by===state.user.id && b.approval_status==='pending'))?`<button class="btn small danger" data-del-supplier-invoice="${b.id}">Delete</button>`:''}
           </td>
         </tr>`;}).join('')}
@@ -1696,14 +2326,18 @@ function attachSupplierInvoiceHandlers(){
     if(approvalStatus === 'approved'){
       await recognizeSupplierInvoiceExpense(bill, rows);
     }
+    await logActivity('create', 'supplier_invoice', bill.id, `${bill.bill_number}`);
     await refreshAll(); render();
     toast(approvalStatus === 'pending' ? 'Supplier invoice submitted for approval.' : 'Supplier invoice captured.');
   });
   document.querySelectorAll('[data-del-supplier-invoice]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this supplier invoice? Its linked expense entry will also be removed.')) return;
+      const delBill = state.supplierInvoices.find(x=>x.id===btn.dataset.delSupplierInvoice);
+      await deleteAttachmentsForEntity('supplier_invoice', btn.dataset.delSupplierInvoice);
       const {error} = await sb.from('cc_supplier_invoices').delete().eq('id', btn.dataset.delSupplierInvoice);
       if(error){ toast(error.message); return; }
+      await logActivity('delete', 'supplier_invoice', btn.dataset.delSupplierInvoice, delBill ? delBill.bill_number : '');
       await refreshAll(); render();
     });
   });
@@ -1753,14 +2387,17 @@ function attachSupplierInvoiceHandlers(){
       vat_applicable: tr.querySelector('.ii-vat').checked
     })).filter(r=>r.description);
     if(rows.length) await sb.from('cc_supplier_credit_note_items').insert(rows);
+    await logActivity('create', 'supplier_credit_note', note.id, `${note.credit_note_number}`);
     await refreshAll(); render();
     toast(approvalStatus === 'pending' ? 'Supplier credit note submitted for approval.' : 'Supplier credit note created.');
   });
   document.querySelectorAll('[data-del-supplier-creditnote]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this supplier credit note?')) return;
+      const delNote = state.supplierCreditNotes.find(x=>x.id===btn.dataset.delSupplierCreditnote);
       const {error} = await sb.from('cc_supplier_credit_notes').delete().eq('id', btn.dataset.delSupplierCreditnote);
       if(error){ toast(error.message); return; }
+      await logActivity('delete', 'supplier_credit_note', btn.dataset.delSupplierCreditnote, delNote ? delNote.credit_note_number : '');
       await refreshAll(); render();
     });
   });
@@ -1774,6 +2411,7 @@ function attachSupplierInvoiceHandlers(){
     const el = document.getElementById('scn-total-'+note.id);
     if(el) el.textContent = fmt(total);
   });
+  wireAttachmentButtons(canEdit);
 }
 async function openSupplierInvoiceView(billId){
   const bill = state.supplierInvoices.find(b=>b.id===billId);
@@ -2110,9 +2748,20 @@ function approvalPill(doc){
   if(doc.approval_status === 'rejected') return `<span class="status-pill status-rejected">rejected</span>`;
   return '';
 }
+function overdueReminderLink(i, today){
+  const isOverdue = i.approval_status === 'approved' && (i.status === 'sent' || i.status === 'overdue') && i.due_date && i.due_date < today;
+  if(!isOverdue) return '';
+  const client = state.clients.find(c=>c.id===i.client_id);
+  const total = docTotal(state.invoiceItems[i.id]);
+  const daysLate = Math.round((new Date(today) - new Date(i.due_date)) / 86400000);
+  const subject = encodeURIComponent(`Reminder: Invoice ${i.invoice_number} from ${state.company.name} is overdue`);
+  const body = encodeURIComponent(`Hi ${client ? client.name : ''},\n\nThis is a friendly reminder that invoice ${i.invoice_number} for ${fmt(total)} was due on ${i.due_date} (${daysLate} day${daysLate===1?'':'s'} ago) and appears to still be outstanding.\n\nPlease let us know if you have any questions, or if payment has already been made.\n\nThanks,\n${state.company.name}`);
+  return `<a class="btn small secondary" href="mailto:${client && client.email ? client.email : ''}?subject=${subject}&body=${body}" title="${client && client.email ? 'Email a payment reminder to '+client.email : 'No client email on file — opens a blank reminder email'}">✉ Remind</a>`;
+}
 function renderInvoices(){
   const canCreate = hasModule('invoices');
   const pendingCount = state.invoices.filter(i=>i.approval_status==='pending').length;
+  const today = todayIso();
   return `
     <div class="section-header" style="--accent-c:var(--c-invoices);"><h1>Invoices</h1>${canCreate ? `<button class="btn" id="add-invoice-btn">+ New Invoice</button>` : ''}</div>
     <p class="section-caption">Bills sent to clients — including recurring invoices and approval status.</p>
@@ -2126,6 +2775,8 @@ function renderInvoices(){
           <td id="inv-total-${i.id}">…</td>
           <td>
             <button class="btn small secondary" data-view-invoice="${i.id}">View</button>
+            <button type="button" class="btn small secondary" data-attachments="invoice|${i.id}" data-attachments-label="Invoice ${i.invoice_number}">${attachmentCountFor('invoice',i.id) ? attachmentCountFor('invoice',i.id)+' file'+(attachmentCountFor('invoice',i.id)>1?'s':'') : 'Attach'}</button>
+            ${overdueReminderLink(i, today)}
             ${canManageDoc(i)?`<button class="btn small danger" data-del-invoice="${i.id}">Delete</button>`:''}
           </td>
         </tr>`).join('')}
@@ -2220,6 +2871,7 @@ function uploadInvoiceLogo(file){
   });
 }
 function attachInvoiceHandlers(){
+  const canCreate = hasModule('invoices');
   const backdrop = document.getElementById('invoice-modal-backdrop');
   document.getElementById('add-invoice-btn')?.addEventListener('click', ()=>{
     document.getElementById('invoice-number').value = nextInvoiceNumber();
@@ -2273,6 +2925,7 @@ function attachInvoiceHandlers(){
     if(approvalStatus === 'approved'){
       await recognizeInvoiceRevenue(invoice, rows);
     }
+    await logActivity('create', 'invoice', invoice.id, `${invoice.invoice_number}`);
     const logoFile = document.getElementById('invoice-logo-input')?.files?.[0];
     if(logoFile) await uploadInvoiceLogo(logoFile);
     await refreshAll(); render();
@@ -2291,14 +2944,18 @@ function attachInvoiceHandlers(){
   document.querySelectorAll('[data-del-invoice]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this invoice?')) return;
+      const delInvoice = state.invoices.find(x=>x.id===btn.dataset.delInvoice);
+      await deleteAttachmentsForEntity('invoice', btn.dataset.delInvoice);
       const {error} = await sb.from('cc_invoices').delete().eq('id', btn.dataset.delInvoice);
       if(error){ toast(error.message); return; }
+      await logActivity('delete', 'invoice', btn.dataset.delInvoice, delInvoice ? delInvoice.invoice_number : '');
       await refreshAll(); render();
     });
   });
   document.querySelectorAll('[data-view-invoice]').forEach(btn=>{
     btn.addEventListener('click', ()=>openInvoiceView(btn.dataset.viewInvoice));
   });
+  wireAttachmentButtons(canCreate);
   // fill totals async
   state.invoices.forEach(async (inv)=>{
     const {data: items} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', inv.id);
@@ -2548,14 +3205,17 @@ function attachCreditNoteHandlers(){
       vat_applicable: tr.querySelector('.ii-vat').checked
     })).filter(r=>r.description);
     if(rows.length) await sb.from('cc_credit_note_items').insert(rows);
+    await logActivity('create', 'credit_note', note.id, `${note.credit_note_number}`);
     await refreshAll(); render();
     toast(approvalStatus === 'pending' ? 'Credit note submitted for approval.' : 'Credit note created.');
   });
   document.querySelectorAll('[data-del-creditnote]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this credit note?')) return;
+      const delNote = state.creditNotes.find(x=>x.id===btn.dataset.delCreditnote);
       const {error} = await sb.from('cc_credit_notes').delete().eq('id', btn.dataset.delCreditnote);
       if(error){ toast(error.message); return; }
+      await logActivity('delete', 'credit_note', btn.dataset.delCreditnote, delNote ? delNote.credit_note_number : '');
       await refreshAll(); render();
     });
   });
@@ -2641,6 +3301,7 @@ async function openCreditNoteView(noteId){
 
 /* ========================= PAYROLL ========================= */
 const LEAVE_TYPES = [['annual','Annual'],['sick','Sick'],['compassionate','Compassionate'],['study','Study']];
+const LOW_LEAVE_THRESHOLD = 2;
 function leaveBalanceFor(empId, type){
   const row = state.leaveBalances.find(b=>b.employee_id===empId && b.leave_type===type);
   return row ? Number(row.balance_days) : 0;
@@ -2966,9 +3627,14 @@ function renderPayroll(){
       <h3 style="margin-top:0;">Leave Balances</h3>
       <p style="color:var(--muted);font-size:.82rem;margin-top:0;">Days remaining per leave type. ${isAdmin() ? 'Use Manage Leave to set balances or log leave taken.' : 'Only management can set or adjust leave balances.'}</p>
       ${state.employees.length ? `<table><thead><tr><th>Employee</th>${LEAVE_TYPES.map(([,l])=>`<th>${l}</th>`).join('')}${isAdmin()?'<th></th>':''}</tr></thead><tbody>
-        ${state.employees.map(e=>`<tr><td>${e.name}</td>${LEAVE_TYPES.map(([t])=>`<td>${leaveBalanceFor(e.id,t)}</td>`).join('')}
+        ${state.employees.map(e=>`<tr><td>${e.name}</td>${LEAVE_TYPES.map(([t])=>{
+          const bal = leaveBalanceFor(e.id,t);
+          const low = bal <= LOW_LEAVE_THRESHOLD;
+          return low ? `<td style="color:var(--danger);font-weight:700;" title="Low balance — consider following up">${bal} ⚠</td>` : `<td>${bal}</td>`;
+        }).join('')}
         ${isAdmin()?`<td><button class="btn small secondary" data-leave-employee="${e.id}">Manage Leave</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No employees yet.</div>`}
+      <p style="color:var(--muted);font-size:.78rem;margin-bottom:0;">⚠ = ${LOW_LEAVE_THRESHOLD} day${LOW_LEAVE_THRESHOLD===1?'':'s'} or fewer remaining.</p>
     </div>
     <div class="panel">
       <h3 style="margin-top:0;">Tasks</h3>
@@ -4130,10 +4796,39 @@ function attachReportsHandlers(){
 
 /* ========================= VAT ========================= */
 function renderVat(){
-  const v = vatFor();
+  const category = state.company.vat_category || 'A';
+  const periods = vatPeriodsFor(category, 8);
+  if(weAreVatRegistered() && periods.length && (!state.vatPeriodStart || !state.vatPeriodEnd)){
+    state.vatPeriodStart = periods[0].start; state.vatPeriodEnd = periods[0].end;
+  }
+  const mode = state.vatViewMode || 'period';
+  const matchingPeriod = periods.find(p=>p.start===state.vatPeriodStart && p.end===state.vatPeriodEnd);
+  const v = (mode === 'alltime' || !weAreVatRegistered()) ? vatFor() : vatForPeriod(state.vatPeriodStart, state.vatPeriodEnd);
   return `
     <h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-vat);display:inline-block;"></span>VAT</h1>
     <p class="section-caption">VAT collected, VAT paid, and what's currently payable to SARS.</p>
+    ${weAreVatRegistered() ? `
+    <div class="panel">
+      <div class="row" style="align-items:flex-end;">
+        <div class="field"><label>View</label><select id="vat-view-mode">
+          <option value="period" ${mode==='period'?'selected':''}>A specific VAT201 period</option>
+          <option value="alltime" ${mode==='alltime'?'selected':''}>All-time running total</option>
+        </select></div>
+        <div class="field" id="vat-period-picker-field" style="${mode==='alltime'?'display:none;':''}"><label>VAT201 period</label><select id="vat-period-picker">
+          ${periods.map((p,i)=>`<option value="${p.start}|${p.end}" ${p.start===state.vatPeriodStart && p.end===state.vatPeriodEnd?'selected':''}>${p.label}${i===0?' (current)':''}</option>`).join('')}
+          <option value="custom" ${!matchingPeriod?'selected':''}>Custom range…</option>
+        </select></div>
+        <div class="field" id="vat-category-field" style="${mode==='alltime'?'display:none;':''}"><label>VAT category</label><select id="vat-category-picker" ${isAdmin()?'':'disabled'}>
+          <option value="A" ${category==='A'?'selected':''}>Category A (periods end Jan/Mar/May/Jul/Sep/Nov)</option>
+          <option value="B" ${category==='B'?'selected':''}>Category B (periods end Feb/Apr/Jun/Aug/Oct/Dec)</option>
+        </select></div>
+      </div>
+      ${(mode==='period' && !matchingPeriod) ? `
+      <div class="row">
+        <div class="field"><label>From</label><input type="date" id="vat-custom-from" value="${state.vatPeriodStart||''}"></div>
+        <div class="field"><label>To</label><input type="date" id="vat-custom-to" value="${state.vatPeriodEnd||''}"></div>
+      </div>` : ''}
+    </div>` : ''}
     <div class="grid">
       <div class="card" style="--accent-c:var(--c-vat);"><h3>VAT Collected</h3><div class="value">${fmt(v.vatCollected)}</div><div class="sub">From revenue marked VAT-inclusive</div></div>
       <div class="card"><h3>VAT Paid</h3><div class="value">${fmt(v.vatPaid)}</div><div class="sub">From expenses marked VAT-inclusive</div></div>
@@ -4141,13 +4836,40 @@ function renderVat(){
     </div>
     <div class="panel">
       ${weAreVatRegistered() ? `
-      <p style="color:var(--muted);font-size:.85rem;">Standard South African VAT rate of ${(VAT_RATE*100).toFixed(0)}% is used to back out VAT from amounts you've marked as VAT-inclusive on Revenue and Expense entries. This is a running total across all entries — not scoped to a specific 2-month VAT201 period yet. This is not tax advice; confirm figures with your accountant or SARS eFiling before submitting a return.</p>
+      <p style="color:var(--muted);font-size:.85rem;">Standard South African VAT rate of ${(VAT_RATE*100).toFixed(0)}% is used to back out VAT from amounts you've marked as VAT-inclusive on Revenue and Expense entries. ${mode==='alltime' ? 'Showing an all-time running total across every entry.' : (matchingPeriod ? `Scoped to the ${matchingPeriod.label} VAT201 period (${state.vatPeriodStart} to ${state.vatPeriodEnd}).` : `Scoped to your custom range (${state.vatPeriodStart||'…'} to ${state.vatPeriodEnd||'…'}).`)} This is not tax advice; confirm figures with your accountant or SARS eFiling before submitting a return.</p>
       ${state.company.vat_number ? `<p style="font-size:.85rem;">Registered VAT number: <strong>${state.company.vat_number}</strong></p>` : `<p style="font-size:.85rem;color:var(--muted);">No VAT number on file for this company yet.</p>`}
       ` : `
       <p style="font-size:.85rem;"><strong>This company is not registered for VAT.</strong> VAT can't be charged on customer invoices or credit notes, and the figures above should stay at zero. You can change this under Team → Company Details if that's changed.</p>
       `}
     </div>
   `;
+}
+async function updateVatCategory(cat){
+  const {error} = await sb.from('cc_companies').update({vat_category: cat}).eq('id', state.company.id);
+  if(error){ toast(error.message); return; }
+  state.company.vat_category = cat;
+  state.vatPeriodStart = null; state.vatPeriodEnd = null;
+  render();
+}
+function attachVatHandlers(){
+  document.getElementById('vat-view-mode')?.addEventListener('change', (e)=>{
+    state.vatViewMode = e.target.value;
+    render();
+  });
+  document.getElementById('vat-category-picker')?.addEventListener('change', (e)=>{
+    updateVatCategory(e.target.value);
+  });
+  document.getElementById('vat-period-picker')?.addEventListener('change', (e)=>{
+    if(e.target.value === 'custom'){
+      state.vatPeriodStart = null; state.vatPeriodEnd = null;
+    } else {
+      const [start,end] = e.target.value.split('|');
+      state.vatPeriodStart = start; state.vatPeriodEnd = end;
+    }
+    render();
+  });
+  document.getElementById('vat-custom-from')?.addEventListener('change', (e)=>{ state.vatPeriodStart = e.target.value || null; render(); });
+  document.getElementById('vat-custom-to')?.addEventListener('change', (e)=>{ state.vatPeriodEnd = e.target.value || null; render(); });
 }
 
 /* ========================= TEAM ========================= */
@@ -4163,6 +4885,7 @@ function renderTeam(){
         <div class="field"><label>Company address (for tax invoices)</label><textarea id="company-address" rows="3" placeholder="Street, suburb, city, postal code">${state.company.address || ''}</textarea></div>
         <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-vat-registered" style="width:auto;" ${weAreVatRegistered()?'checked':''}> Registered for VAT</label>
         <div class="field" id="company-vat-number-field" style="${weAreVatRegistered()?'':'display:none;'}"><label>VAT number</label><input type="text" id="company-vat-number" value="${state.company.vat_number || ''}"></div>
+        <div class="field"><label>Company registration number (CIPC)</label><input type="text" id="company-registration-number" placeholder="e.g. 2019/123456/07" value="${state.company.registration_number || ''}"></div>
         <h3 style="margin-bottom:2px;">SARS statutory references</h3>
         <p style="font-size:.78rem;color:var(--muted);margin-top:0;">Required for the bulk IRP5 export to e@syFile Employer.</p>
         <div class="row">
@@ -4182,6 +4905,14 @@ function renderTeam(){
         </div>
         <div class="modal-actions" style="justify-content:flex-start;"><button type="submit" class="btn small">Save Company Details</button></div>
       </form>
+    </div>` : ''}
+    ${isAdmin() ? `
+    <div class="panel">
+      <h3 style="margin-top:0;">Data Export</h3>
+      <p style="color:var(--muted);font-size:.85rem;">Download your records as CSV — for backup, or to hand to your accountant.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;">
+        ${Object.entries(CSV_EXPORTS).map(([key,def])=>`<button type="button" class="btn small secondary" data-export-csv="${key}">${def.label}</button>`).join('')}
+      </div>
     </div>` : ''}
     <div class="panel">
       <h3 style="margin-top:0;">App access</h3>
@@ -4276,6 +5007,9 @@ function resetMemberForm(){
   toggleMemberTabsBox();
 }
 function attachTeamHandlers(){
+  document.querySelectorAll('[data-export-csv]').forEach(btn=>{
+    btn.addEventListener('click', ()=>exportCSV(btn.dataset.exportCsv));
+  });
   document.getElementById('company-vat-registered')?.addEventListener('change', (e)=>{
     document.getElementById('company-vat-number-field').style.display = e.target.checked ? '' : 'none';
   });
@@ -4284,6 +5018,7 @@ function attachTeamHandlers(){
     const address = document.getElementById('company-address').value.trim() || null;
     const vat_registered = document.getElementById('company-vat-registered').checked;
     const vat_number = vat_registered ? (document.getElementById('company-vat-number').value.trim() || null) : null;
+    const registration_number = document.getElementById('company-registration-number').value.trim() || null;
     const paye_reference_number = document.getElementById('company-paye-ref').value.trim() || null;
     const sdl_reference_number = document.getElementById('company-sdl-ref').value.trim() || null;
     const uif_reference_number = document.getElementById('company-uif-ref').value.trim() || null;
@@ -4292,12 +5027,12 @@ function attachTeamHandlers(){
     const contact_email = document.getElementById('company-contact-email').value.trim() || null;
     const contact_phone = document.getElementById('company-contact-phone').value.trim() || null;
     const {error} = await sb.from('cc_companies').update({
-      address, vat_registered, vat_number,
+      address, vat_registered, vat_number, registration_number,
       paye_reference_number, sdl_reference_number, uif_reference_number,
       contact_first_name, contact_surname, contact_email, contact_phone
     }).eq('id', state.company.id);
     if(error){ toast(error.message); return; }
-    Object.assign(state.company, { address, vat_registered, vat_number, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone });
+    Object.assign(state.company, { address, vat_registered, vat_number, registration_number, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone });
     render();
     toast('Company details saved.');
   });
