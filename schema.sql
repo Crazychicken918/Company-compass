@@ -849,3 +849,25 @@ create policy "own task status update" on cc_employee_tasks for update using (
 
 -- ---------- verify ----------
 select tablename, count(*) as policy_count from pg_policies where tablename in ('cc_task_notes','cc_employee_tasks') group by tablename order by tablename;
+
+-- ============ WAVE 26: bulk IRP5 export for SARS e@syFile Employer ============
+
+-- SARS statutory reference numbers + payroll contact person, needed on the e@syFile
+-- employer header block of the bulk IRP5 import CSV.
+alter table cc_companies add column if not exists paye_reference_number text;
+alter table cc_companies add column if not exists sdl_reference_number text;
+alter table cc_companies add column if not exists uif_reference_number text;
+alter table cc_companies add column if not exists contact_first_name text;
+alter table cc_companies add column if not exists contact_surname text;
+alter table cc_companies add column if not exists contact_email text;
+alter table cc_companies add column if not exists contact_phone text;
+
+-- Surname / first names split, needed for the employee identification fields on the
+-- IRP5 certificate block of the e@syFile import CSV (existing "name" field stays as-is
+-- for display elsewhere in the app).
+alter table cc_employees add column if not exists surname text;
+alter table cc_employees add column if not exists first_names text;
+
+-- ---------- verify ----------
+select column_name from information_schema.columns where table_name = 'cc_companies' and column_name in ('paye_reference_number','sdl_reference_number','uif_reference_number','contact_first_name','contact_surname','contact_email','contact_phone');
+select column_name from information_schema.columns where table_name = 'cc_employees' and column_name in ('surname','first_names');

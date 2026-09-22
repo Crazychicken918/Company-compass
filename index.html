@@ -2791,6 +2791,144 @@ function renderIRP5For(empId, taxYear){
   if(!emp) return;
   document.getElementById('irp5-content').innerHTML = renderIRP5HTML(emp, computeIRP5(empId, taxYear));
 }
+
+/* ========================= E@SYFILE BULK IRP5 EXPORT ========================= */
+function luhnValid(numStr){
+  const digits = String(numStr||'').replace(/\D/g,'');
+  if(!digits) return false;
+  let sum = 0, alt = false;
+  for(let i = digits.length - 1; i >= 0; i--){
+    let d = parseInt(digits[i], 10);
+    if(alt){ d *= 2; if(d > 9) d -= 9; }
+    sum += d;
+    alt = !alt;
+  }
+  return sum % 10 === 0;
+}
+function saIdChecksumValid(id){
+  const digits = String(id||'').replace(/\D/g,'');
+  if(digits.length !== 13) return false;
+  return luhnValid(digits);
+}
+function easyFileCompanyChecks(){
+  const c = state.company;
+  const stat = computeStatutorySummary();
+  const checks = [];
+  checks.push({label:'Company / trading name', pass: !!(c.name && c.name.trim()), reason: (c.name && c.name.trim()) ? '' : 'Company name is missing.'});
+  const payeOk = /^7\d{9}$/.test(String(c.paye_reference_number||'').trim());
+  checks.push({label:'PAYE reference number', pass: payeOk, reason: payeOk ? '' : 'Must be 10 digits starting with 7. Set it under Team → Company Details.'});
+  const needsSdl = !!(stat.sdl && stat.sdl.applicable);
+  const sdlOk = !needsSdl || !!(c.sdl_reference_number && c.sdl_reference_number.trim());
+  checks.push({label:'SDL reference number', pass: sdlOk, reason: sdlOk ? '' : 'Your projected payroll is over R500,000/year (SDL applies) — set the SDL reference under Team → Company Details.'});
+  const uifOk = !!(c.uif_reference_number && c.uif_reference_number.trim());
+  checks.push({label:'UIF reference number', pass: uifOk, reason: uifOk ? '' : 'Set it under Team → Company Details.'});
+  const contactNameOk = !!(c.contact_first_name && c.contact_first_name.trim() && c.contact_surname && c.contact_surname.trim());
+  checks.push({label:'Contact person name', pass: contactNameOk, reason: contactNameOk ? '' : 'Set a contact first name and surname under Team → Company Details.'});
+  const emailOk = !!(c.contact_email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c.contact_email.trim()));
+  checks.push({label:'Contact email', pass: emailOk, reason: emailOk ? '' : 'Set a valid contact email under Team → Company Details.'});
+  const phoneOk = !!(c.contact_phone && c.contact_phone.trim());
+  checks.push({label:'Contact phone', pass: phoneOk, reason: phoneOk ? '' : 'Set a contact phone number under Team → Company Details.'});
+  return checks;
+}
+function easyFileEmployeeChecks(emp){
+  const checks = [];
+  const surnameOk = !!(emp.surname && emp.surname.trim());
+  checks.push({label:'Surname', pass: surnameOk, reason: surnameOk ? '' : 'Add a surname under Payroll → Edit.'});
+  const firstOk = !!(emp.first_names && emp.first_names.trim());
+  checks.push({label:'First name(s)', pass: firstOk, reason: firstOk ? '' : 'Add first name(s) under Payroll → Edit.'});
+  const idOk = saIdChecksumValid(emp.id_number);
+  checks.push({label:'ID number', pass: idOk, reason: idOk ? '' : (emp.id_number ? 'ID number does not look valid (13 digits with a valid checksum).' : 'Add an ID number under Payroll → Edit.')});
+  const dobOk = !!emp.date_of_birth;
+  checks.push({label:'Date of birth', pass: dobOk, reason: dobOk ? '' : 'Add a date of birth under Payroll → Edit.'});
+  const taxOk = /^\d{10}$/.test(String(emp.tax_number||'').trim());
+  checks.push({label:'Income tax reference number', pass: taxOk, reason: taxOk ? '' : 'Must be 10 digits. Add it under Payroll → Edit.'});
+  return checks;
+}
+function easyFileReadiness(taxYearLabel){
+  const companyChecks = easyFileCompanyChecks();
+  const companyOk = companyChecks.every(c=>c.pass);
+  const employeeResults = state.employees
+    .map(emp => ({ emp, irp: computeIRP5(emp.id, taxYearLabel) }))
+    .filter(r => r.irp.count > 0)
+    .map(r => {
+      const checks = easyFileEmployeeChecks(r.emp);
+      return { emp: r.emp, irp: r.irp, checks, ok: checks.every(c=>c.pass) };
+    });
+  return {
+    companyChecks, companyOk, employeeResults,
+    readyCount: employeeResults.filter(r=>r.ok).length,
+    totalCount: employeeResults.length,
+  };
+}
+const EASYFILE_CENTS_CODES = new Set(['4101','4102','4115','4141','4142','4149','4116','4118','4120','6030','7002','7003','7004','7008']);
+function csvText(s){ return String(s==null?'':s).replace(/"/g,'""'); }
+function csvField(code, value){ return `${code},"${csvText(value)}"`; }
+function csvDate(d){ return d ? String(d).replace(/-/g,'') : ''; }
+function wholeRand(n){ return String(Math.round(Number(n)||0)); }
+function centsRand(n){ return String(Math.round((Number(n)||0)*100)); }
+function csvAmount(code, value){ return csvField(code, EASYFILE_CENTS_CODES.has(String(code)) ? centsRand(value) : wholeRand(value)); }
+function buildEasyFileCSV(taxYearLabel, employeeResults){
+  const c = state.company;
+  const lines = [];
+  lines.push(csvField(2010, c.name || ''));
+  lines.push(csvField(2020, (c.paye_reference_number||'').trim()));
+  if((c.sdl_reference_number||'').trim()) lines.push(csvField(2022, c.sdl_reference_number.trim()));
+  if((c.uif_reference_number||'').trim()) lines.push(csvField(2024, c.uif_reference_number.trim()));
+  lines.push(csvField(2025, c.contact_first_name || ''));
+  lines.push(csvField(2026, c.contact_phone || ''));
+  lines.push(csvField(2027, c.contact_email || ''));
+  lines.push(csvField(2030, String(taxYearLabel)));
+  lines.push(csvField(2036, c.contact_surname || ''));
+  employeeResults.forEach((r, idx) => {
+    const emp = r.emp, irp = r.irp;
+    lines.push(csvField(3010, String(idx+1).padStart(6,'0')));
+    lines.push(csvField(3020, 'A'));
+    lines.push(csvField(3030, emp.surname || ''));
+    lines.push(csvField(3040, emp.first_names || ''));
+    lines.push(csvField(3060, (emp.id_number||'').trim()));
+    lines.push(csvField(3080, csvDate(emp.date_of_birth)));
+    lines.push(csvField(3100, (emp.tax_number||'').trim()));
+    lines.push(csvAmount('3601', irp.income3601));
+    if(irp.bonus3605) lines.push(csvAmount('3605', irp.bonus3605));
+    if(irp.commission3606) lines.push(csvAmount('3606', irp.commission3606));
+    if(irp.travel3701) lines.push(csvAmount('3701', irp.travel3701));
+    if(irp.retirement4001) lines.push(csvAmount('4001', irp.retirement4001));
+    if(irp.medical4005) lines.push(csvAmount('4005', irp.medical4005));
+    if(irp.medicalCredit4116) lines.push(csvAmount('4116', irp.medicalCredit4116));
+    lines.push(csvAmount('4102', irp.paye4102));
+    lines.push(csvAmount('4141', irp.uif4141));
+  });
+  lines.push('9999');
+  return lines.join('\r\n') + '\r\n';
+}
+function downloadEasyFileCSV(text, filename){
+  const blob = new Blob([text], {type: 'text/csv;charset=ISO-8859-1'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+function renderEasyFileReadiness(readiness){
+  const c = readiness.companyChecks;
+  const rows = html => `<tr><td>${html.label}</td><td>${html.pass ? '<span class="status-pill status-paid">Pass</span>' : '<span class="status-pill status-overdue">Fail</span>'}</td><td style="color:var(--muted);font-size:.8rem;">${html.reason||''}</td></tr>`;
+  return `
+    <h3 style="margin-bottom:4px;">Company details</h3>
+    <table><thead><tr><th>Check</th><th>Result</th><th>Why</th></tr></thead><tbody>
+      ${c.map(rows).join('')}
+    </tbody></table>
+    <h3 style="margin-bottom:4px;margin-top:14px;">Employees (${readiness.readyCount} of ${readiness.totalCount} ready)</h3>
+    ${readiness.totalCount === 0 ? `<div class="empty">No employees have payslips recorded for this tax year yet — nothing to export.</div>` : `
+    <table><thead><tr><th>Employee</th><th>Result</th><th>Why</th></tr></thead><tbody>
+      ${readiness.employeeResults.map(r=>{
+        const failed = r.checks.filter(x=>!x.pass);
+        return `<tr><td>${r.emp.name}</td><td>${r.ok ? '<span class="status-pill status-paid">Ready</span>' : '<span class="status-pill status-overdue">Not ready</span>'}</td><td style="color:var(--muted);font-size:.8rem;">${failed.length ? failed.map(x=>x.label+': '+x.reason).join('; ') : 'All checks passed.'}</td></tr>`;
+      }).join('')}
+    </tbody></table>`}
+    ${state.employees.filter(e=>e.active).length !== readiness.totalCount ? `<p style="font-size:.76rem;color:var(--muted);margin-top:8px;">Employees with no payslips recorded in this tax year are skipped — they have nothing to certify.</p>` : ''}
+  `;
+}
+
 function renderPayroll(){
   const canEdit = hasModule('payroll');
   const totalPayroll = state.employees.filter(e=>e.active).reduce((s,e)=>s+Number(e.salary),0);
@@ -2805,6 +2943,12 @@ function renderPayroll(){
       <div class="card"><h3>SDL Payable</h3><div class="value">${stat.sdl.applicable ? fmt(stat.sdl.amount) : 'R0.00'}</div><div class="sub">${stat.sdl.applicable ? 'Projected annual payroll over R500,000' : 'Exempt — projected annual payroll is at or below R500,000'}</div></div>
     </div>
     <p style="color:var(--muted);font-size:.78rem;margin-top:-6px;">PAYE/UIF/SDL are estimates from each employee's recurring salary and allowances (once-off bonuses/commission aren't projected forward), using SARS 2027 tax year rates. Not tax advice — confirm with your accountant or SARS before filing.</p>
+    ${isAdmin() ? `
+    <div class="panel" style="border-top:3px solid var(--c-payroll);">
+      <h3 style="margin-top:0;">Bulk IRP5 Export (e@syFile)</h3>
+      <p style="color:var(--muted);font-size:.85rem;margin:0 0 10px;">Generate a CSV of every employee's IRP5 figures for SARS e@syFile Employer's "Import Payroll File" feature. Checks your company and employee details first and tells you exactly what's missing.</p>
+      <button class="btn" id="open-easyfile-btn">Check &amp; Export IRP5s</button>
+    </div>` : ''}
     <div class="panel">
       <h3 style="margin-top:0;">Employees</h3>
       ${state.employees.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Basic Salary</th><th>Frequency</th><th>Active</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
@@ -2850,6 +2994,10 @@ function renderPayroll(){
       <form id="employee-form">
         <input type="hidden" id="employee-edit-id">
         <div class="field"><label>Name</label><input type="text" id="employee-name" required></div>
+        <div class="row">
+          <div class="field"><label>First name(s) (for IRP5)</label><input type="text" id="employee-first-names"></div>
+          <div class="field"><label>Surname (for IRP5)</label><input type="text" id="employee-surname"></div>
+        </div>
         <div class="field"><label>Role</label><input type="text" id="employee-role"></div>
         <div class="row">
           <div class="field"><label>Basic Salary (R, per pay period)</label><input type="number" step="0.01" id="employee-salary" required></div>
@@ -2926,11 +3074,27 @@ function renderPayroll(){
         <div class="modal-actions"><button type="button" class="btn secondary" id="task-cancel">Cancel</button><button type="submit" class="btn">Save Task</button></div>
       </form>
     </div></div>` : ''}
+    ${isAdmin() ? `
+    <div class="modal-backdrop hidden" id="easyfile-modal-backdrop"><div class="modal" style="max-width:640px;">
+      <button class="close-x" id="easyfile-modal-close">✕</button>
+      <h2>Bulk IRP5 Export for e@syFile</h2>
+      <div class="field" style="max-width:320px;"><label>Tax year</label><select id="easyfile-tax-year"></select></div>
+      <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="easyfile-mark-test" style="width:auto;" checked> Mark this as a TEST run when importing into e@syFile</label>
+      <p style="font-size:.78rem;color:var(--muted);margin:2px 0 10px;">Recommended for your first import — e@syFile has a "Test Import" option that validates the file without affecting a live submission. Only switch to a live import once a test import has succeeded.</p>
+      <div id="easyfile-readiness"></div>
+      <div class="modal-actions" style="justify-content:flex-start;">
+        <button type="button" class="btn secondary" id="easyfile-recheck">Re-check</button>
+        <button type="button" class="btn" id="easyfile-download" disabled>Download e@syFile Import CSV</button>
+      </div>
+      <p style="font-size:.7rem;color:var(--muted);margin-top:10px;">This file covers the fields Company Compass calculates — income, bonus, commission, travel allowance, retirement &amp; medical aid contributions, PAYE and UIF — built to the SARS e@syFile import layout. It doesn't cover fringe benefits, share schemes, foreign income, or every field in the full BRS specification. Always run e@syFile's own import validation and review its result before relying on this for a real submission.</p>
+    </div></div>` : ''}
   `;
 }
 function resetEmployeeForm(){
   document.getElementById('employee-edit-id').value = '';
   document.getElementById('employee-name').value = '';
+  document.getElementById('employee-first-names').value = '';
+  document.getElementById('employee-surname').value = '';
   document.getElementById('employee-role').value = '';
   document.getElementById('employee-salary').value = '';
   document.getElementById('employee-frequency').value = 'monthly';
@@ -2960,6 +3124,8 @@ function attachPayrollHandlers(){
       resetEmployeeForm();
       document.getElementById('employee-edit-id').value = emp.id;
       document.getElementById('employee-name').value = emp.name;
+      document.getElementById('employee-first-names').value = emp.first_names || '';
+      document.getElementById('employee-surname').value = emp.surname || '';
       document.getElementById('employee-role').value = emp.role_title || '';
       document.getElementById('employee-salary').value = emp.salary;
       document.getElementById('employee-frequency').value = emp.pay_frequency;
@@ -2981,6 +3147,8 @@ function attachPayrollHandlers(){
     const editId = document.getElementById('employee-edit-id').value;
     const payload = {
       name: document.getElementById('employee-name').value.trim(),
+      first_names: document.getElementById('employee-first-names').value.trim() || null,
+      surname: document.getElementById('employee-surname').value.trim() || null,
       role_title: document.getElementById('employee-role').value.trim() || null,
       salary: parseFloat(document.getElementById('employee-salary').value),
       pay_frequency: document.getElementById('employee-frequency').value,
@@ -3178,6 +3346,35 @@ function attachPayrollHandlers(){
       await refreshAll(); render();
     });
   });
+
+  /* ---------- Bulk IRP5 Export (e@syFile) ---------- */
+  const easyfileBackdrop = document.getElementById('easyfile-modal-backdrop');
+  function runEasyFileCheck(){
+    const taxYear = document.getElementById('easyfile-tax-year').value;
+    const readiness = easyFileReadiness(taxYear);
+    document.getElementById('easyfile-readiness').innerHTML = renderEasyFileReadiness(readiness);
+    const dlBtn = document.getElementById('easyfile-download');
+    dlBtn.disabled = !(readiness.companyOk && readiness.totalCount > 0 && readiness.readyCount === readiness.totalCount);
+    dlBtn.onclick = () => {
+      const csv = buildEasyFileCSV(taxYear, readiness.employeeResults);
+      const isTest = document.getElementById('easyfile-mark-test').checked;
+      const fname = `easyfile_irp5_${taxYear}${isTest ? '_TEST' : ''}.csv`;
+      downloadEasyFileCSV(csv, fname);
+      toast('CSV downloaded — import it into e@syFile' + (isTest ? ' as a test import first.' : '.'));
+    };
+  }
+  document.getElementById('open-easyfile-btn')?.addEventListener('click', ()=>{
+    const current = currentTaxYearLabel();
+    const select = document.getElementById('easyfile-tax-year');
+    select.innerHTML = [current, current-1, current-2].map(y=>`<option value="${y}">${taxYearBounds(y).label}</option>`).join('');
+    select.value = String(current);
+    document.getElementById('easyfile-mark-test').checked = true;
+    runEasyFileCheck();
+    easyfileBackdrop.classList.remove('hidden');
+  });
+  document.getElementById('easyfile-tax-year')?.addEventListener('change', runEasyFileCheck);
+  document.getElementById('easyfile-recheck')?.addEventListener('click', runEasyFileCheck);
+  document.getElementById('easyfile-modal-close')?.addEventListener('click', ()=>easyfileBackdrop.classList.add('hidden'));
 }
 
 /* ========================= REPORTS (P&L / BALANCE SHEET / RATIOS) ========================= */
@@ -3966,6 +4163,23 @@ function renderTeam(){
         <div class="field"><label>Company address (for tax invoices)</label><textarea id="company-address" rows="3" placeholder="Street, suburb, city, postal code">${state.company.address || ''}</textarea></div>
         <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-vat-registered" style="width:auto;" ${weAreVatRegistered()?'checked':''}> Registered for VAT</label>
         <div class="field" id="company-vat-number-field" style="${weAreVatRegistered()?'':'display:none;'}"><label>VAT number</label><input type="text" id="company-vat-number" value="${state.company.vat_number || ''}"></div>
+        <h3 style="margin-bottom:2px;">SARS statutory references</h3>
+        <p style="font-size:.78rem;color:var(--muted);margin-top:0;">Required for the bulk IRP5 export to e@syFile Employer.</p>
+        <div class="row">
+          <div class="field"><label>PAYE reference number</label><input type="text" id="company-paye-ref" placeholder="10 digits, starts with 7" value="${state.company.paye_reference_number || ''}"></div>
+          <div class="field"><label>SDL reference number</label><input type="text" id="company-sdl-ref" placeholder="10 digits, starts with 7" value="${state.company.sdl_reference_number || ''}"></div>
+        </div>
+        <div class="field"><label>UIF reference number</label><input type="text" id="company-uif-ref" value="${state.company.uif_reference_number || ''}"></div>
+        <h3 style="margin-bottom:2px;">Payroll contact person</h3>
+        <p style="font-size:.78rem;color:var(--muted);margin-top:0;">The person SARS/e@syFile can contact about this submission.</p>
+        <div class="row">
+          <div class="field"><label>First name</label><input type="text" id="company-contact-first-name" value="${state.company.contact_first_name || ''}"></div>
+          <div class="field"><label>Surname</label><input type="text" id="company-contact-surname" value="${state.company.contact_surname || ''}"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Email</label><input type="email" id="company-contact-email" value="${state.company.contact_email || ''}"></div>
+          <div class="field"><label>Phone</label><input type="text" id="company-contact-phone" value="${state.company.contact_phone || ''}"></div>
+        </div>
         <div class="modal-actions" style="justify-content:flex-start;"><button type="submit" class="btn small">Save Company Details</button></div>
       </form>
     </div>` : ''}
@@ -4070,11 +4284,20 @@ function attachTeamHandlers(){
     const address = document.getElementById('company-address').value.trim() || null;
     const vat_registered = document.getElementById('company-vat-registered').checked;
     const vat_number = vat_registered ? (document.getElementById('company-vat-number').value.trim() || null) : null;
-    const {error} = await sb.from('cc_companies').update({ address, vat_registered, vat_number }).eq('id', state.company.id);
+    const paye_reference_number = document.getElementById('company-paye-ref').value.trim() || null;
+    const sdl_reference_number = document.getElementById('company-sdl-ref').value.trim() || null;
+    const uif_reference_number = document.getElementById('company-uif-ref').value.trim() || null;
+    const contact_first_name = document.getElementById('company-contact-first-name').value.trim() || null;
+    const contact_surname = document.getElementById('company-contact-surname').value.trim() || null;
+    const contact_email = document.getElementById('company-contact-email').value.trim() || null;
+    const contact_phone = document.getElementById('company-contact-phone').value.trim() || null;
+    const {error} = await sb.from('cc_companies').update({
+      address, vat_registered, vat_number,
+      paye_reference_number, sdl_reference_number, uif_reference_number,
+      contact_first_name, contact_surname, contact_email, contact_phone
+    }).eq('id', state.company.id);
     if(error){ toast(error.message); return; }
-    state.company.address = address;
-    state.company.vat_registered = vat_registered;
-    state.company.vat_number = vat_number;
+    Object.assign(state.company, { address, vat_registered, vat_number, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone });
     render();
     toast('Company details saved.');
   });
