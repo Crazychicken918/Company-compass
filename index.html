@@ -700,6 +700,8 @@ let state = {
   auditLog: [],        // who created/updated/deleted what (cc_audit_log), newest first
   bankTransactions: [], // imported bank statement lines awaiting reconciliation (cc_bank_transactions)
   bankImportPreview: null, // {accountId, rows[]} staged from a CSV before the user confirms the import
+  bankFindMatchOpenTx: null, // id of the unmatched bank line whose Find & Match panel is open, or null = none open
+  bankFindMatchQuery: '',    // current search text inside the open Find & Match panel
   taskDetailId: null,  // task id currently open in the Task Detail modal, or null = closed
   leaveBalances: [],   // one row per employee per leave type (annual/sick/compassionate/study)
   leaveEntries: [],    // audit log of leave taken
@@ -1188,6 +1190,30 @@ function attachAttachmentsModalBodyHandlers(){
     });
   });
 }
+// A single "Attach a document (optional)" file field, reused by every capture form so the
+// receipt/invoice/bill can be attached in the same step as capturing the record, instead of
+// needing a separate trip to the record's "Attach" button afterwards.
+function attachmentCaptureField(inputId){
+  return `<div class="field"><label>Attach a document (optional)</label><input type="file" id="${inputId}"><p style="font-size:.72rem;color:var(--muted);margin:2px 0 0;">Attach the receipt/invoice now, or add it later from the list.</p></div>`;
+}
+// Uploads whatever file (if any) is currently selected in the given file input, against the
+// entity that was just saved. Mirrors the upload logic in attachAttachmentsModalBodyHandlers()
+// so the two paths (capture-time vs. after-the-fact) stay byte-for-byte consistent. Best-effort:
+// the record itself is already saved by the time this runs, so a failure here only toasts and
+// leaves the record attachment-less rather than rolling anything back.
+async function uploadCapturedAttachment(inputId, entityType, entityId){
+  const input = document.getElementById(inputId);
+  const file = input && input.files && input.files[0];
+  if(!file) return;
+  const path = `${state.company.id}/${entityType}/${entityId}/${Date.now()}_${file.name}`;
+  const {error: upErr} = await sb.storage.from('documents').upload(path, file);
+  if(upErr){ toast('Saved, but the attachment failed to upload: ' + upErr.message); return; }
+  const {error: rowErr} = await sb.from('cc_attachments').insert({
+    company_id: state.company.id, entity_type: entityType, entity_id: entityId,
+    file_path: path, file_name: file.name, uploaded_by: state.user.email
+  });
+  if(rowErr){ toast('Saved, but the attachment failed to save: ' + rowErr.message); return; }
+}
 function wireAttachmentButtons(canUpload){
   document.querySelectorAll('[data-attachments]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
@@ -1281,24 +1307,64 @@ function buildBankImportPreview(rawRows, dateCol, descCol, amountCol, flipSign){
 function isDuplicateBankRow(row){
   return state.bankTransactions.some(t=>t.tx_date===row.date && t.description===row.description && Math.abs(Number(t.amount)-row.amount)<0.005);
 }
+// Returns normalized {type, id, date, description, amount} suggestions — 'revenue'/'expense'
+// entries within 10 days at the same amount (as before), plus, new in Wave 32, an outstanding
+// Invoice (money in) or Supplier Invoice (money out) whose remaining balance matches the bank
+// line, issued within the same 10-day window. Matching one of the latter also books a payment —
+// see matchBankTransaction().
 function suggestedMatchesFor(bankTx){
   const absAmt = Math.abs(Number(bankTx.amount));
-  const wantType = Number(bankTx.amount) >= 0 ? 'revenue' : 'expense';
+  const isIn = Number(bankTx.amount) >= 0;
+  const wantType = isIn ? 'revenue' : 'expense';
   const txDate = new Date(bankTx.tx_date+'T00:00:00');
-  return state.entries.filter(e=>{
+  const withinWindow = (dateStr)=>{
+    if(!dateStr) return false;
+    const d = new Date(dateStr+'T00:00:00');
+    return Math.abs((d - txDate) / 86400000) <= 10;
+  };
+  const entryMatches = state.entries.filter(e=>{
     if(e.type !== wantType) return false;
     if(Math.abs(Number(e.amount) - absAmt) > 0.01) return false;
     if(isEntryAlreadyMatched(e.id, wantType)) return false;
-    const d = new Date(e.entry_date+'T00:00:00');
-    const diffDays = Math.abs((d - txDate) / 86400000);
-    return diffDays <= 10;
-  }).slice(0,5);
+    return withinWindow(e.entry_date);
+  }).map(e=>({type: e.type, id: e.id, date: e.entry_date, description: e.description, amount: Number(e.amount)}));
+  const docMatches = isIn
+    ? outstandingInvoices()
+        .filter(x=>Math.abs(x.balance - absAmt) <= 0.01 && !isEntryAlreadyMatched(x.inv.id, 'invoice') && withinWindow(x.inv.issue_date))
+        .map(x=>({type:'invoice', id:x.inv.id, date:x.inv.issue_date, description:`Invoice ${x.inv.invoice_number} — ${clientName(x.inv.client_id)}`, amount:x.balance}))
+    : outstandingSupplierInvoices()
+        .filter(x=>Math.abs(x.balance - absAmt) <= 0.01 && !isEntryAlreadyMatched(x.bill.id, 'supplier_invoice') && withinWindow(x.bill.issue_date))
+        .map(x=>({type:'supplier_invoice', id:x.bill.id, date:x.bill.issue_date, description:`Bill ${x.bill.bill_number} — ${supplierName(x.bill.supplier_id)}`, amount:x.balance}));
+  return [...entryMatches, ...docMatches].slice(0,5);
 }
 function isEntryAlreadyMatched(entryId, type){
   return state.bankTransactions.some(t=>t.status==='matched' && t.matched_entry_type===type && t.matched_entry_id===entryId);
 }
+// Matching a bank line to an Invoice or Supplier Invoice also books a payment for that amount
+// (Xero-style: reconciling the bank line settles the invoice/bill), tracked via
+// cc_bank_transactions.linked_payment_id so unmatchBankTransaction() can reverse it cleanly.
 async function matchBankTransaction(txId, entryType, entryId){
-  const {error} = await sb.from('cc_bank_transactions').update({status:'matched', matched_entry_type:entryType, matched_entry_id:entryId}).eq('id', txId);
+  const tx = state.bankTransactions.find(t=>t.id===txId);
+  let linkedPaymentId = null;
+  if(tx && (entryType === 'invoice' || entryType === 'supplier_invoice')){
+    const amount = Math.abs(Number(tx.amount));
+    if(entryType === 'invoice'){
+      const {data: pay, error: payErr} = await sb.from('cc_invoice_payments').insert({
+        invoice_id: entryId, company_id: state.company.id, payment_date: tx.tx_date, amount,
+        notes: 'From bank reconciliation', created_by: state.user.id
+      }).select().single();
+      if(payErr){ toast(payErr.message); return; }
+      linkedPaymentId = pay && pay.id;
+    } else {
+      const {data: pay, error: payErr} = await sb.from('cc_supplier_invoice_payments').insert({
+        supplier_invoice_id: entryId, company_id: state.company.id, payment_date: tx.tx_date, amount,
+        notes: 'From bank reconciliation', created_by: state.user.id
+      }).select().single();
+      if(payErr){ toast(payErr.message); return; }
+      linkedPaymentId = pay && pay.id;
+    }
+  }
+  const {error} = await sb.from('cc_bank_transactions').update({status:'matched', matched_entry_type:entryType, matched_entry_id:entryId, linked_payment_id:linkedPaymentId}).eq('id', txId);
   if(error){ toast(error.message); return; }
   await refreshAll(); render(); toast('Matched.');
 }
@@ -1308,8 +1374,13 @@ async function ignoreBankTransaction(txId){
   await refreshAll(); render(); toast('Ignored.');
 }
 async function unmatchBankTransaction(txId){
-  const {error} = await sb.from('cc_bank_transactions').update({status:'unmatched', matched_entry_type:null, matched_entry_id:null}).eq('id', txId);
+  const tx = state.bankTransactions.find(t=>t.id===txId);
+  const {error} = await sb.from('cc_bank_transactions').update({status:'unmatched', matched_entry_type:null, matched_entry_id:null, linked_payment_id:null}).eq('id', txId);
   if(error){ toast(error.message); return; }
+  if(tx && tx.linked_payment_id){
+    if(tx.matched_entry_type === 'invoice') await sb.from('cc_invoice_payments').delete().eq('id', tx.linked_payment_id);
+    else if(tx.matched_entry_type === 'supplier_invoice') await sb.from('cc_supplier_invoice_payments').delete().eq('id', tx.linked_payment_id);
+  }
   await refreshAll(); render();
 }
 async function createEntryFromBankTransaction(txId){
@@ -1330,8 +1401,44 @@ async function createEntryFromBankTransaction(txId){
 }
 function bankTxEntryLabel(tx){
   if(tx.status !== 'matched' || !tx.matched_entry_id) return '';
+  if(tx.matched_entry_type === 'invoice'){
+    const inv = state.invoices.find(x=>x.id===tx.matched_entry_id);
+    return inv ? `Invoice ${inv.invoice_number} (${fmt(Math.abs(Number(tx.amount)))})` : 'linked invoice no longer exists';
+  }
+  if(tx.matched_entry_type === 'supplier_invoice'){
+    const bill = state.supplierInvoices.find(x=>x.id===tx.matched_entry_id);
+    return bill ? `Bill ${bill.bill_number} (${fmt(Math.abs(Number(tx.amount)))})` : 'linked bill no longer exists';
+  }
   const e = state.entries.find(x=>x.id===tx.matched_entry_id);
   return e ? `${e.description} (${fmt(e.amount)})` : 'linked entry no longer exists';
+}
+// A searchable list of outstanding invoices (money in) or bills (money out) for one unmatched
+// bank line, each row ending in an "OK" button — matching what the user described as Xero's
+// bank-reconciliation "Find & Match" flow, styled with Company Compass's own panel/table look.
+function renderFindMatchPanel(tx){
+  return `
+  <div class="panel" style="margin:8px 0 0;padding:10px 12px;background:var(--panel2);">
+    <input type="text" data-find-match-search="${tx.id}" placeholder="Search ${Number(tx.amount)>=0?'invoices by number or client':'bills by number or supplier'}…" value="${state.bankFindMatchQuery||''}">
+    <div id="find-match-results-${tx.id}" style="margin-top:8px;">${renderFindMatchResults(tx)}</div>
+  </div>`;
+}
+function renderFindMatchResults(tx){
+  const isIn = Number(tx.amount) >= 0;
+  const query = (state.bankFindMatchQuery||'').trim().toLowerCase();
+  const candidates = isIn
+    ? outstandingInvoices()
+        .filter(x=>!isEntryAlreadyMatched(x.inv.id, 'invoice'))
+        .map(x=>({type:'invoice', id:x.inv.id, date:x.inv.issue_date, label:`Invoice ${x.inv.invoice_number} — ${clientName(x.inv.client_id)}`, balance:x.balance}))
+    : outstandingSupplierInvoices()
+        .filter(x=>!isEntryAlreadyMatched(x.bill.id, 'supplier_invoice'))
+        .map(x=>({type:'supplier_invoice', id:x.bill.id, date:x.bill.issue_date, label:`Bill ${x.bill.bill_number} — ${supplierName(x.bill.supplier_id)}`, balance:x.balance}));
+  const filtered = query ? candidates.filter(c=>c.label.toLowerCase().includes(query)) : candidates;
+  if(!filtered.length){
+    return `<div class="empty">No outstanding ${isIn?'invoices':'bills'}${query?' match that search':''}.</div>`;
+  }
+  return `<table><thead><tr><th>${isIn?'Invoice':'Bill'}</th><th>Date</th><th>Balance</th><th></th></tr></thead><tbody>
+    ${filtered.map(c=>`<tr><td>${c.label}</td><td>${c.date}</td><td>${fmt(c.balance)}</td><td><button type="button" class="btn small" data-find-match-ok="${tx.id}" data-find-match-type="${c.type}" data-find-match-id="${c.id}">OK</button></td></tr>`).join('')}
+  </tbody></table>`;
 }
 function renderBankFeed(){
   const canEdit = isAdmin() || hasModule('revenue') || hasModule('expenses');
@@ -1358,12 +1465,14 @@ function renderBankFeed(){
           ${suggestions.length ? `
           <div style="margin-top:8px;font-size:.82rem;color:var(--muted);">Suggested match${suggestions.length>1?'es':''}:</div>
           <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;">
-            ${suggestions.map(e=>`<button type="button" class="btn small secondary" data-match-tx="${t.id}" data-match-entry-type="${e.type}" data-match-entry-id="${e.id}">${e.entry_date} · ${e.description} (${fmt(e.amount)})</button>`).join('')}
+            ${suggestions.map(e=>`<button type="button" class="btn small secondary" data-match-tx="${t.id}" data-match-entry-type="${e.type}" data-match-entry-id="${e.id}">${e.date} · ${e.description} (${fmt(e.amount)})</button>`).join('')}
           </div>` : `<div style="margin-top:8px;font-size:.82rem;color:var(--muted);">No matching entry found within 10 days.</div>`}
           <div class="modal-actions" style="justify-content:flex-start;margin-top:8px;">
             <button type="button" class="btn small" data-create-entry-from-tx="${t.id}">Create ${Number(t.amount)>=0?'revenue':'expense'} entry</button>
+            <button type="button" class="btn small secondary" data-find-match-toggle="${t.id}">${state.bankFindMatchOpenTx===t.id?'Hide':'Find & Match'} ${Number(t.amount)>=0?'invoice':'bill'}</button>
             <button type="button" class="btn small secondary" data-ignore-tx="${t.id}">Ignore</button>
           </div>
+          ${state.bankFindMatchOpenTx===t.id ? renderFindMatchPanel(t) : ''}
         </div>`;
       }).join('') : `<div class="empty">No unmatched bank lines. Import a statement to get started.</div>`}
     </div>
@@ -1431,6 +1540,37 @@ function attachBankFeedHandlers(){
   document.querySelectorAll('[data-unmatch-tx]').forEach(btn=>{
     btn.addEventListener('click', ()=>unmatchBankTransaction(btn.dataset.unmatchTx));
   });
+  // Find & Match: toggle the panel, live-filter it as the user types (re-rendering only its own
+  // results container so the search input never loses focus), and confirm a row with OK.
+  function wireFindMatchOkButtons(txId){
+    document.querySelectorAll(`[data-find-match-ok="${txId}"]`).forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        await matchBankTransaction(txId, btn.dataset.findMatchType, btn.dataset.findMatchId);
+        state.bankFindMatchOpenTx = null;
+        state.bankFindMatchQuery = '';
+      });
+    });
+  }
+  document.querySelectorAll('[data-find-match-toggle]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const txId = btn.dataset.findMatchToggle;
+      state.bankFindMatchOpenTx = state.bankFindMatchOpenTx === txId ? null : txId;
+      state.bankFindMatchQuery = '';
+      render();
+    });
+  });
+  document.querySelectorAll('[data-find-match-search]').forEach(input=>{
+    input.addEventListener('input', (e)=>{
+      const txId = input.dataset.findMatchSearch;
+      state.bankFindMatchQuery = e.target.value;
+      const tx = state.bankTransactions.find(t=>t.id===txId);
+      const resultsEl = document.getElementById(`find-match-results-${txId}`);
+      if(!tx || !resultsEl) return;
+      resultsEl.innerHTML = renderFindMatchResults(tx);
+      wireFindMatchOkButtons(txId);
+    });
+  });
+  if(state.bankFindMatchOpenTx) wireFindMatchOkButtons(state.bankFindMatchOpenTx);
   const importBackdrop = document.getElementById('bankfeed-import-modal-backdrop');
   document.getElementById('bankfeed-import-btn')?.addEventListener('click', ()=>{
     state.bankImportPreview = null;
@@ -1874,6 +2014,7 @@ function entryModal(type){
         <div class="field hidden" id="entry-recurrence-field"><label>Frequency</label>
           <select id="entry-recurrence-frequency"><option value="weekly">Weekly</option><option value="monthly" selected>Monthly</option><option value="annually">Annually</option></select>
         </div>
+        ${attachmentCaptureField('entry-attachment-file')}
         <div class="modal-actions">
           <button type="button" class="btn secondary" id="entry-cancel">Cancel</button>
           <button type="submit" class="btn">Save</button>
@@ -1890,6 +2031,7 @@ function attachEntryHandlers(type){
   if(addBtn){
     addBtn.addEventListener('click', ()=>{
       document.getElementById('entry-date').value = new Date().toISOString().slice(0,10);
+      document.getElementById('entry-attachment-file').value = '';
       backdrop.classList.remove('hidden');
     });
   }
@@ -1925,6 +2067,7 @@ function attachEntryHandlers(type){
     const {data: savedEntry, error} = await sb.from('cc_entries').insert(payload).select().single();
     if(error){ toast(error.message); return; }
     await logActivity('create', type, savedEntry && savedEntry.id, `${payload.description} (${fmt(payload.amount)})`);
+    if(savedEntry) await uploadCapturedAttachment('entry-attachment-file', type, savedEntry.id);
     await refreshAll(); render(); toast('Saved.');
   });
   document.querySelectorAll('[data-del-entry]').forEach(btn=>{
@@ -2232,6 +2375,27 @@ function billBalance(bill){
   const paid = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===bill.id).reduce((s,p)=>s+Number(p.amount),0);
   return {total, paid, balance: Math.max(0, total - paid)};
 }
+// Customer-invoice equivalent of billBalance() — in ZAR, via docTotalZAR(), so a foreign-currency
+// invoice's balance is on the same footing as a ZAR bank statement line.
+function invoiceBalance(inv){
+  const total = docTotalZAR(inv, state.invoiceItems[inv.id]);
+  const paid = (state.invoicePayments||[]).filter(p=>p.invoice_id===inv.id).reduce((s,p)=>s+Number(p.amount),0);
+  return {total, paid, balance: Math.max(0, total - paid)};
+}
+// Approved invoices/bills that still have money owing on them — used both by the bank
+// reconciliation auto-suggestions and by the "Find & Match" search picker.
+function outstandingInvoices(){
+  return state.invoices
+    .filter(i=>i.approval_status==='approved')
+    .map(i=>({inv:i, ...invoiceBalance(i)}))
+    .filter(x=>x.balance > 0.005);
+}
+function outstandingSupplierInvoices(){
+  return state.supplierInvoices
+    .filter(b=>b.approval_status==='approved')
+    .map(b=>({bill:b, ...billBalance(b)}))
+    .filter(x=>x.balance > 0.005);
+}
 function renderSupplierInvoices(){
   const canEdit = hasModule('supplier_invoices');
   const pendingCount = state.supplierInvoices.filter(b=>b.approval_status==='pending').length;
@@ -2327,6 +2491,7 @@ function supplierInvoiceModal(){
         </table>
         <button type="button" class="btn secondary small" id="supplier-invoice-add-item" style="margin-top:8px;">+ Add line</button>
         <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="supplier-invoice-notes" rows="2"></textarea></div>
+        ${attachmentCaptureField('supplier-invoice-attachment-file')}
         <div class="modal-actions">
           <button type="button" class="btn secondary" id="supplier-invoice-cancel">Cancel</button>
           <button type="submit" class="btn">Save Supplier Invoice</button>
@@ -2357,6 +2522,7 @@ function supplierCreditNoteModal(){
         </table>
         <button type="button" class="btn secondary small" id="supplier-creditnote-add-item" style="margin-top:8px;">+ Add line</button>
         <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="supplier-creditnote-notes" rows="2"></textarea></div>
+        ${attachmentCaptureField('supplier-creditnote-attachment-file')}
         <div class="modal-actions">
           <button type="button" class="btn secondary" id="supplier-creditnote-cancel">Cancel</button>
           <button type="submit" class="btn">Save Credit Note</button>
@@ -2398,6 +2564,7 @@ function attachSupplierInvoiceHandlers(){
     document.getElementById('supplier-invoice-number').value = nextSupplierBillNumber();
     document.getElementById('supplier-invoice-issue-date').value = new Date().toISOString().slice(0,10);
     document.getElementById('supplier-invoice-items-body').innerHTML = invoiceItemRowWithStock();
+    document.getElementById('supplier-invoice-attachment-file').value = '';
     invBackdrop.classList.remove('hidden');
   });
   document.getElementById('supplier-invoice-cancel')?.addEventListener('click', ()=>invBackdrop.classList.add('hidden'));
@@ -2440,6 +2607,7 @@ function attachSupplierInvoiceHandlers(){
       await recognizeSupplierInvoiceExpense(bill, rows);
     }
     await logActivity('create', 'supplier_invoice', bill.id, `${bill.bill_number}`);
+    await uploadCapturedAttachment('supplier-invoice-attachment-file', 'supplier_invoice', bill.id);
     await refreshAll(); render();
     toast(approvalStatus === 'pending' ? 'Supplier invoice submitted for approval.' : 'Supplier invoice captured.');
   });
@@ -2465,6 +2633,7 @@ function attachSupplierInvoiceHandlers(){
     document.getElementById('supplier-creditnote-number').value = nextSupplierCreditNoteNumber();
     document.getElementById('supplier-creditnote-issue-date').value = new Date().toISOString().slice(0,10);
     document.getElementById('supplier-creditnote-items-body').innerHTML = invoiceItemRow();
+    document.getElementById('supplier-creditnote-attachment-file').value = '';
     cnBackdrop.classList.remove('hidden');
   });
   document.getElementById('supplier-creditnote-cancel')?.addEventListener('click', ()=>cnBackdrop.classList.add('hidden'));
@@ -2504,6 +2673,7 @@ function attachSupplierInvoiceHandlers(){
     })).filter(r=>r.description);
     if(rows.length) await sb.from('cc_supplier_credit_note_items').insert(rows);
     await logActivity('create', 'supplier_credit_note', note.id, `${note.credit_note_number}`);
+    await uploadCapturedAttachment('supplier-creditnote-attachment-file', 'supplier_credit_note', note.id);
     await refreshAll(); render();
     toast(approvalStatus === 'pending' ? 'Supplier credit note submitted for approval.' : 'Supplier credit note created.');
   });
@@ -3177,6 +3347,7 @@ function invoiceModal(){
         </table>
         <button type="button" class="btn secondary small" id="invoice-add-item" style="margin-top:8px;">+ Add line</button>
         <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="invoice-notes" rows="2"></textarea></div>
+        ${attachmentCaptureField('invoice-attachment-file')}
         <div class="modal-actions">
           <button type="button" class="btn secondary" id="invoice-cancel">Cancel</button>
           <button type="submit" class="btn">Save Invoice</button>
@@ -3252,6 +3423,7 @@ function attachInvoiceHandlers(){
     document.getElementById('invoice-currency').value = 'ZAR';
     document.getElementById('invoice-exchange-rate').value = '1';
     document.getElementById('invoice-exchange-rate-field').classList.add('hidden');
+    document.getElementById('invoice-attachment-file').value = '';
     backdrop.classList.remove('hidden');
   });
   document.getElementById('invoice-currency')?.addEventListener('change', (e)=>{
@@ -3312,6 +3484,7 @@ function attachInvoiceHandlers(){
     await logActivity('create', 'invoice', invoice.id, `${invoice.invoice_number}`);
     const logoFile = document.getElementById('invoice-logo-input')?.files?.[0];
     if(logoFile) await uploadInvoiceLogo(logoFile);
+    await uploadCapturedAttachment('invoice-attachment-file', 'invoice', invoice.id);
     await refreshAll(); render();
     toast(approvalStatus === 'pending' ? 'Invoice submitted for approval.' : 'Invoice created.');
   });
@@ -3703,13 +3876,14 @@ function renderCreditNotes(){
     <p class="section-caption">Refunds or corrections issued against an invoice.</p>
     ${pendingCount ? `<div class="panel" style="border-top:3px solid var(--warn);"><h3 style="margin-top:0;color:var(--warn);">Pending approval (${pendingCount})</h3><p style="color:var(--muted);font-size:.85rem;margin-bottom:0;">${canApprove() ? 'Open one below to approve or reject it.' : 'Waiting on management or an approver to review.'}</p></div>` : ''}
     <div class="panel">
-      ${state.creditNotes.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Against</th><th>Status</th><th>Approval</th><th>Total</th><th></th></tr></thead><tbody>
+      ${state.creditNotes.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Against</th><th>Status</th><th>Approval</th><th>Total</th><th>Docs</th><th></th></tr></thead><tbody>
         ${state.creditNotes.map(n=>`<tr>
           <td>${n.credit_note_number}</td><td>${clientName(n.client_id)}</td><td>${n.issue_date}</td>
           <td>${n.invoice_id ? (state.invoices.find(i=>i.id===n.invoice_id)?.invoice_number || '—') : '—'}</td>
           <td><span class="status-pill status-${n.status==='issued'?'issued':'draft'}">${n.status}</span></td>
           <td>${approvalPill(n)}</td>
           <td id="cn-total-${n.id}">…</td>
+          <td><button type="button" class="btn small secondary" data-attachments="credit_note|${n.id}" data-attachments-label="Credit Note ${n.credit_note_number}">${attachmentCountFor('credit_note',n.id) ? attachmentCountFor('credit_note',n.id)+' file'+(attachmentCountFor('credit_note',n.id)>1?'s':'') : 'Attach'}</button></td>
           <td>
             <button class="btn small secondary" data-view-creditnote="${n.id}">View</button>
             ${canManageDoc(n)?`<button class="btn small danger" data-del-creditnote="${n.id}">Delete</button>`:''}
@@ -3748,6 +3922,7 @@ function creditNoteModal(){
         </table>
         <button type="button" class="btn secondary small" id="creditnote-add-item" style="margin-top:8px;">+ Add line</button>
         <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="creditnote-notes" rows="2"></textarea></div>
+        ${attachmentCaptureField('creditnote-attachment-file')}
         <div class="modal-actions">
           <button type="button" class="btn secondary" id="creditnote-cancel">Cancel</button>
           <button type="submit" class="btn">Save Credit Note</button>
@@ -3766,6 +3941,7 @@ function attachCreditNoteHandlers(){
     document.getElementById('creditnote-currency').value = 'ZAR';
     document.getElementById('creditnote-exchange-rate').value = '1';
     document.getElementById('creditnote-exchange-rate-field').classList.add('hidden');
+    document.getElementById('creditnote-attachment-file').value = '';
     backdrop.classList.remove('hidden');
   });
   document.getElementById('creditnote-currency')?.addEventListener('change', (e)=>{
@@ -3812,6 +3988,7 @@ function attachCreditNoteHandlers(){
     })).filter(r=>r.description);
     if(rows.length) await sb.from('cc_credit_note_items').insert(rows);
     await logActivity('create', 'credit_note', note.id, `${note.credit_note_number}`);
+    await uploadCapturedAttachment('creditnote-attachment-file', 'credit_note', note.id);
     await refreshAll(); render();
     toast(approvalStatus === 'pending' ? 'Credit note submitted for approval.' : 'Credit note created.');
   });
@@ -3820,6 +3997,7 @@ function attachCreditNoteHandlers(){
       if(!confirm('Delete this credit note?')) return;
       const delNote = state.creditNotes.find(x=>x.id===btn.dataset.delCreditnote);
       if(delNote && isPeriodLocked(delNote.issue_date)){ toast(periodLockMessage()); return; }
+      await deleteAttachmentsForEntity('credit_note', btn.dataset.delCreditnote);
       const {error} = await sb.from('cc_credit_notes').delete().eq('id', btn.dataset.delCreditnote);
       if(error){ toast(error.message); return; }
       await logActivity('delete', 'credit_note', btn.dataset.delCreditnote, delNote ? delNote.credit_note_number : '');
@@ -3829,6 +4007,7 @@ function attachCreditNoteHandlers(){
   document.querySelectorAll('[data-view-creditnote]').forEach(btn=>{
     btn.addEventListener('click', ()=>openCreditNoteView(btn.dataset.viewCreditnote));
   });
+  wireAttachmentButtons(hasModule('credit_notes'));
   state.creditNotes.forEach(async (note)=>{
     const {data: items} = await sb.from('cc_credit_note_items').select('*').eq('credit_note_id', note.id);
     state.creditNoteItems[note.id] = items || [];
