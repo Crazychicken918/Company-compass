@@ -770,6 +770,7 @@ const ALL_VIEWS = [
 // existing staff members keep behaving exactly as before unless an admin opts them in to the
 // restriction (e.g. a floor assistant who should only ever see the Tasks tab).
 function canSeeTab(view){
+  if(view === 'stock' && !tracksInventory()) return false;
   const m = state.membership;
   if(!m) return false;
   if(m.role === 'owner' || m.role === 'admin' || m.role === 'viewer') return true;
@@ -2311,7 +2312,7 @@ function supplierInvoiceModal(){
           <option value="cost_of_sales">Cost of Sales (COS)</option>
         </select></div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th>Stock item</th><th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th>${tracksInventory() ? '<th>Stock item</th>' : ''}<th></th></tr></thead>
           <tbody id="supplier-invoice-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="supplier-invoice-add-item" style="margin-top:8px;">+ Add line</button>
@@ -2776,12 +2777,13 @@ function invoiceItemRowWithStock(vatEditable){
     ? `<input type="checkbox" class="ii-vat" checked style="width:auto;">`
     : `<input type="checkbox" class="ii-vat" disabled title="Not VAT registered" style="width:auto;">`;
   const stockOptions = state.stockItems.map(s=>`<option value="${s.id}">${s.name}</option>`).join('');
+  const stockCell = tracksInventory() ? `<td><select class="ii-stock"><option value="">— none —</option>${stockOptions}</select></td>` : '';
   return `<tr>
     <td><input type="text" class="ii-desc" required></td>
     <td><input type="number" class="ii-qty" value="1" step="0.01"></td>
     <td><input type="number" class="ii-price" value="0" step="0.01"></td>
     <td style="text-align:center;">${vatCell}</td>
-    <td><select class="ii-stock"><option value="">— none —</option>${stockOptions}</select></td>
+    ${stockCell}
     <td><button type="button" class="btn small danger ii-remove">✕</button></td>
   </tr>`;
 }
@@ -3160,7 +3162,7 @@ function invoiceModal(){
           <div class="field"><label>Stop after (optional)</label><input type="date" id="invoice-recurrence-end"></div>
         </div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th>Stock item</th><th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th>${tracksInventory() ? '<th>Stock item</th>' : ''}<th></th></tr></thead>
           <tbody id="invoice-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="invoice-add-item" style="margin-top:8px;">+ Add line</button>
@@ -3192,6 +3194,12 @@ function invoiceItemRow(vatEditable){
 // companies (registered before this field existed) keep behaving as before.
 function weAreVatRegistered(){
   return state.company.vat_registered !== false;
+}
+// Whether this business carries physical stock/inventory. Defaults to true so existing
+// companies (created before this setting existed) keep seeing Stock exactly as before —
+// a service provider with no products opts OUT via Team \u2192 Company Details.
+function tracksInventory(){
+  return !(state.company && state.company.tracks_inventory === false);
 }
 
 // Reads an image file and stores it as the company's invoice logo (a data URL on
@@ -5751,6 +5759,8 @@ function renderTeam(){
         <div class="field"><label>Company address (for tax invoices)</label><textarea id="company-address" rows="3" placeholder="Street, suburb, city, postal code">${state.company.address || ''}</textarea></div>
         <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-vat-registered" style="width:auto;" ${weAreVatRegistered()?'checked':''}> Registered for VAT</label>
         <div class="field" id="company-vat-number-field" style="${weAreVatRegistered()?'':'display:none;'}"><label>VAT number</label><input type="text" id="company-vat-number" value="${state.company.vat_number || ''}"></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-tracks-inventory" style="width:auto;" ${tracksInventory()?'checked':''}> This business carries stock/inventory</label>
+        <p style="font-size:.72rem;color:var(--muted);margin:-8px 0 0;">Uncheck this if you're a pure service provider with nothing to stock — it hides the Stock tab and the stock-item column on Invoice/Supplier Invoice line items app-wide.</p>
         <div class="field"><label>Company registration number (CIPC)</label><input type="text" id="company-registration-number" placeholder="e.g. 2019/123456/07" value="${state.company.registration_number || ''}"></div>
         <div class="field"><label>COIDA registration number (Compensation Fund)</label><input type="text" id="company-coida-registration-number" value="${state.company.coida_registration_number || ''}"></div>
         <div class="field"><label>Financial year-end</label><select id="company-financial-year-end-month"><option value="1" ${state.company.financial_year_end_month==1?'selected':''}>January</option><option value="2" ${state.company.financial_year_end_month==2?'selected':''}>February</option><option value="3" ${state.company.financial_year_end_month==3?'selected':''}>March</option><option value="4" ${state.company.financial_year_end_month==4?'selected':''}>April</option><option value="5" ${state.company.financial_year_end_month==5?'selected':''}>May</option><option value="6" ${state.company.financial_year_end_month==6?'selected':''}>June</option><option value="7" ${state.company.financial_year_end_month==7?'selected':''}>July</option><option value="8" ${state.company.financial_year_end_month==8?'selected':''}>August</option><option value="9" ${state.company.financial_year_end_month==9?'selected':''}>September</option><option value="10" ${state.company.financial_year_end_month==10?'selected':''}>October</option><option value="11" ${state.company.financial_year_end_month==11?'selected':''}>November</option><option value="12" ${state.company.financial_year_end_month==12?'selected':''}>December</option></select></div>
@@ -5830,7 +5840,7 @@ function renderTeam(){
           <label>Modules this staff member can add &amp; edit</label>
           <div class="perm-box">
             <label><input type="checkbox" class="member-module" value="revenue"> Revenue</label>
-          <label><input type="checkbox" class="member-module" value="stock"> Stock</label>
+          ${tracksInventory() ? `<label><input type="checkbox" class="member-module" value="stock"> Stock</label>` : ''}
           <label><input type="checkbox" class="member-module" value="expenses"> Expenses</label>
           <label><input type="checkbox" class="member-module" value="assets"> Assets</label>
           <label><input type="checkbox" class="member-module" value="liabilities"> Liabilities</label>
@@ -5855,7 +5865,7 @@ function renderTeam(){
         <div class="field hidden" id="member-tabs-restrict-field">
           <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="member-restrict-tabs" style="width:auto;"> Restrict which tabs this member can see</label>
           <div class="perm-box hidden" id="member-tabs-box">
-            ${ALL_VIEWS.map(([k,l])=>`<label><input type="checkbox" class="member-tab" value="${k}"> ${l}</label>`).join('')}
+            ${ALL_VIEWS.filter(([k])=>k!=='stock'||tracksInventory()).map(([k,l])=>`<label><input type="checkbox" class="member-tab" value="${k}"> ${l}</label>`).join('')}
           </div>
           <p style="font-size:.76rem;color:var(--muted);margin:4px 0 0;">Unchecked = this member sees every tab, same as today. Tick the box and pick tabs to limit them — e.g. Tasks only for a floor assistant.</p>
         </div>
@@ -5920,6 +5930,7 @@ function attachTeamHandlers(){
     const vat_registered = document.getElementById('company-vat-registered').checked;
     const vat_number = vat_registered ? (document.getElementById('company-vat-number').value.trim() || null) : null;
     const registration_number = document.getElementById('company-registration-number').value.trim() || null;
+    const tracks_inventory = document.getElementById('company-tracks-inventory').checked;
     const paye_reference_number = document.getElementById('company-paye-ref').value.trim() || null;
     const sdl_reference_number = document.getElementById('company-sdl-ref').value.trim() || null;
     const uif_reference_number = document.getElementById('company-uif-ref').value.trim() || null;
@@ -5934,10 +5945,11 @@ function attachTeamHandlers(){
       address, vat_registered, vat_number, registration_number,
       paye_reference_number, sdl_reference_number, uif_reference_number,
       contact_first_name, contact_surname, contact_email, contact_phone,
-      coida_registration_number, financial_year_end_month, official_interest_rate_pct
+      coida_registration_number, financial_year_end_month, official_interest_rate_pct,
+      tracks_inventory
     }).eq('id', state.company.id);
     if(error){ toast(error.message); return; }
-    Object.assign(state.company, { address, vat_registered, vat_number, registration_number, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone, coida_registration_number, financial_year_end_month, official_interest_rate_pct });
+    Object.assign(state.company, { address, vat_registered, vat_number, registration_number, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone, coida_registration_number, financial_year_end_month, official_interest_rate_pct, tracks_inventory });
     render();
     toast('Company details saved.');
   });
