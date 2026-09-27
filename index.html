@@ -16,6 +16,7 @@
     --c-liabilities:#f5a524; --c-clients:#a855f7; --c-invoices:#6366f1; --c-creditnotes:#ec4899;
     --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b; --c-reports:#1d4ed8;
     --c-scenarios:#059669; --c-supplierinvoices:#0ea5e9; --c-tasks:#7c3aed;
+    --c-quotes:#eab308; --c-stock:#84cc16;
     --grid-line: rgba(25,26,35,.03);
   }
   /* Dark mode: follows the OS setting by default; a manual toggle (data-theme)
@@ -110,6 +111,8 @@
   #sidebar nav button[data-view="team"]{--dot:var(--c-team);}
   #sidebar nav button[data-view="scenarios"]{--dot:var(--c-scenarios);}
   #sidebar nav button[data-view="supplierinvoices"]{--dot:var(--c-supplierinvoices);}
+  #sidebar nav button[data-view="quotes"]{--dot:var(--c-quotes);}
+  #sidebar nav button[data-view="stock"]{--dot:var(--c-stock);}
   #sidebar .logout{margin-top:10px;font-size:.8rem;color:var(--muted);background:none;border:none;text-align:left;padding:9px 10px;}
 
   #main{flex:1;padding:26px 32px;max-width:1100px;}
@@ -229,9 +232,11 @@
       <button data-view="revenue"><span class="dot"></span>Revenue</button>
       <button data-view="expenses"><span class="dot"></span>Expenses</button>
       <button data-view="assets"><span class="dot"></span>Assets</button>
+      <button data-view="stock"><span class="dot"></span>Stock</button>
       <button data-view="liabilities"><span class="dot"></span>Liabilities</button>
       <button data-view="supplierinvoices"><span class="dot"></span>Supplier Invoices</button>
       <button data-view="clients"><span class="dot"></span>Clients</button>
+      <button data-view="quotes"><span class="dot"></span>Quotes</button>
       <button data-view="invoices"><span class="dot"></span>Invoices</button>
       <button data-view="creditnotes"><span class="dot"></span>Credit Notes</button>
       <button data-view="payroll"><span class="dot"></span>Payroll</button>
@@ -300,7 +305,31 @@ const SDL_RATE = 0.01;                    // employer-only levy
 const SDL_ANNUAL_THRESHOLD = 500000;      // employers with an annual payroll at or below this are exempt
 const RETIREMENT_DEDUCTION_RATE = 0.275;  // 27.5% of remuneration/taxable income, whichever cap binds first
 const RETIREMENT_DEDUCTION_ANNUAL_CAP = 430000; // per 2026 Budget, effective 1 March 2026
+// Foreign-currency invoicing/credit notes: line items are entered in the selected currency;
+// the exchange rate converts the document total to ZAR for revenue recognition, VAT, and every
+// other report, which all stay Rand-only. Payments received are always recorded in ZAR.
+const CURRENCIES = ['ZAR','USD','GBP','EUR'];
 const TRAVEL_ALLOWANCE_TAXABLE_PORTION = 0.8; // SARS default inclusion rate (no employer business-use certificate)
+// If the employer is satisfied, from logbook evidence, that at least 80% of a vehicle's use is for
+// business, only 20% of the travel allowance need be withheld on instead of the 80% default
+// (Income Tax Act, para 8(1)(b) — a binary either/or, not a continuous business-use percentage).
+const TRAVEL_ALLOWANCE_TAXABLE_PORTION_LOGBOOK = 0.2;
+// Company car fringe benefit (Seventh Schedule para 7): a fixed % of the vehicle's determined
+// value (cash cost incl. VAT) is added to taxable remuneration every month it's available for
+// private use — lower if a qualifying maintenance plan (contractual, from purchase, 3yrs/60,000km+) applies.
+const CAR_FRINGE_BENEFIT_RATE_STANDARD = 0.035;
+const CAR_FRINGE_BENEFIT_RATE_MAINTENANCE = 0.0325;
+// SARS official rate of interest (repo + 1%) — the benchmark an employer loan is compared against
+// for the low/no-interest loan fringe benefit. Changes when the Reserve Bank moves the repo rate;
+// kept editable per company on Team → Company Details rather than hardcoded for that reason.
+const OFFICIAL_INTEREST_RATE_DEFAULT = 8.00; // % p.a., effective 1 June 2026 — confirm current rate with SARS
+// Flat company income tax rate (standard companies). Does NOT model the graduated Small Business
+// Corporation rates or turnover tax — estimate only, for provisional-tax planning.
+const COMPANY_TAX_RATE = 0.27;
+// COIDA Return of Earnings: individual employee earnings are capped at this amount for the
+// 2026/2027 assessment year when calculating the assessable total — confirm the current cap on
+// the Compensation Fund's own tables before relying on this for a real submission.
+const COIDA_EARNINGS_CAP_2027 = 668000;
 
 function round2(n){ return Math.round((n + Number.EPSILON) * 100) / 100; }
 
@@ -379,13 +408,31 @@ function computePayslip(emp, opts){
   const retirementContribution = Number(emp.retirement_contribution) || 0;
   const medicalContribution = Number(emp.medical_aid_contribution) || 0;
   const medicalDependants = Number(emp.medical_aid_dependants) || 0;
+  const logbookQualifies = !!emp.travel_logbook_qualifies;
+  const hasCompanyCar = !!emp.has_company_car;
+  const carDeterminedValue = Number(emp.car_determined_value) || 0;
+  const carMaintenancePlan = !!emp.car_has_maintenance_plan;
+  const loanBalance = Number(emp.loan_balance) || 0;
+  const loanRateCharged = Number(emp.loan_interest_rate_charged) || 0;
 
   const grossEarnings = basic + travelAllowance + bonus + commission;
 
-  // Only the SARS-default 80% of a travel allowance is included in taxable remuneration
-  // (the full 100% is used for UIF and for the payslip's Gross Earnings line).
-  const taxableTravelPortion = travelAllowance * TRAVEL_ALLOWANCE_TAXABLE_PORTION;
-  const preRetirementTaxable = basic + taxableTravelPortion + bonus + commission;
+  // The SARS-default 80% of a travel allowance is included in taxable remuneration, UNLESS a
+  // logbook satisfies the employer that at least 80% of the vehicle's use is for business — in
+  // which case only 20% need be withheld on (a binary either/or, not a sliding scale).
+  // The full 100% is used for UIF and for the payslip's Gross Earnings line either way.
+  const travelTaxablePortionRate = logbookQualifies ? TRAVEL_ALLOWANCE_TAXABLE_PORTION_LOGBOOK : TRAVEL_ALLOWANCE_TAXABLE_PORTION;
+  const taxableTravelPortion = travelAllowance * travelTaxablePortionRate;
+  // Company car fringe benefit (Seventh Schedule para 7): a % of the vehicle's determined value,
+  // per month, added to taxable remuneration — it's non-cash, so it never enters Gross Earnings/Net Pay.
+  const officialInterestRate = Number((state.company && state.company.official_interest_rate_pct) || OFFICIAL_INTEREST_RATE_DEFAULT);
+  const carFringeBenefitMonthly = hasCompanyCar ? round2(carDeterminedValue * (carMaintenancePlan ? CAR_FRINGE_BENEFIT_RATE_MAINTENANCE : CAR_FRINGE_BENEFIT_RATE_STANDARD)) : 0;
+  const carFringeBenefit = round2(carFringeBenefitMonthly * 12 / periods);
+  // Low/no-interest employer loan fringe benefit: the shortfall between SARS' official rate of
+  // interest and what's actually charged, applied to the loan balance, spread across this year's pay periods.
+  const loanFringeBenefitAnnual = loanBalance > 0 ? Math.max(0, ((officialInterestRate - loanRateCharged) / 100) * loanBalance) : 0;
+  const loanFringeBenefit = round2(loanFringeBenefitAnnual / periods);
+  const preRetirementTaxable = basic + taxableTravelPortion + bonus + commission + carFringeBenefit + loanFringeBenefit;
 
   // The FULL retirement contribution is still deducted from pay; only the allowed portion
   // (capped at 27.5% of remuneration or the annual Rand cap, whichever binds) reduces the
@@ -413,7 +460,8 @@ function computePayslip(emp, opts){
   return {
     payDate, periods, age,
     basic, travelAllowance, bonus, commission, grossEarnings,
-    taxableTravelPortion, preRetirementTaxable,
+    taxableTravelPortion, travelTaxablePortionRate, preRetirementTaxable,
+    carFringeBenefit, loanFringeBenefit,
     retirementContribution, retirementDeduction, taxableIncomePeriod,
     annualTaxableIncome, annualTaxGross, rebate, annualTaxAfterRebate,
     medicalContribution, medicalDependants, medicalCreditMonthly: medicalCreditMonthlyAmt,
@@ -629,6 +677,12 @@ let state = {
   creditNoteItems: {}, // creditNoteId -> items[]
   invoicePayments: [], // actual cash received against customer invoices
   suppliers: [],
+  quotes: [],
+  quoteItems: {},   // quoteId -> items[]
+  stockItems: [],   // cc_stock_items
+  provisionalTax: [],     // cc_provisional_tax rows (company income tax, 2 periods/year)
+  emp201Submissions: [],  // cc_emp201_submissions rows (monthly PAYE/UIF/SDL tracking)
+  coidaReturns: [],       // cc_coida_returns rows (annual Return of Earnings tracking)
   supplierInvoices: [],
   supplierInvoiceItems: {}, // supplierInvoiceId -> items[]
   supplierInvoicePayments: [], // actual cash paid against supplier invoices
@@ -654,12 +708,19 @@ let state = {
   scenarioDetailId: null,  // scenario id currently expanded for editing, or null = list view
   scenarioNewCategory: null, // category chosen in the "new scenario" modal, or null = modal closed
   scenarioCompareIds: [],  // scenario ids currently selected for side-by-side comparison
-  monthlyAccountsMonth: new Date().toISOString().slice(0,7) // 'YYYY-MM', for the Monthly Accounts report
+  monthlyAccountsMonth: new Date().toISOString().slice(0,7), // 'YYYY-MM', for the Monthly Accounts report
+  companyTaxFYOffset: 0, // 0 = current financial year, -1/+1 = previous/next, for the Company Tax report tab
+  coidaTaxYearLabel: null // selected COIDA assessment year label; null = default to the current tax year
 };
 
 function fmt(n){
   n = Number(n)||0;
   return 'R' + n.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function fmtCurrency(n, currency){
+  n = Number(n)||0;
+  if(!currency || currency==='ZAR') return fmt(n);
+  return n.toLocaleString('en-ZA', {minimumFractionDigits:2, maximumFractionDigits:2}) + ' ' + currency;
 }
 function toast(msg){
   const t = document.getElementById('toast');
@@ -667,6 +728,15 @@ function toast(msg){
   t.style.display = 'block';
   clearTimeout(t._timer);
   t._timer = setTimeout(()=>{ t.style.display='none'; }, 3000);
+}
+
+// Period lock: an admin-set cutoff date (state.company.locked_through_date). Any
+// transaction dated on or before it is considered part of a closed accounting period.
+function isPeriodLocked(dateStr){
+  return !!(state.company && state.company.locked_through_date && dateStr && dateStr <= state.company.locked_through_date);
+}
+function periodLockMessage(){
+  return `That date falls within a locked accounting period (locked through ${state.company.locked_through_date}). Ask an admin to move the lock date on Team to make changes.`;
 }
 function isAdmin(){
   return state.membership && (state.membership.role === 'owner' || state.membership.role === 'admin');
@@ -690,8 +760,8 @@ function canApprove(){
 }
 // Every tab in the sidebar, in nav order. Used both to render the nav and to gate access.
 const ALL_VIEWS = [
-  ['dashboard','Dashboard'], ['revenue','Revenue'], ['expenses','Expenses'], ['assets','Assets'],
-  ['liabilities','Liabilities'], ['supplierinvoices','Supplier Invoices'], ['clients','Clients'],
+  ['dashboard','Dashboard'], ['revenue','Revenue'], ['expenses','Expenses'], ['assets','Assets'], ['stock','Stock'],
+  ['liabilities','Liabilities'], ['supplierinvoices','Supplier Invoices'], ['clients','Clients'], ['quotes','Quotes'],
   ['invoices','Invoices'], ['creditnotes','Credit Notes'], ['payroll','Payroll'], ['tasks','Tasks'],
   ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'],
 ];
@@ -989,12 +1059,22 @@ async function refreshAll(){
   state.leaveEntries = leaveEntriesRes.data || [];
   state.taskNotes = taskNotesRes.data || [];
   state.attachments = attachmentsRes.data || [];
-  const [auditLogRes, bankTxRes] = await Promise.all([
+  const [auditLogRes, bankTxRes, stockRes, quotesRes, provTaxRes, emp201Res, coidaRes] = await Promise.all([
     sb.from('cc_audit_log').select('*').eq('company_id', cid).order('created_at', {ascending:false}).limit(300),
-    sb.from('cc_bank_transactions').select('*').eq('company_id', cid).order('tx_date', {ascending:false})
+    sb.from('cc_bank_transactions').select('*').eq('company_id', cid).order('tx_date', {ascending:false}),
+    sb.from('cc_stock_items').select('*').eq('company_id', cid).order('name', {ascending:true}),
+    sb.from('cc_quotes').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
+    sb.from('cc_provisional_tax').select('*').eq('company_id', cid),
+    sb.from('cc_emp201_submissions').select('*').eq('company_id', cid),
+    sb.from('cc_coida_returns').select('*').eq('company_id', cid)
   ]);
   state.auditLog = auditLogRes.data || [];
   state.bankTransactions = bankTxRes.data || [];
+  state.stockItems = stockRes.data || [];
+  state.quotes = quotesRes.data || [];
+  state.provisionalTax = provTaxRes.data || [];
+  state.emp201Submissions = emp201Res.data || [];
+  state.coidaReturns = coidaRes.data || [];
 
   const invoiceIds = state.invoices.map(i=>i.id);
   const creditNoteIds = state.creditNotes.map(cn=>cn.id);
@@ -1016,6 +1096,10 @@ async function refreshAll(){
   state.supplierInvoicePayments = supInvPaymentsRes.data || [];
   state.creditNoteItems = {};
   (cnItemsRes.data||[]).forEach(it=>{ (state.creditNoteItems[it.credit_note_id] = state.creditNoteItems[it.credit_note_id]||[]).push(it); });
+  const quoteIds = state.quotes.map(q=>q.id);
+  const quoteItemsRes = quoteIds.length ? await sb.from('cc_quote_items').select('*').in('quote_id', quoteIds) : {data:[]};
+  state.quoteItems = {};
+  (quoteItemsRes.data||[]).forEach(it=>{ (state.quoteItems[it.quote_id] = state.quoteItems[it.quote_id]||[]).push(it); });
 }
 
 
@@ -1221,6 +1305,7 @@ async function unmatchBankTransaction(txId){
 async function createEntryFromBankTransaction(txId){
   const tx = state.bankTransactions.find(t=>t.id===txId);
   if(!tx) return;
+  if(isPeriodLocked(tx.tx_date)){ toast(periodLockMessage()); return; }
   const type = Number(tx.amount) >= 0 ? 'revenue' : 'expense';
   const payload = {
     company_id: state.company.id, type, description: tx.description || (type==='revenue'?'Bank deposit':'Bank payment'),
@@ -1426,10 +1511,14 @@ const CSV_EXPORTS = {
   clients: { label:'Clients', rows: ()=>state.clients, columns:[
     {key:'name',label:'Name'}, {key:r=>r.email||'',label:'Email'}, {key:r=>r.phone||'',label:'Phone'}, {key:r=>r.address||'',label:'Address'},
   ]},
+  stock: { label:'Stock', rows: ()=>state.stockItems, columns:[
+    {key:'name',label:'Name'}, {key:r=>r.sku||'',label:'SKU'}, {key:'unit_cost',label:'Unit Cost'}, {key:'qty_on_hand',label:'Qty On Hand'},
+  ]},
   invoices: { label:'Invoices', rows: ()=>state.invoices, columns:[
     {key:'invoice_number',label:'Number'}, {key:r=>clientName(r.client_id),label:'Client'}, {key:'issue_date',label:'Issue Date'},
     {key:r=>r.due_date||'',label:'Due Date'}, {key:'status',label:'Status'}, {key:'approval_status',label:'Approval'},
-    {key:r=>fmt(docTotal(state.invoiceItems[r.id])),label:'Total'},
+    {key:r=>r.currency||'ZAR',label:'Currency'},
+    {key:r=>docTotal(state.invoiceItems[r.id]),label:'Total (in document currency)'},
   ]},
   suppliers: { label:'Suppliers', rows: ()=>state.suppliers, columns:[
     {key:'name',label:'Name'}, {key:r=>r.email||'',label:'Email'}, {key:r=>r.phone||'',label:'Phone'}, {key:r=>r.address||'',label:'Address'},
@@ -1544,9 +1633,11 @@ function render(){
     case 'revenue': main.innerHTML = renderEntries('revenue'); attachEntryHandlers('revenue'); break;
     case 'expenses': main.innerHTML = renderEntries('expense'); attachEntryHandlers('expense'); break;
     case 'assets': main.innerHTML = renderAssets(); attachAssetHandlers(); break;
+    case 'stock': main.innerHTML = renderStock(); attachStockHandlers(); break;
     case 'liabilities': main.innerHTML = renderLiabilities(); attachLiabilityHandlers(); break;
     case 'supplierinvoices': main.innerHTML = renderSupplierInvoices(); attachSupplierInvoiceHandlers(); break;
     case 'clients': main.innerHTML = renderClients(); attachClientHandlers(); break;
+    case 'quotes': main.innerHTML = renderQuotes(); attachQuoteHandlers(); break;
     case 'invoices': main.innerHTML = renderInvoices(); attachInvoiceHandlers(); break;
     case 'creditnotes': main.innerHTML = renderCreditNotes(); attachCreditNoteHandlers(); break;
     case 'payroll': main.innerHTML = renderPayroll(); attachPayrollHandlers(); break;
@@ -1819,6 +1910,7 @@ function attachEntryHandlers(type){
     if(type==='expense'){
       payload.expense_category = document.getElementById('entry-expense-category').value;
     }
+    if(isPeriodLocked(payload.entry_date)){ toast(periodLockMessage()); return; }
     const {data: savedEntry, error} = await sb.from('cc_entries').insert(payload).select().single();
     if(error){ toast(error.message); return; }
     await logActivity('create', type, savedEntry && savedEntry.id, `${payload.description} (${fmt(payload.amount)})`);
@@ -1828,6 +1920,7 @@ function attachEntryHandlers(type){
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this entry?')) return;
       const delEntry = state.entries.find(x=>x.id===btn.dataset.delEntry);
+      if(delEntry && isPeriodLocked(delEntry.entry_date)){ toast(periodLockMessage()); return; }
       await deleteAttachmentsForEntity(type, btn.dataset.delEntry);
       await sb.from('cc_entries').delete().eq('id', btn.dataset.delEntry);
       await logActivity('delete', type, btn.dataset.delEntry, delEntry ? `${delEntry.description} (${fmt(delEntry.amount)})` : '');
@@ -1858,14 +1951,17 @@ function attachEntryHandlers(type){
     confirmBtn.textContent = `Import ${validCount} valid row${validCount===1?'':'s'}`;
   });
   document.getElementById('import-csv-confirm')?.addEventListener('click', async ()=>{
-    const payload = importRowsToPayload(type, state.importPreviewRows || []);
+    let payload = importRowsToPayload(type, state.importPreviewRows || []);
     if(!payload.length) return;
+    const lockedCount = payload.filter(r=>isPeriodLocked(r.entry_date)).length;
+    payload = payload.filter(r=>!isPeriodLocked(r.entry_date));
+    if(!payload.length){ toast(periodLockMessage()); return; }
     const {error} = await sb.from('cc_entries').insert(payload);
     if(error){ toast(error.message); return; }
     await logActivity('create', type, null, `Bulk CSV import: ${payload.length} rows`);
     importBackdrop.classList.add('hidden');
     await refreshAll(); render();
-    toast(`Imported ${payload.length} ${type==='revenue'?'revenue':'expense'} row${payload.length===1?'':'s'}.`);
+    toast(`Imported ${payload.length} ${type==='revenue'?'revenue':'expense'} row${payload.length===1?'':'s'}.${lockedCount ? ` Skipped ${lockedCount} row${lockedCount===1?'':'s'} in a locked period.` : ''}`);
   });
 }
 
@@ -1990,6 +2086,7 @@ function attachAssetHandlers(){
       const amount = Math.min(monthly, remaining);
       if(amount <= 0){ toast('This asset is already fully depreciated.'); return; }
       const today = todayIso();
+      if(isPeriodLocked(today)){ toast(periodLockMessage()); return; }
       const {error: entryError} = await sb.from('cc_entries').insert({
         company_id: state.company.id,
         type: 'expense',
@@ -2117,6 +2214,7 @@ async function recognizeSupplierInvoiceExpense(bill, items){
     created_by: bill.created_by || state.user.id,
     source_supplier_invoice_id: bill.id
   });
+  await applyStockPurchaseMovements(items);
 }
 function billBalance(bill){
   const total = docTotal(state.supplierInvoiceItems[bill.id]);
@@ -2169,6 +2267,7 @@ function renderSupplierInvoices(){
           <td id="scn-total-${n.id}">…</td>
           <td>
             <button class="btn small secondary" data-view-supplier-creditnote="${n.id}">View</button>
+            <button type="button" class="btn small secondary" data-attachments="supplier_credit_note|${n.id}" data-attachments-label="Supplier Credit Note ${n.credit_note_number}">${attachmentCountFor('supplier_credit_note',n.id) ? attachmentCountFor('supplier_credit_note',n.id)+' file'+(attachmentCountFor('supplier_credit_note',n.id)>1?'s':'') : 'Attach'}</button>
             ${(canApprove() || (n.created_by===state.user.id && n.approval_status==='pending'))?`<button class="btn small danger" data-del-supplier-creditnote="${n.id}">Delete</button>`:''}
           </td>
         </tr>`).join('')}
@@ -2212,7 +2311,7 @@ function supplierInvoiceModal(){
           <option value="cost_of_sales">Cost of Sales (COS)</option>
         </select></div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th>Stock item</th><th></th></tr></thead>
           <tbody id="supplier-invoice-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="supplier-invoice-add-item" style="margin-top:8px;">+ Add line</button>
@@ -2287,13 +2386,13 @@ function attachSupplierInvoiceHandlers(){
     if(!state.suppliers.length){ toast('Add a supplier first.'); return; }
     document.getElementById('supplier-invoice-number').value = nextSupplierBillNumber();
     document.getElementById('supplier-invoice-issue-date').value = new Date().toISOString().slice(0,10);
-    document.getElementById('supplier-invoice-items-body').innerHTML = invoiceItemRow();
+    document.getElementById('supplier-invoice-items-body').innerHTML = invoiceItemRowWithStock();
     invBackdrop.classList.remove('hidden');
   });
   document.getElementById('supplier-invoice-cancel')?.addEventListener('click', ()=>invBackdrop.classList.add('hidden'));
   document.getElementById('supplier-invoice-modal-close')?.addEventListener('click', ()=>invBackdrop.classList.add('hidden'));
   document.getElementById('supplier-invoice-add-item')?.addEventListener('click', ()=>{
-    document.getElementById('supplier-invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRow());
+    document.getElementById('supplier-invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRowWithStock());
   });
   document.getElementById('supplier-invoice-items-body')?.addEventListener('click', (e)=>{
     if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
@@ -2303,11 +2402,13 @@ function attachSupplierInvoiceHandlers(){
     const supplierId = document.getElementById('supplier-invoice-supplier').value;
     if(!supplierId){ toast('Add a supplier first.'); return; }
     const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const supplierInvoiceIssueDate = document.getElementById('supplier-invoice-issue-date').value;
+    if(isPeriodLocked(supplierInvoiceIssueDate)){ toast(periodLockMessage()); return; }
     const {data: bill, error} = await sb.from('cc_supplier_invoices').insert({
       company_id: state.company.id,
       supplier_id: supplierId,
       bill_number: document.getElementById('supplier-invoice-number').value.trim(),
-      issue_date: document.getElementById('supplier-invoice-issue-date').value,
+      issue_date: supplierInvoiceIssueDate,
       due_date: document.getElementById('supplier-invoice-due-date').value || null,
       expense_category: document.getElementById('supplier-invoice-category').value,
       notes: document.getElementById('supplier-invoice-notes').value.trim() || null,
@@ -2320,7 +2421,8 @@ function attachSupplierInvoiceHandlers(){
       description: tr.querySelector('.ii-desc').value.trim(),
       quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
       unit_price: parseFloat(tr.querySelector('.ii-price').value)||0,
-      vat_applicable: tr.querySelector('.ii-vat').checked
+      vat_applicable: tr.querySelector('.ii-vat').checked,
+      stock_item_id: tr.querySelector('.ii-stock')?.value || null
     })).filter(r=>r.description);
     if(rows.length) await sb.from('cc_supplier_invoice_items').insert(rows);
     if(approvalStatus === 'approved'){
@@ -2334,6 +2436,7 @@ function attachSupplierInvoiceHandlers(){
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this supplier invoice? Its linked expense entry will also be removed.')) return;
       const delBill = state.supplierInvoices.find(x=>x.id===btn.dataset.delSupplierInvoice);
+      if(delBill && isPeriodLocked(delBill.issue_date)){ toast(periodLockMessage()); return; }
       await deleteAttachmentsForEntity('supplier_invoice', btn.dataset.delSupplierInvoice);
       const {error} = await sb.from('cc_supplier_invoices').delete().eq('id', btn.dataset.delSupplierInvoice);
       if(error){ toast(error.message); return; }
@@ -2366,12 +2469,14 @@ function attachSupplierInvoiceHandlers(){
     const supplierId = document.getElementById('supplier-creditnote-supplier').value;
     if(!supplierId){ toast('Add a supplier first.'); return; }
     const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const supplierCreditNoteIssueDate = document.getElementById('supplier-creditnote-issue-date').value;
+    if(isPeriodLocked(supplierCreditNoteIssueDate)){ toast(periodLockMessage()); return; }
     const {data: note, error} = await sb.from('cc_supplier_credit_notes').insert({
       company_id: state.company.id,
       supplier_id: supplierId,
       supplier_invoice_id: document.getElementById('supplier-creditnote-invoice').value || null,
       credit_note_number: document.getElementById('supplier-creditnote-number').value.trim(),
-      issue_date: document.getElementById('supplier-creditnote-issue-date').value,
+      issue_date: supplierCreditNoteIssueDate,
       reason: document.getElementById('supplier-creditnote-reason').value.trim() || null,
       status: 'draft',
       notes: document.getElementById('supplier-creditnote-notes').value.trim() || null,
@@ -2395,6 +2500,8 @@ function attachSupplierInvoiceHandlers(){
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this supplier credit note?')) return;
       const delNote = state.supplierCreditNotes.find(x=>x.id===btn.dataset.delSupplierCreditnote);
+      if(delNote && isPeriodLocked(delNote.issue_date)){ toast(periodLockMessage()); return; }
+      await deleteAttachmentsForEntity('supplier_credit_note', btn.dataset.delSupplierCreditnote);
       const {error} = await sb.from('cc_supplier_credit_notes').delete().eq('id', btn.dataset.delSupplierCreditnote);
       if(error){ toast(error.message); return; }
       await logActivity('delete', 'supplier_credit_note', btn.dataset.delSupplierCreditnote, delNote ? delNote.credit_note_number : '');
@@ -2580,6 +2687,142 @@ async function openSupplierCreditNoteView(noteId){
   });
 }
 
+/* ========================= STOCK ========================= */
+function renderStock(){
+  const canEdit = hasModule('stock');
+  return `
+    <div class="section-header" style="--accent-c:var(--c-stock);"><h1>Stock</h1>${canEdit ? `<button class="btn" id="add-stock-btn">+ Add Stock Item</button>` : ''}</div>
+    <p class="section-caption">Items you keep on hand. Link a line item to one of these on an Invoice (selling) or a Supplier Invoice (buying) to keep quantity and cost of sales in sync automatically.</p>
+    <div class="panel">
+      ${state.stockItems.length ? `<table><thead><tr><th>Name</th><th>SKU</th><th>Unit Cost</th><th>Qty on Hand</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.stockItems.map(s=>`<tr><td>${s.name}</td><td>${s.sku||'—'}</td><td>${fmt(s.unit_cost)}</td><td>${s.qty_on_hand}</td>${canEdit?`<td><button class="btn small secondary" data-edit-stock="${s.id}">Edit</button> <button class="btn small danger" data-del-stock="${s.id}">Delete</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No stock items yet.</div>`}
+    </div>
+    ${canEdit ? `
+    <div class="modal-backdrop hidden" id="stock-modal-backdrop"><div class="modal">
+      <button class="close-x" id="stock-modal-close">✕</button>
+      <h2 id="stock-modal-title">Add Stock Item</h2>
+      <form id="stock-form">
+        <input type="hidden" id="stock-edit-id">
+        <div class="field"><label>Name</label><input type="text" id="stock-name" required></div>
+        <div class="field"><label>SKU (optional)</label><input type="text" id="stock-sku"></div>
+        <div class="field"><label>Unit cost (R)</label><input type="number" step="0.01" id="stock-unit-cost" value="0" required></div>
+        <div class="field"><label>Quantity on hand</label><input type="number" step="0.01" id="stock-qty" value="0" required></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="stock-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
+      </form>
+    </div></div>` : ''}
+  `;
+}
+function attachStockHandlers(){
+  const backdrop = document.getElementById('stock-modal-backdrop');
+  function resetStockForm(){
+    document.getElementById('stock-edit-id').value = '';
+    document.getElementById('stock-name').value = '';
+    document.getElementById('stock-sku').value = '';
+    document.getElementById('stock-unit-cost').value = '0';
+    document.getElementById('stock-qty').value = '0';
+    document.getElementById('stock-modal-title').textContent = 'Add Stock Item';
+  }
+  document.getElementById('add-stock-btn')?.addEventListener('click', ()=>{
+    resetStockForm();
+    backdrop.classList.remove('hidden');
+  });
+  document.getElementById('stock-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('stock-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.querySelectorAll('[data-edit-stock]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const s = state.stockItems.find(x=>x.id===btn.dataset.editStock);
+      if(!s) return;
+      document.getElementById('stock-edit-id').value = s.id;
+      document.getElementById('stock-name').value = s.name;
+      document.getElementById('stock-sku').value = s.sku || '';
+      document.getElementById('stock-unit-cost').value = s.unit_cost;
+      document.getElementById('stock-qty').value = s.qty_on_hand;
+      document.getElementById('stock-modal-title').textContent = 'Edit Stock Item';
+      backdrop.classList.remove('hidden');
+    });
+  });
+  document.getElementById('stock-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const editId = document.getElementById('stock-edit-id').value;
+    const payload = {
+      name: document.getElementById('stock-name').value.trim(),
+      sku: document.getElementById('stock-sku').value.trim() || null,
+      unit_cost: parseFloat(document.getElementById('stock-unit-cost').value) || 0,
+      qty_on_hand: parseFloat(document.getElementById('stock-qty').value) || 0
+    };
+    const {error} = editId
+      ? await sb.from('cc_stock_items').update(payload).eq('id', editId)
+      : await sb.from('cc_stock_items').insert({...payload, company_id: state.company.id});
+    if(error){ toast(error.message); return; }
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Stock item saved.');
+  });
+  document.querySelectorAll('[data-del-stock]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this stock item?')) return;
+      await sb.from('cc_stock_items').delete().eq('id', btn.dataset.delStock);
+      await refreshAll(); render();
+    });
+  });
+}
+// A line item row with an extra "Stock item" column — used only on Invoices (selling, decrements
+// qty and posts cost of sales) and Supplier Invoices (buying, increments qty). Quotes, customer
+// credit notes and supplier credit notes keep the plain invoiceItemRow() with no stock linkage.
+function invoiceItemRowWithStock(vatEditable){
+  if(vatEditable === undefined) vatEditable = true;
+  const vatCell = vatEditable
+    ? `<input type="checkbox" class="ii-vat" checked style="width:auto;">`
+    : `<input type="checkbox" class="ii-vat" disabled title="Not VAT registered" style="width:auto;">`;
+  const stockOptions = state.stockItems.map(s=>`<option value="${s.id}">${s.name}</option>`).join('');
+  return `<tr>
+    <td><input type="text" class="ii-desc" required></td>
+    <td><input type="number" class="ii-qty" value="1" step="0.01"></td>
+    <td><input type="number" class="ii-price" value="0" step="0.01"></td>
+    <td style="text-align:center;">${vatCell}</td>
+    <td><select class="ii-stock"><option value="">— none —</option>${stockOptions}</select></td>
+    <td><button type="button" class="btn small danger ii-remove">✕</button></td>
+  </tr>`;
+}
+// Decrements stock on hand and posts an automatic Cost of Sales expense at the stock item's own
+// unit cost (not the selling price) for every line item on a sale that's linked to a stock item.
+async function applyStockSaleMovements(items, dateStr, docLabel){
+  for(const it of (items||[])){
+    if(!it.stock_item_id) continue;
+    const stockItem = state.stockItems.find(s=>s.id===it.stock_item_id);
+    if(!stockItem) continue;
+    const qty = Number(it.quantity) || 0;
+    await sb.from('cc_stock_items').update({qty_on_hand: Number(stockItem.qty_on_hand) - qty}).eq('id', stockItem.id);
+    const cost = round2(qty * Number(stockItem.unit_cost || 0));
+    if(cost > 0){
+      await sb.from('cc_entries').insert({
+        company_id: state.company.id,
+        type: 'expense',
+        description: `Cost of sales — ${stockItem.name} (${docLabel})`,
+        amount: cost,
+        entry_date: dateStr,
+        tags: ['cost-of-sales','stock'],
+        vat_applicable: false,
+        expense_category: 'cost_of_sales',
+        created_by: state.user.id
+      });
+    }
+  }
+}
+// Increments stock on hand for every line item on a purchase (a captured bill) that's linked to a
+// stock item. Does not touch the stock item's unit_cost — no weighted-average recosting.
+async function applyStockPurchaseMovements(items){
+  for(const it of (items||[])){
+    if(!it.stock_item_id) continue;
+    const stockItem = state.stockItems.find(s=>s.id===it.stock_item_id);
+    if(!stockItem) continue;
+    const qty = Number(it.quantity) || 0;
+    await sb.from('cc_stock_items').update({qty_on_hand: Number(stockItem.qty_on_hand) + qty}).eq('id', stockItem.id);
+  }
+}
+
+
 /* ========================= CLIENTS ========================= */
 function renderClients(){
   const canEdit = hasModule('clients');
@@ -2587,10 +2830,11 @@ function renderClients(){
     <div class="section-header" style="--accent-c:var(--c-clients);"><h1>Clients</h1>${canEdit ? `<button class="btn" id="add-client-btn">+ Add Client</button>` : ''}</div>
     <p class="section-caption">The people and companies you invoice.</p>
     <div class="panel">
-      ${state.clients.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td>${canEdit?`<td><button class="btn small danger" data-del-client="${c.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.clients.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th></th></tr></thead><tbody>
+        ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td><td><button class="btn small secondary" data-statement-client="${c.id}">Statement</button>${canEdit?` <button class="btn small danger" data-del-client="${c.id}">Delete</button>`:''}</td></tr>`).join('')}
       </tbody></table>` : `<div class="empty">No clients yet.</div>`}
     </div>
+    ${clientStatementModal()}
     ${canEdit ? `
     <div class="modal-backdrop hidden" id="client-modal-backdrop"><div class="modal">
       <button class="close-x" id="client-modal-close">✕</button>
@@ -2629,6 +2873,93 @@ function attachClientHandlers(){
       await refreshAll(); render();
     });
   });
+  attachClientStatementHandlers();
+}
+
+function clientStatementModal(){
+  return `
+  <div class="modal-backdrop hidden" id="statement-modal-backdrop"><div class="modal">
+    <button class="close-x" id="statement-modal-close">✕</button>
+    <h2>Statement of Account</h2>
+    <form id="statement-form">
+      <input type="hidden" id="statement-client-id">
+      <div class="row">
+        <div class="field"><label>From (optional)</label><input type="date" id="statement-from"></div>
+        <div class="field"><label>To (optional)</label><input type="date" id="statement-to"></div>
+      </div>
+      <p style="font-size:.78rem;color:var(--muted);">Leave both blank for the full history. Only approved invoices and credit notes are included.</p>
+      <div class="modal-actions"><button type="button" class="btn secondary" id="statement-cancel">Cancel</button><button type="submit" class="btn">Generate</button></div>
+    </form>
+  </div></div>
+  <div class="modal-backdrop hidden" id="statement-view-backdrop"><div class="modal" id="statement-view-content"></div></div>`;
+}
+// Converts a multi-currency invoice/credit-note's line-item total into ZAR (rate=1 for ZAR-only
+// documents), matching the conversion recognizeInvoiceRevenue uses — keeps the statement's
+// running balance on the same footing as every other ZAR-only report in the app.
+function docTotalZAR(doc, items){
+  const t = docTotal(items);
+  const rate = (doc && doc.currency && doc.currency !== 'ZAR') ? (Number(doc.exchange_rate)||1) : 1;
+  return round2(t * rate);
+}
+function attachClientStatementHandlers(){
+  const modalBackdrop = document.getElementById('statement-modal-backdrop');
+  document.querySelectorAll('[data-statement-client]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      document.getElementById('statement-client-id').value = btn.dataset.statementClient;
+      document.getElementById('statement-from').value = '';
+      document.getElementById('statement-to').value = '';
+      modalBackdrop.classList.remove('hidden');
+    });
+  });
+  document.getElementById('statement-cancel')?.addEventListener('click', ()=>modalBackdrop.classList.add('hidden'));
+  document.getElementById('statement-modal-close')?.addEventListener('click', ()=>modalBackdrop.classList.add('hidden'));
+  document.getElementById('statement-form')?.addEventListener('submit', (e)=>{
+    e.preventDefault();
+    modalBackdrop.classList.add('hidden');
+    openClientStatementView(
+      document.getElementById('statement-client-id').value,
+      document.getElementById('statement-from').value || null,
+      document.getElementById('statement-to').value || null
+    );
+  });
+  const viewBackdrop = document.getElementById('statement-view-backdrop');
+  document.getElementById('statement-view-close')?.addEventListener('click', ()=>viewBackdrop.classList.add('hidden'));
+}
+function openClientStatementView(clientId, fromDate, toDate){
+  const client = state.clients.find(c=>c.id===clientId);
+  if(!client) return;
+  const inRange = (d) => (!fromDate || d >= fromDate) && (!toDate || d <= toDate);
+  const lines = [];
+  state.invoices.filter(i=>i.client_id===clientId && i.approval_status==='approved' && inRange(i.issue_date)).forEach(i=>{
+    lines.push({date:i.issue_date, label:`Invoice ${i.invoice_number}`, amount: docTotalZAR(i, state.invoiceItems[i.id])});
+  });
+  state.creditNotes.filter(n=>n.client_id===clientId && n.approval_status==='approved' && inRange(n.issue_date)).forEach(n=>{
+    lines.push({date:n.issue_date, label:`Credit Note ${n.credit_note_number}`, amount: -docTotalZAR(n, state.creditNoteItems[n.id])});
+  });
+  const clientInvoiceIds = new Set(state.invoices.filter(i=>i.client_id===clientId).map(i=>i.id));
+  state.invoicePayments.filter(p=>clientInvoiceIds.has(p.invoice_id) && inRange(p.payment_date)).forEach(p=>{
+    const inv = state.invoices.find(i=>i.id===p.invoice_id);
+    lines.push({date:p.payment_date, label:`Payment received (${inv?inv.invoice_number:'—'})`, amount: -Number(p.amount)});
+  });
+  lines.sort((a,b)=> a.date < b.date ? -1 : (a.date > b.date ? 1 : 0));
+  let running = 0;
+  const withBalance = lines.map(l=>{ running = round2(running + l.amount); return {...l, balance: running}; });
+  const closingBalance = running;
+  const backdrop = document.getElementById('statement-view-backdrop');
+  document.getElementById('statement-view-content').innerHTML = `
+    <button class="close-x" id="statement-view-close">✕</button>
+    <h2>Statement of Account</h2>
+    <p style="color:var(--muted);margin-top:-8px;">${state.company.name}</p>
+    <p><strong>${client.name}</strong>${client.email?' ('+client.email+')':''}</p>
+    <p style="font-size:.85rem;color:var(--muted);">${fromDate||toDate ? `${fromDate||'…'} to ${toDate||'…'}` : 'Full history'}</p>
+    ${withBalance.length ? `<table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Balance</th></tr></thead><tbody>
+      ${withBalance.map(l=>`<tr><td>${l.date}</td><td>${l.label}</td><td>${l.amount<0?'-':''}${fmt(Math.abs(l.amount))}</td><td>${fmt(l.balance)}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No activity in this period.</div>`}
+    <div style="text-align:right;margin-top:10px;font-weight:700;font-size:1.1rem;">Balance due: ${fmt(closingBalance)}</div>
+    <div class="modal-actions"><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
+  `;
+  backdrop.classList.remove('hidden');
+  document.getElementById('statement-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
 }
 
 /* ========================= INVOICES ========================= */
@@ -2690,6 +3021,8 @@ async function generateDueRecurringInvoices(){
       notes: src.notes,
       created_by: src.created_by,
       approval_status: approvalStatus,
+      currency: src.currency || 'ZAR',
+      exchange_rate: src.exchange_rate || 1,
       is_recurring: false,
       recurrence_frequency: null,
       recurrence_next_date: null,
@@ -2727,14 +3060,17 @@ function canManageDoc(doc){
 // Balance Sheet exclude this entry from cash and use actual cc_invoice_payments
 // instead (see isNonCashEntry / computeCashFlow / computeBS).
 async function recognizeInvoiceRevenue(invoice, items){
-  const total = docTotal(items);
-  if(total <= 0) return;
+  const docCurrencyTotal = docTotal(items);
+  if(docCurrencyTotal <= 0) return;
+  const rate = Number(invoice.exchange_rate) || 1;
+  const total = round2(docCurrencyTotal * rate); // always ZAR — every report downstream assumes Rand
   const anyVat = (items||[]).some(it=>it.vat_applicable);
+  const currencyNote = (invoice.currency && invoice.currency !== 'ZAR') ? ` (${fmtCurrency(docCurrencyTotal, invoice.currency)} @ ${rate})` : '';
   await sb.from('cc_entries').insert({
     company_id: state.company.id,
     client_id: invoice.client_id || null,
     type: 'revenue',
-    description: `Invoice ${invoice.invoice_number} — ${clientName(invoice.client_id)}`,
+    description: `Invoice ${invoice.invoice_number} — ${clientName(invoice.client_id)}${currencyNote}`,
     amount: total,
     entry_date: invoice.issue_date,
     tags: ['invoice'],
@@ -2742,6 +3078,7 @@ async function recognizeInvoiceRevenue(invoice, items){
     created_by: invoice.created_by || state.user.id,
     source_invoice_id: invoice.id
   });
+  await applyStockSaleMovements(items, invoice.issue_date, `Invoice ${invoice.invoice_number}`);
 }
 function approvalPill(doc){
   if(doc.approval_status === 'pending') return `<span class="status-pill status-pending">pending approval</span>`;
@@ -2808,6 +3145,10 @@ function invoiceModal(){
           <div class="field"><label>Issue date</label><input type="date" id="invoice-issue-date" required></div>
           <div class="field"><label>Due date</label><input type="date" id="invoice-due-date"></div>
         </div>
+        <div class="row">
+          <div class="field"><label>Currency</label><select id="invoice-currency">${CURRENCIES.map(c=>`<option value="${c}">${c}</option>`).join('')}</select></div>
+          <div class="field hidden" id="invoice-exchange-rate-field"><label>Exchange rate (1 unit → ZAR)</label><input type="number" step="0.0001" id="invoice-exchange-rate" value="1"></div>
+        </div>
         <div class="field"><label><input type="checkbox" id="invoice-recurring" style="width:auto;"> Recurring invoice</label></div>
         <div class="row hidden" id="invoice-recurrence-fields">
           <div class="field"><label>Repeats</label><select id="invoice-recurrence-frequency">
@@ -2819,7 +3160,7 @@ function invoiceModal(){
           <div class="field"><label>Stop after (optional)</label><input type="date" id="invoice-recurrence-end"></div>
         </div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th>Stock item</th><th></th></tr></thead>
           <tbody id="invoice-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="invoice-add-item" style="margin-top:8px;">+ Add line</button>
@@ -2876,13 +3217,19 @@ function attachInvoiceHandlers(){
   document.getElementById('add-invoice-btn')?.addEventListener('click', ()=>{
     document.getElementById('invoice-number').value = nextInvoiceNumber();
     document.getElementById('invoice-issue-date').value = new Date().toISOString().slice(0,10);
-    document.getElementById('invoice-items-body').innerHTML = invoiceItemRow(weAreVatRegistered());
+    document.getElementById('invoice-items-body').innerHTML = invoiceItemRowWithStock(weAreVatRegistered());
+    document.getElementById('invoice-currency').value = 'ZAR';
+    document.getElementById('invoice-exchange-rate').value = '1';
+    document.getElementById('invoice-exchange-rate-field').classList.add('hidden');
     backdrop.classList.remove('hidden');
+  });
+  document.getElementById('invoice-currency')?.addEventListener('change', (e)=>{
+    document.getElementById('invoice-exchange-rate-field').classList.toggle('hidden', e.target.value==='ZAR');
   });
   document.getElementById('invoice-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('invoice-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('invoice-add-item')?.addEventListener('click', ()=>{
-    document.getElementById('invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRow(weAreVatRegistered()));
+    document.getElementById('invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRowWithStock(weAreVatRegistered()));
   });
   document.getElementById('invoice-recurring')?.addEventListener('change', (e)=>{
     document.getElementById('invoice-recurrence-fields').classList.toggle('hidden', !e.target.checked);
@@ -2898,6 +3245,9 @@ function attachInvoiceHandlers(){
     const isRecurring = document.getElementById('invoice-recurring').checked;
     const issueDate = document.getElementById('invoice-issue-date').value;
     const frequency = document.getElementById('invoice-recurrence-frequency').value;
+    const currency = document.getElementById('invoice-currency').value || 'ZAR';
+    const exchangeRate = currency==='ZAR' ? 1 : (parseFloat(document.getElementById('invoice-exchange-rate').value) || 1);
+    if(isPeriodLocked(issueDate)){ toast(periodLockMessage()); return; }
     const {data: invoice, error} = await sb.from('cc_invoices').insert({
       company_id: state.company.id,
       client_id: clientId,
@@ -2908,6 +3258,8 @@ function attachInvoiceHandlers(){
       notes: document.getElementById('invoice-notes').value.trim() || null,
       created_by: state.user.id,
       approval_status: approvalStatus,
+      currency: currency,
+      exchange_rate: exchangeRate,
       is_recurring: isRecurring,
       recurrence_frequency: isRecurring ? frequency : null,
       recurrence_next_date: isRecurring ? nextRecurrenceDate(issueDate, frequency) : null,
@@ -2919,7 +3271,8 @@ function attachInvoiceHandlers(){
       description: tr.querySelector('.ii-desc').value.trim(),
       quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
       unit_price: parseFloat(tr.querySelector('.ii-price').value)||0,
-      vat_applicable: tr.querySelector('.ii-vat').checked
+      vat_applicable: tr.querySelector('.ii-vat').checked,
+      stock_item_id: tr.querySelector('.ii-stock')?.value || null
     })).filter(r=>r.description);
     if(rows.length) await sb.from('cc_invoice_items').insert(rows);
     if(approvalStatus === 'approved'){
@@ -2945,6 +3298,7 @@ function attachInvoiceHandlers(){
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this invoice?')) return;
       const delInvoice = state.invoices.find(x=>x.id===btn.dataset.delInvoice);
+      if(delInvoice && isPeriodLocked(delInvoice.issue_date)){ toast(periodLockMessage()); return; }
       await deleteAttachmentsForEntity('invoice', btn.dataset.delInvoice);
       const {error} = await sb.from('cc_invoices').delete().eq('id', btn.dataset.delInvoice);
       if(error){ toast(error.message); return; }
@@ -2975,8 +3329,10 @@ async function openInvoiceView(invoiceId){
   const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
   const vatTotal = items.reduce((s,it)=> s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
   const total = items.reduce((s,it)=>s+it.quantity*it.unit_price,0);
+  const isForeign = inv.currency && inv.currency !== 'ZAR';
+  const zarTotal = isForeign ? round2(total * (Number(inv.exchange_rate)||1)) : total;
   const totalPaid = payments.reduce((s,p)=>s+Number(p.amount),0);
-  const balance = Math.max(0, total - totalPaid);
+  const balance = Math.max(0, zarTotal - totalPaid);
   const canRecordPayment = hasModule('invoices') && inv.approval_status === 'approved';
   const mailtoSubject = encodeURIComponent(`Invoice ${inv.invoice_number} from ${state.company.name}`);
   const mailtoBody = encodeURIComponent(`Hi ${client?client.name:''},\n\nPlease find invoice ${inv.invoice_number} for ${fmt(total)}, ${inv.due_date?('due '+inv.due_date):'due on receipt'}.\n\n(Use "Print / Save PDF" first and attach it — this just opens a pre-filled email, it can't attach the file for you.)\n\nThanks,\n${state.company.name}`);
@@ -2995,14 +3351,14 @@ async function openInvoiceView(invoiceId){
     <div style="text-align:right;margin-top:10px;font-size:.9rem;">
       <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
       ${weAreVatRegistered() ? `<div>VAT (15%): ${fmt(vatTotal)}</div>` : ''}
-      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmt(total)}</div>
+      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmtCurrency(total, inv.currency)}${isForeign ? ` (≈ ${fmt(zarTotal)} @ ${inv.exchange_rate})` : ''}</div>
       ${totalPaid ? `<div style="color:var(--accent2);">Paid: ${fmt(totalPaid)}</div><div style="font-weight:700;">Balance due: ${fmt(balance)}</div>` : ''}
     </div>
     ${inv.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${inv.notes}</p>` : ''}
     ${inv.approval_status === 'rejected' && inv.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${inv.rejection_note}</p>` : ''}
     ${inv.approval_status === 'approved' ? `
     <div class="panel" style="margin-top:14px;">
-      <h3 style="margin-top:0;">Payments received</h3>
+      <h3 style="margin-top:0;">Payments received${isForeign ? ' (in ZAR)' : ''}</h3>
       ${payments.length ? `<table class="payment-list"><thead><tr><th>Date</th><th>Amount</th><th>Notes</th>${canRecordPayment?'<th></th>':''}</tr></thead><tbody>
         ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.amount)}</td><td>${p.notes||'—'}</td>${canRecordPayment?`<td><button class="btn small danger" data-del-invoice-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
@@ -3094,6 +3450,209 @@ async function openInvoiceView(invoiceId){
 }
 
 
+/* ========================= QUOTES ========================= */
+function nextQuoteNumber(){
+  const year = new Date().getFullYear();
+  const nums = state.quotes
+    .map(q=>q.quote_number)
+    .filter(n=>n && n.startsWith('QUO-'+year))
+    .map(n=>parseInt(n.split('-').pop())||0);
+  const next = (nums.length ? Math.max(...nums) : 0) + 1;
+  return `QUO-${year}-${String(next).padStart(3,'0')}`;
+}
+function quoteStatusPill(q){
+  return `<span class="status-pill status-${q.status}">${q.status}</span>`;
+}
+function renderQuotes(){
+  const canCreate = hasModule('quotes');
+  return `
+    <div class="section-header" style="--accent-c:var(--c-quotes);"><h1>Quotes</h1>${canCreate ? `<button class="btn" id="add-quote-btn">+ New Quote</button>` : ''}</div>
+    <p class="section-caption">Quote a client first, then convert the accepted quote straight into an invoice — no retyping line items.</p>
+    <div class="panel">
+      ${state.quotes.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Expiry</th><th>Status</th><th>Total</th><th></th></tr></thead><tbody>
+        ${state.quotes.map(q=>`<tr>
+          <td>${q.quote_number}</td><td>${clientName(q.client_id)}</td><td>${q.issue_date}</td><td>${q.expiry_date||'—'}</td>
+          <td>${quoteStatusPill(q)}</td>
+          <td id="quo-total-${q.id}">…</td>
+          <td>
+            <button class="btn small secondary" data-view-quote="${q.id}">View</button>
+            ${(canCreate && q.status!=='converted') ? `<button class="btn small danger" data-del-quote="${q.id}">Delete</button>` : ''}
+          </td>
+        </tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No quotes yet.</div>`}
+    </div>
+    ${canCreate ? quoteModal() : ''}
+    <div class="modal-backdrop hidden" id="quote-view-backdrop"><div class="modal" id="quote-view-content"></div></div>
+  `;
+}
+function quoteModal(){
+  return `
+  <div class="modal-backdrop hidden" id="quote-modal-backdrop">
+    <div class="modal" style="max-width:600px;">
+      <button class="close-x" id="quote-modal-close">✕</button>
+      <h2>New Quote</h2>
+      <form id="quote-form">
+        <div class="row">
+          <div class="field"><label>Quote #</label><input type="text" id="quote-number" required></div>
+          <div class="field"><label>Client</label><select id="quote-client">${state.clients.map(c=>`<option value="${c.id}">${c.name}</option>`).join('') || '<option value="">Add a client first</option>'}</select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Issue date</label><input type="date" id="quote-issue-date" required></div>
+          <div class="field"><label>Expiry date</label><input type="date" id="quote-expiry-date"></div>
+        </div>
+        <h3 style="margin-bottom:6px;">Line items</h3>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+          <tbody id="quote-items-body"></tbody>
+        </table>
+        <button type="button" class="btn secondary small" id="quote-add-item" style="margin-top:8px;">+ Add line</button>
+        <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="quote-notes" rows="2"></textarea></div>
+        <div class="modal-actions">
+          <button type="button" class="btn secondary" id="quote-cancel">Cancel</button>
+          <button type="submit" class="btn">Save Quote</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+function attachQuoteHandlers(){
+  const canCreate = hasModule('quotes');
+  const backdrop = document.getElementById('quote-modal-backdrop');
+  document.getElementById('add-quote-btn')?.addEventListener('click', ()=>{
+    document.getElementById('quote-number').value = nextQuoteNumber();
+    document.getElementById('quote-issue-date').value = new Date().toISOString().slice(0,10);
+    document.getElementById('quote-items-body').innerHTML = invoiceItemRow(weAreVatRegistered());
+    backdrop.classList.remove('hidden');
+  });
+  document.getElementById('quote-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('quote-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('quote-add-item')?.addEventListener('click', ()=>{
+    document.getElementById('quote-items-body').insertAdjacentHTML('beforeend', invoiceItemRow(weAreVatRegistered()));
+  });
+  document.getElementById('quote-items-body')?.addEventListener('click', (e)=>{
+    if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
+  });
+  document.getElementById('quote-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const clientId = document.getElementById('quote-client').value;
+    if(!clientId){ toast('Add a client first.'); return; }
+    const {data: quote, error} = await sb.from('cc_quotes').insert({
+      company_id: state.company.id,
+      client_id: clientId,
+      quote_number: document.getElementById('quote-number').value.trim(),
+      issue_date: document.getElementById('quote-issue-date').value,
+      expiry_date: document.getElementById('quote-expiry-date').value || null,
+      status: 'draft',
+      notes: document.getElementById('quote-notes').value.trim() || null,
+      created_by: state.user.id
+    }).select().single();
+    if(error){ toast(error.message); return; }
+    const rows = [...document.querySelectorAll('#quote-items-body tr')].map(tr=>({
+      quote_id: quote.id,
+      description: tr.querySelector('.ii-desc').value.trim(),
+      quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
+      unit_price: parseFloat(tr.querySelector('.ii-price').value)||0,
+      vat_applicable: tr.querySelector('.ii-vat').checked
+    })).filter(r=>r.description);
+    if(rows.length) await sb.from('cc_quote_items').insert(rows);
+    await refreshAll(); render();
+    toast('Quote created.');
+  });
+  document.querySelectorAll('[data-del-quote]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this quote?')) return;
+      const {error} = await sb.from('cc_quotes').delete().eq('id', btn.dataset.delQuote);
+      if(error){ toast(error.message); return; }
+      await refreshAll(); render();
+    });
+  });
+  document.querySelectorAll('[data-view-quote]').forEach(btn=>{
+    btn.addEventListener('click', ()=>openQuoteView(btn.dataset.viewQuote));
+  });
+  state.quotes.forEach(async (q)=>{
+    const {data: items} = await sb.from('cc_quote_items').select('*').eq('quote_id', q.id);
+    state.quoteItems[q.id] = items || [];
+    const total = docTotal(items);
+    const el = document.getElementById('quo-total-'+q.id);
+    if(el) el.textContent = fmt(total);
+  });
+}
+async function openQuoteView(quoteId){
+  const q = state.quotes.find(x=>x.id===quoteId);
+  const {data: items} = await sb.from('cc_quote_items').select('*').eq('quote_id', quoteId);
+  const client = state.clients.find(c=>c.id===q.client_id);
+  const total = docTotal(items);
+  const canEdit = hasModule('quotes');
+  const backdrop = document.getElementById('quote-view-backdrop');
+  document.getElementById('quote-view-content').innerHTML = `
+    <button class="close-x" id="quote-view-close">✕</button>
+    <h2>${q.quote_number} ${quoteStatusPill(q)}</h2>
+    <p><strong>Client:</strong> ${client ? client.name : '—'}</p>
+    <p style="font-size:.85rem;color:var(--muted);">Issued ${q.issue_date}${q.expiry_date?' · Expires '+q.expiry_date:''}</p>
+    <table><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr></thead><tbody>
+      ${items.map(it=>`<tr><td>${it.description}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
+    </tbody></table>
+    <div style="text-align:right;margin-top:10px;font-weight:700;font-size:1.1rem;">Total: ${fmt(total)}</div>
+    ${q.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${q.notes}</p>` : ''}
+    ${canEdit && q.status!=='converted' ? `
+    <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
+      <span style="font-size:.8rem;color:var(--muted);align-self:center;">Mark as:</span>
+      <button class="btn small secondary" data-set-quote-status="draft">Draft</button>
+      <button class="btn small secondary" data-set-quote-status="sent">Sent</button>
+      <button class="btn small secondary" data-set-quote-status="accepted">Accepted</button>
+      <button class="btn small secondary" data-set-quote-status="declined">Declined</button>
+      <button class="btn small secondary" data-set-quote-status="expired">Expired</button>
+    </div>` : ''}
+    ${canEdit && q.status!=='converted' ? `
+    <div class="modal-actions">
+      <button class="btn" id="convert-quote-btn">Convert to Invoice</button>
+    </div>` : (q.status==='converted' ? `<p style="color:var(--accent2);font-size:.85rem;">Already converted to an invoice.</p>` : '')}
+  `;
+  backdrop.classList.remove('hidden');
+  document.getElementById('quote-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.querySelectorAll('[data-set-quote-status]').forEach(b=>{
+    b.addEventListener('click', async ()=>{
+      const {error} = await sb.from('cc_quotes').update({status:b.dataset.setQuoteStatus}).eq('id', q.id);
+      if(error){ toast(error.message); return; }
+      backdrop.classList.add('hidden');
+      await refreshAll(); render();
+      toast('Quote updated.');
+    });
+  });
+  document.getElementById('convert-quote-btn')?.addEventListener('click', async ()=>{
+    if(!hasModule('invoices')){ toast('You need the Invoices module to convert a quote.'); return; }
+    const issueDate = new Date().toISOString().slice(0,10);
+    if(isPeriodLocked(issueDate)){ toast(periodLockMessage()); return; }
+    const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const {data: invoice, error} = await sb.from('cc_invoices').insert({
+      company_id: state.company.id,
+      client_id: q.client_id,
+      invoice_number: nextInvoiceNumber(),
+      issue_date: issueDate,
+      due_date: null,
+      status: 'draft',
+      notes: q.notes,
+      created_by: state.user.id,
+      approval_status: approvalStatus,
+      currency: 'ZAR',
+      exchange_rate: 1
+    }).select().single();
+    if(error){ toast(error.message); return; }
+    if(items && items.length){
+      await sb.from('cc_invoice_items').insert(items.map(it=>({
+        invoice_id: invoice.id,
+        description: it.description, quantity: it.quantity, unit_price: it.unit_price, vat_applicable: it.vat_applicable
+      })));
+    }
+    if(approvalStatus === 'approved') await recognizeInvoiceRevenue(invoice, items || []);
+    await sb.from('cc_quotes').update({status:'converted', converted_invoice_id: invoice.id}).eq('id', q.id);
+    await logActivity('create', 'invoice', invoice.id, `${invoice.invoice_number} (from quote ${q.quote_number})`);
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Quote converted to invoice '+invoice.invoice_number+'.');
+  });
+}
+
+
 /* ========================= CREDIT NOTES ========================= */
 function nextCreditNoteNumber(){
   const year = new Date().getFullYear();
@@ -3147,6 +3706,10 @@ function creditNoteModal(){
           <div class="field"><label>Issue date</label><input type="date" id="creditnote-issue-date" required></div>
           <div class="field"><label>Against invoice (optional)</label><select id="creditnote-invoice"><option value="">—</option>${state.invoices.map(i=>`<option value="${i.id}">${i.invoice_number}</option>`).join('')}</select></div>
         </div>
+        <div class="row">
+          <div class="field"><label>Currency</label><select id="creditnote-currency">${CURRENCIES.map(c=>`<option value="${c}">${c}</option>`).join('')}</select></div>
+          <div class="field hidden" id="creditnote-exchange-rate-field"><label>Exchange rate (1 unit → ZAR)</label><input type="number" step="0.0001" id="creditnote-exchange-rate" value="1"></div>
+        </div>
         <div class="field"><label>Reason</label><input type="text" id="creditnote-reason" placeholder="e.g. returned goods, billing correction"></div>
         <h3 style="margin-bottom:6px;">Line items</h3>
         <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
@@ -3169,7 +3732,13 @@ function attachCreditNoteHandlers(){
     document.getElementById('creditnote-number').value = nextCreditNoteNumber();
     document.getElementById('creditnote-issue-date').value = new Date().toISOString().slice(0,10);
     document.getElementById('creditnote-items-body').innerHTML = invoiceItemRow(weAreVatRegistered());
+    document.getElementById('creditnote-currency').value = 'ZAR';
+    document.getElementById('creditnote-exchange-rate').value = '1';
+    document.getElementById('creditnote-exchange-rate-field').classList.add('hidden');
     backdrop.classList.remove('hidden');
+  });
+  document.getElementById('creditnote-currency')?.addEventListener('change', (e)=>{
+    document.getElementById('creditnote-exchange-rate-field').classList.toggle('hidden', e.target.value==='ZAR');
   });
   document.getElementById('creditnote-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('creditnote-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
@@ -3184,16 +3753,22 @@ function attachCreditNoteHandlers(){
     const clientId = document.getElementById('creditnote-client').value;
     if(!clientId){ toast('Add a client first.'); return; }
     const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const creditNoteIssueDate = document.getElementById('creditnote-issue-date').value;
+    if(isPeriodLocked(creditNoteIssueDate)){ toast(periodLockMessage()); return; }
+    const cnCurrency = document.getElementById('creditnote-currency').value || 'ZAR';
+    const cnExchangeRate = cnCurrency==='ZAR' ? 1 : (parseFloat(document.getElementById('creditnote-exchange-rate').value) || 1);
     const {data: note, error} = await sb.from('cc_credit_notes').insert({
       company_id: state.company.id,
       client_id: clientId,
       invoice_id: document.getElementById('creditnote-invoice').value || null,
       credit_note_number: document.getElementById('creditnote-number').value.trim(),
-      issue_date: document.getElementById('creditnote-issue-date').value,
+      issue_date: creditNoteIssueDate,
       reason: document.getElementById('creditnote-reason').value.trim() || null,
       status: 'draft',
       notes: document.getElementById('creditnote-notes').value.trim() || null,
       created_by: state.user.id,
+      currency: cnCurrency,
+      exchange_rate: cnExchangeRate,
       approval_status: approvalStatus
     }).select().single();
     if(error){ toast(error.message); return; }
@@ -3213,6 +3788,7 @@ function attachCreditNoteHandlers(){
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this credit note?')) return;
       const delNote = state.creditNotes.find(x=>x.id===btn.dataset.delCreditnote);
+      if(delNote && isPeriodLocked(delNote.issue_date)){ toast(periodLockMessage()); return; }
       const {error} = await sb.from('cc_credit_notes').delete().eq('id', btn.dataset.delCreditnote);
       if(error){ toast(error.message); return; }
       await logActivity('delete', 'credit_note', btn.dataset.delCreditnote, delNote ? delNote.credit_note_number : '');
@@ -3239,6 +3815,8 @@ async function openCreditNoteView(noteId){
   const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
   const vatTotal = items.reduce((s,it)=> s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
   const total = items.reduce((s,it)=>s+it.quantity*it.unit_price,0);
+  const cnIsForeign = note.currency && note.currency !== 'ZAR';
+  const cnZarTotal = cnIsForeign ? round2(total * (Number(note.exchange_rate)||1)) : total;
   const backdrop = document.getElementById('creditnote-view-backdrop');
   document.getElementById('creditnote-view-content').innerHTML = `
     <button class="close-x" id="creditnote-view-close">✕</button>
@@ -3253,7 +3831,7 @@ async function openCreditNoteView(noteId){
     <div style="text-align:right;margin-top:10px;font-size:.9rem;">
       <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
       ${weAreVatRegistered() ? `<div>VAT (15%): ${fmt(vatTotal)}</div>` : ''}
-      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmt(total)}</div>
+      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmtCurrency(total, note.currency)}${cnIsForeign ? ` (≈ ${fmt(cnZarTotal)} @ ${note.exchange_rate})` : ''}</div>
     </div>
     ${note.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${note.notes}</p>` : ''}
     ${note.approval_status === 'rejected' && note.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${note.rejection_note}</p>` : ''}
@@ -3313,6 +3891,7 @@ function normalizePayslipCalc(calc){
   return {
     payDate: calc.payDate, basic: calc.basic, travelAllowance: calc.travelAllowance,
     bonus: calc.bonus, commission: calc.commission, grossEarnings: calc.grossEarnings,
+    carFringeBenefit: calc.carFringeBenefit, loanFringeBenefit: calc.loanFringeBenefit,
     retirementContribution: calc.retirementContribution, medicalContribution: calc.medicalContribution,
     medicalCreditMonthly: calc.medicalCreditPeriod,
     paye: calc.paye, uifEmployee: calc.uifEmployee, uifEmployer: calc.uifEmployer,
@@ -3324,6 +3903,7 @@ function normalizePayslipRow(row){
   return {
     payDate: row.pay_date, basic: row.basic_salary, travelAllowance: row.travel_allowance,
     bonus: row.bonus, commission: row.commission, grossEarnings: row.gross,
+    carFringeBenefit: row.car_fringe_benefit, loanFringeBenefit: row.loan_fringe_benefit,
     retirementContribution: row.retirement_deduction, medicalContribution: row.medical_deduction,
     medicalCreditMonthly: row.medical_credit,
     paye: row.paye, uifEmployee: row.uif_employee, uifEmployer: row.uif_employer,
@@ -3345,6 +3925,11 @@ function renderPayslipHTML(emp, v){
         ${v.commission ? `<tr><td>Commission</td><td style="text-align:right;">${fmt(v.commission)}</td></tr>` : ''}
         <tr style="font-weight:700;"><td>Gross Earnings</td><td style="text-align:right;">${fmt(v.grossEarnings)}</td></tr>
       </tbody></table>
+      ${(v.carFringeBenefit || v.loanFringeBenefit) ? `
+      <table style="margin-top:10px;"><thead><tr><th>Fringe benefits (non-cash, added to taxable income only)</th><th style="text-align:right;">Amount</th></tr></thead><tbody>
+        ${v.carFringeBenefit ? `<tr><td>Company vehicle use</td><td style="text-align:right;">${fmt(v.carFringeBenefit)}</td></tr>` : ''}
+        ${v.loanFringeBenefit ? `<tr><td>Low/no-interest loan</td><td style="text-align:right;">${fmt(v.loanFringeBenefit)}</td></tr>` : ''}
+      </tbody></table>` : ''}
       <table style="margin-top:10px;"><thead><tr><th>Deductions</th><th style="text-align:right;">Amount</th></tr></thead><tbody>
         <tr><td>PAYE (Employees' Tax)</td><td style="text-align:right;">${fmt(v.paye)}</td></tr>
         <tr><td>UIF Contribution</td><td style="text-align:right;">${fmt(v.uifEmployee)}</td></tr>
@@ -3377,7 +3962,8 @@ function computeIRP5(employeeId, taxYearLabel){
   return {
     bounds, count: rows.length,
     income3601: sum('basic_salary'), bonus3605: sum('bonus'), commission3606: sum('commission'),
-    travel3701: sum('travel_allowance'), retirement4001: sum('retirement_deduction'),
+    travel3701: sum('travel_allowance'), car3802: sum('car_fringe_benefit'), loan3801: sum('loan_fringe_benefit'),
+    retirement4001: sum('retirement_deduction'),
     medical4005: sum('medical_deduction'), medicalCredit4116: sum('medical_credit'),
     paye4102: sum('paye'), uif4141: sum('uif_employee'),
     grossRemuneration: sum('gross'), netPayTotal: sum('net'),
@@ -3397,6 +3983,8 @@ function renderIRP5HTML(emp, irp){
         ${irp.bonus3605 ? `<tr><td>3605</td><td>Annual Payment (bonus)</td><td style="text-align:right;">${fmt(irp.bonus3605)}</td></tr>` : ''}
         ${irp.commission3606 ? `<tr><td>3606</td><td>Commission</td><td style="text-align:right;">${fmt(irp.commission3606)}</td></tr>` : ''}
         ${irp.travel3701 ? `<tr><td>3701</td><td>Travel Allowance</td><td style="text-align:right;">${fmt(irp.travel3701)}</td></tr>` : ''}
+        ${irp.car3802 ? `<tr><td>3802</td><td>Use of Employer-Provided Vehicle</td><td style="text-align:right;">${fmt(irp.car3802)}</td></tr>` : ''}
+        ${irp.loan3801 ? `<tr><td>3801</td><td>General Fringe Benefit (low/no-interest loan)</td><td style="text-align:right;">${fmt(irp.loan3801)}</td></tr>` : ''}
         ${irp.retirement4001 ? `<tr><td>4001</td><td>Pension/Retirement Fund Contributions</td><td style="text-align:right;">${fmt(irp.retirement4001)}</td></tr>` : ''}
         ${irp.medical4005 ? `<tr><td>4005</td><td>Medical Aid Contributions</td><td style="text-align:right;">${fmt(irp.medical4005)}</td></tr>` : ''}
         ${irp.medicalCredit4116 ? `<tr><td>4116</td><td>Medical Scheme Fees Tax Credit</td><td style="text-align:right;">${fmt(irp.medicalCredit4116)}</td></tr>` : ''}
@@ -3553,6 +4141,8 @@ function buildEasyFileCSV(taxYearLabel, employeeResults){
     if(irp.bonus3605) lines.push(csvAmount('3605', irp.bonus3605));
     if(irp.commission3606) lines.push(csvAmount('3606', irp.commission3606));
     if(irp.travel3701) lines.push(csvAmount('3701', irp.travel3701));
+    if(irp.car3802) lines.push(csvAmount('3802', irp.car3802));
+    if(irp.loan3801) lines.push(csvAmount('3801', irp.loan3801));
     if(irp.retirement4001) lines.push(csvAmount('4001', irp.retirement4001));
     if(irp.medical4005) lines.push(csvAmount('4005', irp.medical4005));
     if(irp.medicalCredit4116) lines.push(csvAmount('4116', irp.medicalCredit4116));
@@ -3590,6 +4180,89 @@ function renderEasyFileReadiness(readiness){
   `;
 }
 
+
+// Groups saved (paid) payslips by calendar month for the Monthly EMP201 Tracking panel —
+// actual amounts, not projections, since EMP201 liability is reported on what was actually paid.
+function monthlyPayrollActuals(){
+  const byMonth = {};
+  state.payrollPayments.filter(p=>p.paid).forEach(p=>{
+    const ym = (p.pay_date||'').slice(0,7);
+    if(!ym) return;
+    if(!byMonth[ym]) byMonth[ym] = {ym, paye:0, uifEmployee:0, uifEmployer:0, leviablePayroll:0};
+    byMonth[ym].paye += Number(p.paye) || 0;
+    byMonth[ym].uifEmployee += Number(p.uif_employee) || 0;
+    byMonth[ym].uifEmployer += Number(p.uif_employer) || 0;
+    byMonth[ym].leviablePayroll += (Number(p.basic_salary) || 0) + (Number(p.travel_allowance) || 0);
+  });
+  return Object.values(byMonth).sort((a,b)=> b.ym.localeCompare(a.ym));
+}
+function emp201Row(ym){ return state.emp201Submissions.find(r=>r.period_month===ym); }
+function renderEmp201Panel(){
+  const months = monthlyPayrollActuals();
+  const stat = computeStatutorySummary();
+  return `
+  <div class="panel" style="border-top:3px solid var(--c-payroll);">
+    <h3 style="margin-top:0;">Monthly EMP201 Tracking</h3>
+    <p style="color:var(--muted);font-size:.85rem;margin:0 0 10px;">Actual PAYE, UIF and SDL due per month, from saved payslips — mark each month off once its EMP201 has been submitted and paid. EMP201 is due by the 7th of the following month.</p>
+    ${months.length ? `<table><thead><tr><th>Month</th><th>PAYE</th><th>UIF (both halves)</th><th>SDL</th><th>Total Due</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+      ${months.map(m=>{
+        const sdl = stat.sdl.applicable ? round2(m.leviablePayroll * SDL_RATE) : 0;
+        const total = round2(m.paye + m.uifEmployee + m.uifEmployer + sdl);
+        const row = emp201Row(m.ym);
+        const submitted = !!(row && row.submitted);
+        return `<tr>
+          <td>${monthLabel(m.ym)}</td><td>${fmt(m.paye)}</td><td>${fmt(m.uifEmployee + m.uifEmployer)}</td><td>${fmt(sdl)}</td>
+          <td style="font-weight:600;">${fmt(total)}</td>
+          <td>${submitted ? `<span class="tag-pill">Submitted${row&&row.submitted_date?' — '+row.submitted_date:''}</span>` : '<span class="tag-pill" style="opacity:.6;">Pending</span>'}</td>
+          ${isAdmin() ? `<td><label style="display:flex;align-items:center;gap:6px;font-size:.82rem;white-space:nowrap;"><input type="checkbox" class="emp201-mark-submitted" data-month="${m.ym}" data-paye="${m.paye}" data-uif-employee="${m.uifEmployee}" data-uif-employer="${m.uifEmployer}" data-sdl="${sdl}" ${submitted?'checked':''} style="width:auto;"> Mark submitted</label></td>` : ''}
+        </tr>`;
+      }).join('')}
+    </tbody></table>` : `<div class="empty">No payslips saved yet — save a payslip below to start tracking EMP201 liability by month.</div>`}
+    <p style="color:var(--muted);font-size:.78rem;margin-top:8px;">SDL is only shown where your projected annual payroll is over R500,000. Not tax advice — confirm with your accountant or SARS eFiling before submitting.</p>
+  </div>
+  `;
+}
+// COIDA (Compensation Fund) Return of Earnings: individual employee earnings, capped, for the
+// selected assessment year (same 1 Mar – end Feb window as the SARS individual tax year).
+function computeCoidaReturn(taxYearLabel){
+  const bounds = taxYearBounds(taxYearLabel);
+  const rows = state.employees.filter(e=>e.active).map(emp=>{
+    const paid = state.payrollPayments.filter(p=>p.employee_id===emp.id && p.paid && p.pay_date>=bounds.start && p.pay_date<=bounds.end);
+    const actualEarnings = round2(paid.reduce((s,p)=> s + (Number(p.gross)||0), 0));
+    const cappedEarnings = Math.min(actualEarnings, COIDA_EARNINGS_CAP_2027);
+    return {emp, actualEarnings, cappedEarnings};
+  });
+  const totalAssessable = round2(rows.reduce((s,r)=>s+r.cappedEarnings,0));
+  return {bounds, rows, totalAssessable};
+}
+function renderCoidaPanel(){
+  const current = currentTaxYearLabel();
+  const label = Number(state.coidaTaxYearLabel || current);
+  const coida = computeCoidaReturn(label);
+  const row = state.coidaReturns.find(r=>Number(r.tax_year_label)===label);
+  const submitted = !!(row && row.submitted);
+  const projected = (row && row.projected_earnings_next_year != null) ? row.projected_earnings_next_year : '';
+  return `
+  <div class="panel" style="border-top:3px solid var(--c-payroll);">
+    <h3 style="margin-top:0;">COIDA Return of Earnings (W.As.8)</h3>
+    <p style="color:var(--muted);font-size:.85rem;margin:0 0 10px;">Annual submission window: 1 April – 30 June, with a 10% penalty for a late return. Individual employee earnings are capped at ${fmt(COIDA_EARNINGS_CAP_2027)} for this assessment year.</p>
+    <div class="field" style="max-width:320px;"><label>Assessment year</label><select id="coida-tax-year">
+      ${[current, current-1, current-2].map(y=>`<option value="${y}" ${y===label?'selected':''}>${taxYearBounds(y).label}</option>`).join('')}
+    </select></div>
+    ${coida.rows.length ? `<table><thead><tr><th>Employee</th><th>Actual Earnings</th><th>Capped for Assessment</th></tr></thead><tbody>
+      ${coida.rows.map(r=>`<tr><td>${r.emp.name}</td><td>${fmt(r.actualEarnings)}</td><td>${fmt(r.cappedEarnings)}${r.actualEarnings>COIDA_EARNINGS_CAP_2027?' <span class="tag-pill">capped</span>':''}</td></tr>`).join('')}
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Total Assessable Earnings</td><td></td><td>${fmt(coida.totalAssessable)}</td></tr>
+    </tbody></table>` : `<div class="empty">No active employees, or no payslips saved for this assessment year yet.</div>`}
+    <div class="row" style="margin-top:12px;align-items:flex-end;">
+      <div class="field"><label>Projected earnings for next year (R)</label><input type="number" step="0.01" id="coida-projected" value="${projected}" ${isAdmin()?'':'disabled'}></div>
+      ${isAdmin() ? `<button type="button" class="btn small secondary" id="coida-save-projected">Save</button>` : ''}
+    </div>
+    ${isAdmin() ? `<label style="display:flex;align-items:center;gap:8px;font-weight:500;margin-top:10px;"><input type="checkbox" id="coida-mark-submitted" ${submitted?'checked':''} style="width:auto;"> Return submitted to the Compensation Fund${row&&row.submitted_date?' ('+row.submitted_date+')':''}</label>` : (submitted ? `<p style="font-size:.85rem;margin-top:10px;">Return submitted${row&&row.submitted_date?' on '+row.submitted_date:''}.</p>` : '')}
+    <p style="color:var(--muted);font-size:.78rem;margin-top:10px;">Actual earnings are summed from saved payslips (gross pay) for active employees in this assessment year. Confirm the current earnings cap and submission requirements on the Compensation Fund's own tables before relying on this for a real submission.</p>
+  </div>
+  `;
+}
+
 function renderPayroll(){
   const canEdit = hasModule('payroll');
   const totalPayroll = state.employees.filter(e=>e.active).reduce((s,e)=>s+Number(e.salary),0);
@@ -3610,6 +4283,8 @@ function renderPayroll(){
       <p style="color:var(--muted);font-size:.85rem;margin:0 0 10px;">Generate a CSV of every employee's IRP5 figures for SARS e@syFile Employer's "Import Payroll File" feature. Checks your company and employee details first and tells you exactly what's missing.</p>
       <button class="btn" id="open-easyfile-btn">Check &amp; Export IRP5s</button>
     </div>` : ''}
+    ${isAdmin() ? renderEmp201Panel() : ''}
+    ${isAdmin() ? renderCoidaPanel() : ''}
     <div class="panel">
       <h3 style="margin-top:0;">Employees</h3>
       ${state.employees.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Basic Salary</th><th>Frequency</th><th>Active</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
@@ -3678,11 +4353,24 @@ function renderPayroll(){
         </div>
         <div class="field"><label>Date of birth</label><input type="date" id="employee-dob"></div>
         <div class="field"><label>Travel allowance (R, per pay period)</label><input type="number" step="0.01" id="employee-travel-allowance" value="0"></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;margin:-6px 0 10px;"><input type="checkbox" id="employee-travel-logbook" style="width:auto;"> Logbook substantiates ≥80% business use (withhold PAYE on 20% of the allowance instead of the default 80%)</label>
         <div class="field"><label>Retirement fund contribution (R, per pay period)</label><input type="number" step="0.01" id="employee-retirement" value="0"></div>
         <div class="row">
           <div class="field"><label>Medical aid contribution (R, per pay period)</label><input type="number" step="0.01" id="employee-medical" value="0"></div>
           <div class="field"><label>Medical aid dependants (excl. self)</label><input type="number" step="1" min="0" id="employee-medical-dependants" value="0"></div>
         </div>
+        <h3 style="margin-bottom:2px;">Fringe benefits</h3>
+        <p style="font-size:.78rem;color:var(--muted);margin-top:0;">Adds a taxable fringe benefit value to PAYE per the Seventh Schedule. Estimate only — not tax advice; verify with your accountant or SARS.</p>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="employee-has-car" style="width:auto;"> Company-provided vehicle</label>
+        <div class="row">
+          <div class="field"><label>Vehicle determined value (R)</label><input type="number" step="0.01" id="employee-car-value" value="0"></div>
+          <div class="field" style="display:flex;align-items:center;"><label style="display:flex;align-items:center;gap:8px;font-weight:500;margin-top:18px;"><input type="checkbox" id="employee-car-maintenance" style="width:auto;"> Qualifying maintenance plan (3.25%/month vs 3.5%)</label></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Employer loan balance (R)</label><input type="number" step="0.01" id="employee-loan-balance" value="0"></div>
+          <div class="field"><label>Interest rate charged on loan (% p.a.)</label><input type="number" step="0.01" id="employee-loan-rate" value="0"></div>
+        </div>
+        <p style="font-size:.7rem;color:var(--muted);margin-top:-6px;">Low/no-interest loan benefit = (SARS official rate − rate charged) × balance ÷ 12, if positive. Set the SARS official rate on the Team page under Company Details.</p>
         <div class="modal-actions"><button type="button" class="btn secondary" id="employee-cancel">Cancel</button><button type="submit" class="btn" id="employee-submit">Save</button></div>
       </form>
     </div></div>
@@ -3752,7 +4440,7 @@ function renderPayroll(){
         <button type="button" class="btn secondary" id="easyfile-recheck">Re-check</button>
         <button type="button" class="btn" id="easyfile-download" disabled>Download e@syFile Import CSV</button>
       </div>
-      <p style="font-size:.7rem;color:var(--muted);margin-top:10px;">This file covers the fields Company Compass calculates — income, bonus, commission, travel allowance, retirement &amp; medical aid contributions, PAYE and UIF — built to the SARS e@syFile import layout. It doesn't cover fringe benefits, share schemes, foreign income, or every field in the full BRS specification. Always run e@syFile's own import validation and review its result before relying on this for a real submission.</p>
+      <p style="font-size:.7rem;color:var(--muted);margin-top:10px;">This file covers the fields Company Compass calculates — income, bonus, commission, travel allowance, company car and low/no-interest loan fringe benefits, retirement &amp; medical aid contributions, PAYE and UIF — built to the SARS e@syFile import layout. It doesn't cover share schemes, foreign income, or every field in the full BRS specification. Always run e@syFile's own import validation and review its result before relying on this for a real submission.</p>
     </div></div>` : ''}
   `;
 }
@@ -3769,9 +4457,15 @@ function resetEmployeeForm(){
   document.getElementById('employee-tax-number').value = '';
   document.getElementById('employee-dob').value = '';
   document.getElementById('employee-travel-allowance').value = '0';
+  document.getElementById('employee-travel-logbook').checked = false;
   document.getElementById('employee-retirement').value = '0';
   document.getElementById('employee-medical').value = '0';
   document.getElementById('employee-medical-dependants').value = '0';
+  document.getElementById('employee-has-car').checked = false;
+  document.getElementById('employee-car-value').value = '0';
+  document.getElementById('employee-car-maintenance').checked = false;
+  document.getElementById('employee-loan-balance').value = '0';
+  document.getElementById('employee-loan-rate').value = '0';
   document.getElementById('employee-modal-title').textContent = 'Add Employee';
   document.getElementById('employee-submit').textContent = 'Save';
 }
@@ -3800,9 +4494,15 @@ function attachPayrollHandlers(){
       document.getElementById('employee-tax-number').value = emp.tax_number || '';
       document.getElementById('employee-dob').value = emp.date_of_birth || '';
       document.getElementById('employee-travel-allowance').value = emp.travel_allowance || 0;
+      document.getElementById('employee-travel-logbook').checked = !!emp.travel_logbook_qualifies;
       document.getElementById('employee-retirement').value = emp.retirement_contribution || 0;
       document.getElementById('employee-medical').value = emp.medical_aid_contribution || 0;
       document.getElementById('employee-medical-dependants').value = emp.medical_aid_dependants || 0;
+      document.getElementById('employee-has-car').checked = !!emp.has_company_car;
+      document.getElementById('employee-car-value').value = emp.car_determined_value || 0;
+      document.getElementById('employee-car-maintenance').checked = !!emp.car_has_maintenance_plan;
+      document.getElementById('employee-loan-balance').value = emp.loan_balance || 0;
+      document.getElementById('employee-loan-rate').value = emp.loan_interest_rate_charged || 0;
       document.getElementById('employee-modal-title').textContent = 'Edit ' + emp.name;
       document.getElementById('employee-submit').textContent = 'Save Changes';
       empBackdrop.classList.remove('hidden');
@@ -3823,9 +4523,15 @@ function attachPayrollHandlers(){
       tax_number: document.getElementById('employee-tax-number').value.trim() || null,
       date_of_birth: document.getElementById('employee-dob').value || null,
       travel_allowance: parseFloat(document.getElementById('employee-travel-allowance').value) || 0,
+      travel_logbook_qualifies: document.getElementById('employee-travel-logbook').checked,
       retirement_contribution: parseFloat(document.getElementById('employee-retirement').value) || 0,
       medical_aid_contribution: parseFloat(document.getElementById('employee-medical').value) || 0,
       medical_aid_dependants: parseInt(document.getElementById('employee-medical-dependants').value, 10) || 0,
+      has_company_car: document.getElementById('employee-has-car').checked,
+      car_determined_value: parseFloat(document.getElementById('employee-car-value').value) || 0,
+      car_has_maintenance_plan: document.getElementById('employee-car-maintenance').checked,
+      loan_balance: parseFloat(document.getElementById('employee-loan-balance').value) || 0,
+      loan_interest_rate_charged: parseFloat(document.getElementById('employee-loan-rate').value) || 0,
     };
     const {error} = editId
       ? await sb.from('cc_employees').update(payload).eq('id', editId)
@@ -3893,6 +4599,7 @@ function attachPayrollHandlers(){
         employee_id: emp.id, company_id: state.company.id, pay_date: calc.payDate,
         gross: calc.grossEarnings, deductions: calc.totalDeductions, net: calc.netPay, paid: true,
         basic_salary: calc.basic, travel_allowance: calc.travelAllowance, bonus: calc.bonus, commission: calc.commission,
+        car_fringe_benefit: calc.carFringeBenefit, loan_fringe_benefit: calc.loanFringeBenefit,
         retirement_deduction: calc.retirementContribution, medical_deduction: calc.medicalContribution,
         paye: calc.paye, uif_employee: calc.uifEmployee, uif_employer: calc.uifEmployer,
         medical_credit: calc.medicalCreditPeriod, other_deduction: calc.otherDeduction, other_deduction_note: calc.otherDeductionNote,
@@ -4041,6 +4748,56 @@ function attachPayrollHandlers(){
   document.getElementById('easyfile-tax-year')?.addEventListener('change', runEasyFileCheck);
   document.getElementById('easyfile-recheck')?.addEventListener('click', runEasyFileCheck);
   document.getElementById('easyfile-modal-close')?.addEventListener('click', ()=>easyfileBackdrop.classList.add('hidden'));
+
+  /* ---------- Monthly EMP201 Tracking ---------- */
+  document.querySelectorAll('.emp201-mark-submitted').forEach(cb=>{
+    cb.addEventListener('change', async ()=>{
+      const ym = cb.dataset.month;
+      const existing = emp201Row(ym);
+      const payload = {
+        company_id: state.company.id, period_month: ym,
+        paye: parseFloat(cb.dataset.paye) || 0, uif_employee: parseFloat(cb.dataset.uifEmployee) || 0,
+        uif_employer: parseFloat(cb.dataset.uifEmployer) || 0, sdl: parseFloat(cb.dataset.sdl) || 0,
+        submitted: cb.checked, submitted_date: cb.checked ? todayIso() : null,
+      };
+      const {error} = existing
+        ? await sb.from('cc_emp201_submissions').update(payload).eq('id', existing.id)
+        : await sb.from('cc_emp201_submissions').insert(payload);
+      if(error){ toast(error.message); cb.checked = !cb.checked; return; }
+      await refreshAll(); render(); toast(payload.submitted ? 'Marked as submitted.' : 'Marked as not submitted.');
+    });
+  });
+
+  /* ---------- COIDA Return of Earnings ---------- */
+  document.getElementById('coida-tax-year')?.addEventListener('change', (e)=>{
+    state.coidaTaxYearLabel = e.target.value; render();
+  });
+  document.getElementById('coida-save-projected')?.addEventListener('click', async ()=>{
+    const label = Number(document.getElementById('coida-tax-year').value);
+    const existing = state.coidaReturns.find(r=>Number(r.tax_year_label)===label);
+    const payload = {
+      company_id: state.company.id, tax_year_label: label,
+      projected_earnings_next_year: parseFloat(document.getElementById('coida-projected').value) || 0,
+    };
+    const {error} = existing
+      ? await sb.from('cc_coida_returns').update(payload).eq('id', existing.id)
+      : await sb.from('cc_coida_returns').insert(payload);
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Projected earnings saved.');
+  });
+  document.getElementById('coida-mark-submitted')?.addEventListener('change', async (e)=>{
+    const label = Number(document.getElementById('coida-tax-year').value);
+    const existing = state.coidaReturns.find(r=>Number(r.tax_year_label)===label);
+    const payload = {
+      company_id: state.company.id, tax_year_label: label,
+      submitted: e.target.checked, submitted_date: e.target.checked ? todayIso() : null,
+    };
+    const {error} = existing
+      ? await sb.from('cc_coida_returns').update(payload).eq('id', existing.id)
+      : await sb.from('cc_coida_returns').insert(payload);
+    if(error){ toast(error.message); e.target.checked = !e.target.checked; return; }
+    await refreshAll(); render(); toast(payload.submitted ? 'Marked as submitted.' : 'Marked as not submitted.');
+  });
 }
 
 /* ========================= REPORTS (P&L / BALANCE SHEET / RATIOS) ========================= */
@@ -4077,6 +4834,58 @@ function monthLabel(ym){
   const [y,m] = (ym||'').split('-').map(Number);
   if(!y || !m) return ym;
   return new Date(y, m-1, 1).toLocaleString(undefined, {month:'long', year:'numeric'});
+}
+
+
+// Company's financial year bounds (Mar-Feb by default, i.e. financial_year_end_month=2, matching
+// the SARS individual tax year) — used to scope the Company Tax / Provisional Tax report tab.
+// offsetYears: 0 = the FY containing today, -1/+1 = the previous/next FY.
+function companyFinancialYearBounds(offsetYears){
+  offsetYears = offsetYears || 0;
+  const feMonth = Number(state.company.financial_year_end_month) || 2; // 1-12
+  const now = new Date();
+  const y = now.getFullYear(), m = now.getMonth() + 1;
+  let endYear = (m <= feMonth) ? y : y + 1;
+  endYear += offsetYears;
+  const iso = d => d.toISOString().slice(0,10);
+  const endDate = new Date(endYear, feMonth, 0);       // last day of feMonth in endYear
+  const startDate = new Date(endYear - 1, feMonth, 1); // first day of the month after feMonth, prior year
+  return { endYear, feMonth, start: iso(startDate), end: iso(endDate) };
+}
+// The two annual IRP6 provisional tax periods: first payment due at the FY's halfway point
+// (6 months in), second at FY end — e.g. for a Mar-Feb financial year, roughly Aug and Feb.
+function provisionalTaxPeriods(fy){
+  const halfwayMonth = ((fy.feMonth + 6 - 1) % 12) + 1; // 1-12
+  const halfwayYear = halfwayMonth <= fy.feMonth ? fy.endYear : fy.endYear - 1;
+  const iso = d => d.toISOString().slice(0,10);
+  const p1End = iso(new Date(halfwayYear, halfwayMonth, 0));
+  return [ {period_number: 1, end: p1End}, {period_number: 2, end: fy.end} ];
+}
+function provisionalTaxRow(endYear, periodNumber){
+  return state.provisionalTax.find(r => r.tax_year_end_year === endYear && r.period_number === periodNumber);
+}
+// Estimates company income tax at the flat COMPANY_TAX_RATE, extrapolating year-to-date net
+// profit (from the existing P&L logic) to a full-year figure once the FY is still in progress.
+function computeProvisionalTax(fy){
+  const today = todayIso();
+  const periods = provisionalTaxPeriods(fy);
+  const isFYComplete = today >= fy.end;
+  const toDate = isFYComplete ? fy.end : (today < fy.start ? fy.start : today);
+  const pl = computePL(fy.start, toDate);
+  const daysElapsed = Math.max(1, Math.round((new Date(toDate) - new Date(fy.start)) / 86400000) + 1);
+  const daysInFY = Math.max(1, Math.round((new Date(fy.end) - new Date(fy.start)) / 86400000) + 1);
+  const estimatedAnnualProfit = isFYComplete ? pl.netProfit : pl.netProfit * (daysInFY / daysElapsed);
+  const estimatedAnnualTax = round2(Math.max(0, estimatedAnnualProfit) * COMPANY_TAX_RATE);
+  const period1Tax = round2(estimatedAnnualTax / 2);
+  const period2Tax = round2(estimatedAnnualTax - period1Tax);
+  return {
+    fy, isFYComplete, ytdProfit: pl.netProfit, ytdThrough: toDate,
+    estimatedAnnualProfit: round2(estimatedAnnualProfit), estimatedAnnualTax,
+    periods: [
+      Object.assign({}, periods[0], {estimatedTax: period1Tax}),
+      Object.assign({}, periods[1], {estimatedTax: period2Tax}),
+    ],
+  };
 }
 
 function computePL(start, end){
@@ -4491,6 +5300,7 @@ function renderReports(){
       <button class="btn ${state.reportsTab==='budget'?'':'secondary'} small" data-report-tab="budget">Budget vs Actual</button>
       <button class="btn ${state.reportsTab==='financials'?'':'secondary'} small" data-report-tab="financials">Signed Financials</button>
       <button class="btn ${state.reportsTab==='ratios'?'':'secondary'} small" data-report-tab="ratios">Ratios</button>
+      <button class="btn ${state.reportsTab==='companytax'?'':'secondary'} small" data-report-tab="companytax">Company Tax</button>
     </div>
     <p class="section-caption">${({
       monthly: "A full month's pack in one place — P&amp;L, balance sheet, fixed assets, and outstanding balances.",
@@ -4502,6 +5312,7 @@ function renderReports(){
       budget: "Actual spending against what was budgeted, by category.",
       financials: "Signed-off financial statements, filed for the record.",
       ratios: "Key ratios that summarise financial health at a glance.",
+      companytax: "Estimated company income tax and the two annual provisional tax (IRP6) payment windows.",
     })[state.reportsTab] || "Revenue minus expenses for the period — how much the business made."}</p>
     ${state.reportsTab==='monthly' ? `
     <div class="panel period-bar">
@@ -4509,7 +5320,7 @@ function renderReports(){
       <button class="btn small secondary" id="monthly-accounts-this-month">This Month</button>
       <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">${monthLabel(state.monthlyAccountsMonth)}</div>
     </div>
-    ` : `
+    ` : state.reportsTab==='companytax' ? '' : `
     <div class="panel period-bar">
       ${['month','quarter','year','all'].map(m=>`<button class="btn ${state.reportsPeriod.mode===m?'':'secondary'} small" data-period-mode="${m}">${periodModeLabel(m)}</button>`).join('')}
       <button class="btn ${state.reportsPeriod.mode==='custom'?'':'secondary'} small" data-period-mode="custom">Custom</button>
@@ -4521,7 +5332,7 @@ function renderReports(){
       <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">P&amp;L: ${period.start} to ${period.end}<br>Balance sheet as of ${period.end}</div>
     </div>
     `}
-    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : renderPL(pl)}
+    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : state.reportsTab==='companytax' ? renderCompanyTax() : renderPL(pl)}
   `;
 }
 
@@ -4677,6 +5488,41 @@ function renderRatios(ratios, bs){
   `;
 }
 
+
+function renderCompanyTax(){
+  const fy = companyFinancialYearBounds(state.companyTaxFYOffset || 0);
+  const ct = computeProvisionalTax(fy);
+  return `
+    <div class="panel period-bar">
+      <button class="btn small secondary" id="companytax-prev-fy">&lsaquo; Previous FY</button>
+      <div style="align-self:center;font-weight:600;">Financial year: ${fy.start} to ${fy.end}</div>
+      <button class="btn small secondary" id="companytax-next-fy">Next FY &rsaquo;</button>
+      <button class="btn small secondary" id="companytax-this-fy" style="margin-left:auto;">Current FY</button>
+    </div>
+    <div class="grid">
+      <div class="card" style="--accent-c:var(--c-reports);"><h3>Est. Net Profit (full FY)</h3><div class="value ${ct.estimatedAnnualProfit<0?'negative':''}">${fmt(ct.estimatedAnnualProfit)}</div><div class="sub">${ct.isFYComplete ? `Actual, for the full year` : `Extrapolated from ${fmt(ct.ytdProfit)} to ${ct.ytdThrough}`}</div></div>
+      <div class="card"><h3>Est. Company Income Tax</h3><div class="value">${fmt(ct.estimatedAnnualTax)}</div><div class="sub">${(COMPANY_TAX_RATE*100).toFixed(0)}% flat company rate</div></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Provisional Tax Payments (IRP6)</h3>
+      <table><thead><tr><th>Period</th><th>Due (estimate)</th><th>Estimated Tax</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
+        ${ct.periods.map(p=>{
+          const row = provisionalTaxRow(fy.endYear, p.period_number);
+          const paid = !!(row && row.paid);
+          return `<tr>
+            <td>${p.period_number===1?'First Period':'Second Period (top-up)'}</td>
+            <td>${p.end}</td>
+            <td>${fmt(p.estimatedTax)}</td>
+            <td>${paid?`<span class="tag-pill">Paid${row&&row.paid_date?' — '+row.paid_date:''}</span>`:'<span class="tag-pill" style="opacity:.6;">Not yet paid</span>'}</td>
+            ${isAdmin() ? `<td><label style="display:flex;align-items:center;gap:6px;font-size:.82rem;white-space:nowrap;"><input type="checkbox" class="companytax-mark-paid" data-tax-year="${fy.endYear}" data-period="${p.period_number}" data-estimated="${p.estimatedTax}" data-due="${p.end}" ${paid?'checked':''} style="width:auto;"> Mark paid</label></td>` : ''}
+          </tr>`;
+        }).join('')}
+      </tbody></table>
+    </div>
+    <p style="color:var(--muted);font-size:.8rem;">Estimate only, at the flat ${(COMPANY_TAX_RATE*100).toFixed(0)}% standard company rate — this does not model Small Business Corporation graduated rates or turnover tax, and (while the financial year is still in progress) extrapolates from your Profit &amp; Loss to date. SARS' actual first and second provisional tax due dates fall on the last day of the 6th and 12th months of your financial year. Not tax advice — confirm exact dates and figures with your accountant or SARS eFiling before paying.</p>
+  `;
+}
+
 function attachReportsHandlers(){
   const period = currentPeriod();
   if(state.reportsTab==='pl' || !state.reportsTab){
@@ -4733,6 +5579,26 @@ function attachReportsHandlers(){
     if(!start || !end || start>end){ toast('Enter a valid date range.'); return; }
     state.reportsPeriod = {mode:'custom', start, end};
     render();
+  });
+  document.getElementById('companytax-prev-fy')?.addEventListener('click', ()=>{ state.companyTaxFYOffset = (state.companyTaxFYOffset||0) - 1; render(); });
+  document.getElementById('companytax-next-fy')?.addEventListener('click', ()=>{ state.companyTaxFYOffset = (state.companyTaxFYOffset||0) + 1; render(); });
+  document.getElementById('companytax-this-fy')?.addEventListener('click', ()=>{ state.companyTaxFYOffset = 0; render(); });
+  document.querySelectorAll('.companytax-mark-paid').forEach(cb=>{
+    cb.addEventListener('change', async ()=>{
+      const taxYear = parseInt(cb.dataset.taxYear, 10);
+      const periodNumber = parseInt(cb.dataset.period, 10);
+      const existing = provisionalTaxRow(taxYear, periodNumber);
+      const payload = {
+        company_id: state.company.id, tax_year_end_year: taxYear, period_number: periodNumber,
+        due_date: cb.dataset.due, estimated_tax: parseFloat(cb.dataset.estimated) || 0,
+        paid: cb.checked, paid_date: cb.checked ? todayIso() : null,
+      };
+      const {error} = existing
+        ? await sb.from('cc_provisional_tax').update(payload).eq('id', existing.id)
+        : await sb.from('cc_provisional_tax').insert(payload);
+      if(error){ toast(error.message); cb.checked = !cb.checked; return; }
+      await refreshAll(); render(); toast(payload.paid ? 'Marked as paid.' : 'Marked as not yet paid.');
+    });
   });
   document.getElementById('budget-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
@@ -4886,6 +5752,9 @@ function renderTeam(){
         <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-vat-registered" style="width:auto;" ${weAreVatRegistered()?'checked':''}> Registered for VAT</label>
         <div class="field" id="company-vat-number-field" style="${weAreVatRegistered()?'':'display:none;'}"><label>VAT number</label><input type="text" id="company-vat-number" value="${state.company.vat_number || ''}"></div>
         <div class="field"><label>Company registration number (CIPC)</label><input type="text" id="company-registration-number" placeholder="e.g. 2019/123456/07" value="${state.company.registration_number || ''}"></div>
+        <div class="field"><label>COIDA registration number (Compensation Fund)</label><input type="text" id="company-coida-registration-number" value="${state.company.coida_registration_number || ''}"></div>
+        <div class="field"><label>Financial year-end</label><select id="company-financial-year-end-month"><option value="1" ${state.company.financial_year_end_month==1?'selected':''}>January</option><option value="2" ${state.company.financial_year_end_month==2?'selected':''}>February</option><option value="3" ${state.company.financial_year_end_month==3?'selected':''}>March</option><option value="4" ${state.company.financial_year_end_month==4?'selected':''}>April</option><option value="5" ${state.company.financial_year_end_month==5?'selected':''}>May</option><option value="6" ${state.company.financial_year_end_month==6?'selected':''}>June</option><option value="7" ${state.company.financial_year_end_month==7?'selected':''}>July</option><option value="8" ${state.company.financial_year_end_month==8?'selected':''}>August</option><option value="9" ${state.company.financial_year_end_month==9?'selected':''}>September</option><option value="10" ${state.company.financial_year_end_month==10?'selected':''}>October</option><option value="11" ${state.company.financial_year_end_month==11?'selected':''}>November</option><option value="12" ${state.company.financial_year_end_month==12?'selected':''}>December</option></select></div>
+        <div class="field"><label>SARS official rate of interest (% p.a.)</label><input type="number" step="0.01" id="company-official-interest-rate" value="${state.company.official_interest_rate_pct}"><p style="font-size:.72rem;color:var(--muted);margin:2px 0 0;">Used for the low/no-interest employer loan fringe benefit. SARS updates this when the repo rate moves — check the current published rate before relying on it.</p></div>
         <h3 style="margin-bottom:2px;">SARS statutory references</h3>
         <p style="font-size:.78rem;color:var(--muted);margin-top:0;">Required for the bulk IRP5 export to e@syFile Employer.</p>
         <div class="row">
@@ -4913,6 +5782,19 @@ function renderTeam(){
       <div style="display:flex;flex-wrap:wrap;gap:8px;">
         ${Object.entries(CSV_EXPORTS).map(([key,def])=>`<button type="button" class="btn small secondary" data-export-csv="${key}">${def.label}</button>`).join('')}
       </div>
+    </div>` : ''}
+    ${isAdmin() ? `
+    <div class="panel">
+      <h3 style="margin-top:0;">Accounting Period Lock</h3>
+      <p style="color:var(--muted);font-size:.85rem;">Lock the books through a date so nothing can be added, edited, or deleted on or before it — Revenue, Expenses, Invoices, Credit Notes, Supplier Invoices, and Supplier Credit Notes. Move the date forward as you close each period; approvals, payments, and status changes on existing records still work as normal.</p>
+      ${state.company.locked_through_date
+        ? `<p style="font-weight:600;">🔒 Locked through ${state.company.locked_through_date}</p>`
+        : `<p style="color:var(--muted);">No lock set — all periods are open.</p>`}
+      <form id="period-lock-form" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+        <div class="field" style="margin-bottom:0;"><label>Locked through</label><input type="date" id="period-lock-date" value="${state.company.locked_through_date || ''}"></div>
+        <button type="submit" class="btn small">Save</button>
+        ${state.company.locked_through_date ? `<button type="button" class="btn small secondary" id="period-lock-clear">Clear lock</button>` : ''}
+      </form>
     </div>` : ''}
     <div class="panel">
       <h3 style="margin-top:0;">App access</h3>
@@ -4948,10 +5830,12 @@ function renderTeam(){
           <label>Modules this staff member can add &amp; edit</label>
           <div class="perm-box">
             <label><input type="checkbox" class="member-module" value="revenue"> Revenue</label>
+          <label><input type="checkbox" class="member-module" value="stock"> Stock</label>
           <label><input type="checkbox" class="member-module" value="expenses"> Expenses</label>
           <label><input type="checkbox" class="member-module" value="assets"> Assets</label>
           <label><input type="checkbox" class="member-module" value="liabilities"> Liabilities</label>
           <label><input type="checkbox" class="member-module" value="clients"> Clients</label>
+          <label><input type="checkbox" class="member-module" value="quotes"> Quotes</label>
           <label><input type="checkbox" class="member-module" value="invoices"> Invoices</label>
           <label><input type="checkbox" class="member-module" value="credit_notes"> Credit Notes</label>
           <label><input type="checkbox" class="member-module" value="payroll"> Payroll</label>
@@ -5010,6 +5894,23 @@ function attachTeamHandlers(){
   document.querySelectorAll('[data-export-csv]').forEach(btn=>{
     btn.addEventListener('click', ()=>exportCSV(btn.dataset.exportCsv));
   });
+  document.getElementById('period-lock-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const locked_through_date = document.getElementById('period-lock-date').value || null;
+    const {error} = await sb.from('cc_companies').update({locked_through_date}).eq('id', state.company.id);
+    if(error){ toast(error.message); return; }
+    state.company.locked_through_date = locked_through_date;
+    render();
+    toast(locked_through_date ? `Locked through ${locked_through_date}.` : 'Lock cleared.');
+  });
+  document.getElementById('period-lock-clear')?.addEventListener('click', async ()=>{
+    if(!confirm('Clear the period lock? All periods will be open again.')) return;
+    const {error} = await sb.from('cc_companies').update({locked_through_date: null}).eq('id', state.company.id);
+    if(error){ toast(error.message); return; }
+    state.company.locked_through_date = null;
+    render();
+    toast('Lock cleared.');
+  });
   document.getElementById('company-vat-registered')?.addEventListener('change', (e)=>{
     document.getElementById('company-vat-number-field').style.display = e.target.checked ? '' : 'none';
   });
@@ -5026,13 +5927,17 @@ function attachTeamHandlers(){
     const contact_surname = document.getElementById('company-contact-surname').value.trim() || null;
     const contact_email = document.getElementById('company-contact-email').value.trim() || null;
     const contact_phone = document.getElementById('company-contact-phone').value.trim() || null;
+    const coida_registration_number = document.getElementById('company-coida-registration-number').value.trim() || null;
+    const financial_year_end_month = parseInt(document.getElementById('company-financial-year-end-month').value) || 2;
+    const official_interest_rate_pct = parseFloat(document.getElementById('company-official-interest-rate').value) || 0;
     const {error} = await sb.from('cc_companies').update({
       address, vat_registered, vat_number, registration_number,
       paye_reference_number, sdl_reference_number, uif_reference_number,
-      contact_first_name, contact_surname, contact_email, contact_phone
+      contact_first_name, contact_surname, contact_email, contact_phone,
+      coida_registration_number, financial_year_end_month, official_interest_rate_pct
     }).eq('id', state.company.id);
     if(error){ toast(error.message); return; }
-    Object.assign(state.company, { address, vat_registered, vat_number, registration_number, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone });
+    Object.assign(state.company, { address, vat_registered, vat_number, registration_number, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone, coida_registration_number, financial_year_end_month, official_interest_rate_pct });
     render();
     toast('Company details saved.');
   });
