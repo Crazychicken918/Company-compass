@@ -15,6 +15,7 @@
     --c-dashboard:#7c5cff; --c-revenue:#0fb981; --c-expenses:#f4406a; --c-assets:#06b6d4;
     --c-liabilities:#f5a524; --c-clients:#a855f7; --c-invoices:#6366f1; --c-creditnotes:#ec4899;
     --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b; --c-reports:#1d4ed8;
+    --c-settings:#334155;
     --c-scenarios:#059669; --c-supplierinvoices:#0ea5e9; --c-tasks:#7c3aed;
     --c-quotes:#eab308; --c-stock:#84cc16;
     --grid-line: rgba(25,26,35,.03);
@@ -109,6 +110,7 @@
   #sidebar nav button[data-view="vat"]{--dot:var(--c-vat);}
   #sidebar nav button[data-view="reports"]{--dot:var(--c-reports);}
   #sidebar nav button[data-view="team"]{--dot:var(--c-team);}
+  #sidebar nav button[data-view="settings"]{--dot:var(--c-settings);}
   #sidebar nav button[data-view="scenarios"]{--dot:var(--c-scenarios);}
   #sidebar nav button[data-view="supplierinvoices"]{--dot:var(--c-supplierinvoices);}
   #sidebar nav button[data-view="quotes"]{--dot:var(--c-quotes);}
@@ -247,6 +249,7 @@
       <button data-view="bankfeed"><span class="dot"></span>Bank Feed</button>
       <button data-view="activitylog"><span class="dot"></span>Activity Log</button>
       <button data-view="team"><span class="dot"></span>Team</button>
+      <button data-view="settings"><span class="dot"></span>Settings</button>
     </nav>
     <div class="legal-links sidebar-legal-links">
       <a href="#" data-open-legal="terms">Terms</a> · <a href="#" data-open-legal="privacy">Privacy</a>
@@ -321,7 +324,7 @@ const CAR_FRINGE_BENEFIT_RATE_STANDARD = 0.035;
 const CAR_FRINGE_BENEFIT_RATE_MAINTENANCE = 0.0325;
 // SARS official rate of interest (repo + 1%) — the benchmark an employer loan is compared against
 // for the low/no-interest loan fringe benefit. Changes when the Reserve Bank moves the repo rate;
-// kept editable per company on Team → Company Details rather than hardcoded for that reason.
+// kept editable per company on Settings → Company Details rather than hardcoded for that reason.
 const OFFICIAL_INTEREST_RATE_DEFAULT = 8.00; // % p.a., effective 1 June 2026 — confirm current rate with SARS
 // Flat company income tax rate (standard companies). Does NOT model the graduated Small Business
 // Corporation rates or turnover tax — estimate only, for provisional-tax planning.
@@ -704,6 +707,7 @@ let state = {
   scenarioCashflows: {},   // scenarioId -> cashflow rows[], sorted by period_number
   view: 'dashboard',
   reportsTab: 'pl',
+  settingsTab: 'company',
   reportsPeriod: {mode:'month'},
   scenarioDetailId: null,  // scenario id currently expanded for editing, or null = list view
   scenarioNewCategory: null, // category chosen in the "new scenario" modal, or null = modal closed
@@ -736,7 +740,7 @@ function isPeriodLocked(dateStr){
   return !!(state.company && state.company.locked_through_date && dateStr && dateStr <= state.company.locked_through_date);
 }
 function periodLockMessage(){
-  return `That date falls within a locked accounting period (locked through ${state.company.locked_through_date}). Ask an admin to move the lock date on Team to make changes.`;
+  return `That date falls within a locked accounting period (locked through ${state.company.locked_through_date}). Ask an admin to move the lock date on Settings to make changes.`;
 }
 function isAdmin(){
   return state.membership && (state.membership.role === 'owner' || state.membership.role === 'admin');
@@ -763,7 +767,7 @@ const ALL_VIEWS = [
   ['dashboard','Dashboard'], ['revenue','Revenue'], ['expenses','Expenses'], ['assets','Assets'], ['stock','Stock'],
   ['liabilities','Liabilities'], ['supplierinvoices','Supplier Invoices'], ['clients','Clients'], ['quotes','Quotes'],
   ['invoices','Invoices'], ['creditnotes','Credit Notes'], ['payroll','Payroll'], ['tasks','Tasks'],
-  ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'],
+  ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'], ['settings','Settings'],
 ];
 // Owner/admin/viewer always see every tab. A staff member sees every tab UNLESS an admin has
 // explicitly restricted them to a specific list (m.permissions.tabs) via the Team page — so
@@ -1213,17 +1217,18 @@ async function logActivity(action, entityType, entityId, summary){
   } catch(e){ /* best-effort — never block the underlying action if logging fails */ }
 }
 const AUDIT_ENTITY_LABELS = {
+  company:'Company Settings',
   revenue:'Revenue', expense:'Expense', asset:'Asset', liability:'Liability',
   invoice:'Invoice', supplier_invoice:'Supplier Invoice', credit_note:'Credit Note', supplier_credit_note:'Supplier Credit Note',
 };
-function renderActivityLog(){
+// The table only, with no page <h1> — reused standalone by renderActivityLog() below and
+// as a Settings sub-tab by renderSettings().
+function renderActivityLogBody(){
   if(!isAdmin()){
-    return `<h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-team);display:inline-block;"></span>Activity Log</h1>
-    <div class="panel"><p class="empty">The activity log is only visible to management.</p></div>`;
+    return `<div class="panel"><p class="empty">The activity log is only visible to management.</p></div>`;
   }
   const rows = state.auditLog;
   return `
-    <h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-team);display:inline-block;"></span>Activity Log</h1>
     <p class="section-caption">Who created, changed, or deleted records in the books — most recent 300 entries.</p>
     <div class="panel">
       ${rows.length ? `<table><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Record</th><th>Details</th></tr></thead><tbody>
@@ -1237,6 +1242,10 @@ function renderActivityLog(){
       </tbody></table>` : `<div class="empty">No activity recorded yet.</div>`}
     </div>
   `;
+}
+function renderActivityLog(){
+  return `<h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-team);display:inline-block;"></span>Activity Log</h1>
+  ${renderActivityLogBody()}`;
 }
 function attachActivityLogHandlers(){}
 
@@ -1649,6 +1658,7 @@ function render(){
     case 'activitylog': main.innerHTML = renderActivityLog(); attachActivityLogHandlers(); break;
     case 'bankfeed': main.innerHTML = renderBankFeed(); attachBankFeedHandlers(); break;
     case 'team': main.innerHTML = renderTeam(); attachTeamHandlers(); break;
+    case 'settings': main.innerHTML = renderSettings(); attachSettingsHandlers(); break;
   }
 }
 
@@ -3197,9 +3207,22 @@ function weAreVatRegistered(){
 }
 // Whether this business carries physical stock/inventory. Defaults to true so existing
 // companies (created before this setting existed) keep seeing Stock exactly as before —
-// a service provider with no products opts OUT via Team \u2192 Company Details.
+// a service provider with no products opts OUT via Settings \u2192 Company Details.
 function tracksInventory(){
   return !(state.company && state.company.tracks_inventory === false);
+}
+// PAYE/SDL/UIF "registered" toggles are visibility-only: they show/hide their reference-number
+// field on Settings. They do NOT change how PAYE, SDL, or UIF are calculated or displayed
+// anywhere else (Payroll's Statutory Summary, monthly EMP201 tracking, e@syFile readiness).
+// Default to true so every existing company keeps seeing these fields exactly as before.
+function payeRegistered(){
+  return !(state.company && state.company.paye_registered === false);
+}
+function sdlRegistered(){
+  return !(state.company && state.company.sdl_registered === false);
+}
+function uifRegistered(){
+  return !(state.company && state.company.uif_registered === false);
 }
 
 // Reads an image file and stores it as the company's invoice logo (a data URL on
@@ -4378,7 +4401,7 @@ function renderPayroll(){
           <div class="field"><label>Employer loan balance (R)</label><input type="number" step="0.01" id="employee-loan-balance" value="0"></div>
           <div class="field"><label>Interest rate charged on loan (% p.a.)</label><input type="number" step="0.01" id="employee-loan-rate" value="0"></div>
         </div>
-        <p style="font-size:.7rem;color:var(--muted);margin-top:-6px;">Low/no-interest loan benefit = (SARS official rate − rate charged) × balance ÷ 12, if positive. Set the SARS official rate on the Team page under Company Details.</p>
+        <p style="font-size:.7rem;color:var(--muted);margin-top:-6px;">Low/no-interest loan benefit = (SARS official rate − rate charged) × balance ÷ 12, if positive. Set the SARS official rate on the Settings page under Company Details.</p>
         <div class="modal-actions"><button type="button" class="btn secondary" id="employee-cancel">Cancel</button><button type="submit" class="btn" id="employee-submit">Save</button></div>
       </form>
     </div></div>
@@ -5750,62 +5773,7 @@ function attachVatHandlers(){
 function renderTeam(){
   return `
     <div class="section-header" style="--accent-c:var(--c-team);"><h1>Team</h1>${isAdmin() ? `<button class="btn" id="add-member-btn">+ Invite Member</button>` : ''}</div>
-    <p style="color:var(--muted);font-size:.85rem;margin-top:-10px;">Management (owner/admin) has full access everywhere. Staff members only see and edit the modules you grant them below; invoices and credit notes they create wait for approval unless they're also marked as an approver.</p>
-    ${isAdmin() ? `
-    <div class="panel">
-      <h3 style="margin-top:0;">Company Details</h3>
-      <p style="color:var(--muted);font-size:.85rem;">Your registered address is required on tax invoices by SARS. VAT can only be charged on customer invoices and credit notes if you're registered for VAT.</p>
-      <form id="company-details-form" style="display:flex;flex-direction:column;gap:12px;max-width:480px;">
-        <div class="field"><label>Company address (for tax invoices)</label><textarea id="company-address" rows="3" placeholder="Street, suburb, city, postal code">${state.company.address || ''}</textarea></div>
-        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-vat-registered" style="width:auto;" ${weAreVatRegistered()?'checked':''}> Registered for VAT</label>
-        <div class="field" id="company-vat-number-field" style="${weAreVatRegistered()?'':'display:none;'}"><label>VAT number</label><input type="text" id="company-vat-number" value="${state.company.vat_number || ''}"></div>
-        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-tracks-inventory" style="width:auto;" ${tracksInventory()?'checked':''}> This business carries stock/inventory</label>
-        <p style="font-size:.72rem;color:var(--muted);margin:-8px 0 0;">Uncheck this if you're a pure service provider with nothing to stock — it hides the Stock tab and the stock-item column on Invoice/Supplier Invoice line items app-wide.</p>
-        <div class="field"><label>Company registration number (CIPC)</label><input type="text" id="company-registration-number" placeholder="e.g. 2019/123456/07" value="${state.company.registration_number || ''}"></div>
-        <div class="field"><label>COIDA registration number (Compensation Fund)</label><input type="text" id="company-coida-registration-number" value="${state.company.coida_registration_number || ''}"></div>
-        <div class="field"><label>Financial year-end</label><select id="company-financial-year-end-month"><option value="1" ${state.company.financial_year_end_month==1?'selected':''}>January</option><option value="2" ${state.company.financial_year_end_month==2?'selected':''}>February</option><option value="3" ${state.company.financial_year_end_month==3?'selected':''}>March</option><option value="4" ${state.company.financial_year_end_month==4?'selected':''}>April</option><option value="5" ${state.company.financial_year_end_month==5?'selected':''}>May</option><option value="6" ${state.company.financial_year_end_month==6?'selected':''}>June</option><option value="7" ${state.company.financial_year_end_month==7?'selected':''}>July</option><option value="8" ${state.company.financial_year_end_month==8?'selected':''}>August</option><option value="9" ${state.company.financial_year_end_month==9?'selected':''}>September</option><option value="10" ${state.company.financial_year_end_month==10?'selected':''}>October</option><option value="11" ${state.company.financial_year_end_month==11?'selected':''}>November</option><option value="12" ${state.company.financial_year_end_month==12?'selected':''}>December</option></select></div>
-        <div class="field"><label>SARS official rate of interest (% p.a.)</label><input type="number" step="0.01" id="company-official-interest-rate" value="${state.company.official_interest_rate_pct}"><p style="font-size:.72rem;color:var(--muted);margin:2px 0 0;">Used for the low/no-interest employer loan fringe benefit. SARS updates this when the repo rate moves — check the current published rate before relying on it.</p></div>
-        <h3 style="margin-bottom:2px;">SARS statutory references</h3>
-        <p style="font-size:.78rem;color:var(--muted);margin-top:0;">Required for the bulk IRP5 export to e@syFile Employer.</p>
-        <div class="row">
-          <div class="field"><label>PAYE reference number</label><input type="text" id="company-paye-ref" placeholder="10 digits, starts with 7" value="${state.company.paye_reference_number || ''}"></div>
-          <div class="field"><label>SDL reference number</label><input type="text" id="company-sdl-ref" placeholder="10 digits, starts with 7" value="${state.company.sdl_reference_number || ''}"></div>
-        </div>
-        <div class="field"><label>UIF reference number</label><input type="text" id="company-uif-ref" value="${state.company.uif_reference_number || ''}"></div>
-        <h3 style="margin-bottom:2px;">Payroll contact person</h3>
-        <p style="font-size:.78rem;color:var(--muted);margin-top:0;">The person SARS/e@syFile can contact about this submission.</p>
-        <div class="row">
-          <div class="field"><label>First name</label><input type="text" id="company-contact-first-name" value="${state.company.contact_first_name || ''}"></div>
-          <div class="field"><label>Surname</label><input type="text" id="company-contact-surname" value="${state.company.contact_surname || ''}"></div>
-        </div>
-        <div class="row">
-          <div class="field"><label>Email</label><input type="email" id="company-contact-email" value="${state.company.contact_email || ''}"></div>
-          <div class="field"><label>Phone</label><input type="text" id="company-contact-phone" value="${state.company.contact_phone || ''}"></div>
-        </div>
-        <div class="modal-actions" style="justify-content:flex-start;"><button type="submit" class="btn small">Save Company Details</button></div>
-      </form>
-    </div>` : ''}
-    ${isAdmin() ? `
-    <div class="panel">
-      <h3 style="margin-top:0;">Data Export</h3>
-      <p style="color:var(--muted);font-size:.85rem;">Download your records as CSV — for backup, or to hand to your accountant.</p>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;">
-        ${Object.entries(CSV_EXPORTS).map(([key,def])=>`<button type="button" class="btn small secondary" data-export-csv="${key}">${def.label}</button>`).join('')}
-      </div>
-    </div>` : ''}
-    ${isAdmin() ? `
-    <div class="panel">
-      <h3 style="margin-top:0;">Accounting Period Lock</h3>
-      <p style="color:var(--muted);font-size:.85rem;">Lock the books through a date so nothing can be added, edited, or deleted on or before it — Revenue, Expenses, Invoices, Credit Notes, Supplier Invoices, and Supplier Credit Notes. Move the date forward as you close each period; approvals, payments, and status changes on existing records still work as normal.</p>
-      ${state.company.locked_through_date
-        ? `<p style="font-weight:600;">🔒 Locked through ${state.company.locked_through_date}</p>`
-        : `<p style="color:var(--muted);">No lock set — all periods are open.</p>`}
-      <form id="period-lock-form" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
-        <div class="field" style="margin-bottom:0;"><label>Locked through</label><input type="date" id="period-lock-date" value="${state.company.locked_through_date || ''}"></div>
-        <button type="submit" class="btn small">Save</button>
-        ${state.company.locked_through_date ? `<button type="button" class="btn small secondary" id="period-lock-clear">Clear lock</button>` : ''}
-      </form>
-    </div>` : ''}
+    <p style="color:var(--muted);font-size:.85rem;margin-top:-10px;">Management (owner/admin) has full access everywhere. Staff members only see and edit the modules you grant them below; invoices and credit notes they create wait for approval unless they're also marked as an approver. Company details, data export, and the accounting period lock moved to the Settings tab.</p>
     <div class="panel">
       <h3 style="margin-top:0;">App access</h3>
       <table><thead><tr><th>Email</th><th>Role &amp; permissions</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
@@ -5901,58 +5869,6 @@ function resetMemberForm(){
   toggleMemberTabsBox();
 }
 function attachTeamHandlers(){
-  document.querySelectorAll('[data-export-csv]').forEach(btn=>{
-    btn.addEventListener('click', ()=>exportCSV(btn.dataset.exportCsv));
-  });
-  document.getElementById('period-lock-form')?.addEventListener('submit', async (e)=>{
-    e.preventDefault();
-    const locked_through_date = document.getElementById('period-lock-date').value || null;
-    const {error} = await sb.from('cc_companies').update({locked_through_date}).eq('id', state.company.id);
-    if(error){ toast(error.message); return; }
-    state.company.locked_through_date = locked_through_date;
-    render();
-    toast(locked_through_date ? `Locked through ${locked_through_date}.` : 'Lock cleared.');
-  });
-  document.getElementById('period-lock-clear')?.addEventListener('click', async ()=>{
-    if(!confirm('Clear the period lock? All periods will be open again.')) return;
-    const {error} = await sb.from('cc_companies').update({locked_through_date: null}).eq('id', state.company.id);
-    if(error){ toast(error.message); return; }
-    state.company.locked_through_date = null;
-    render();
-    toast('Lock cleared.');
-  });
-  document.getElementById('company-vat-registered')?.addEventListener('change', (e)=>{
-    document.getElementById('company-vat-number-field').style.display = e.target.checked ? '' : 'none';
-  });
-  document.getElementById('company-details-form')?.addEventListener('submit', async (e)=>{
-    e.preventDefault();
-    const address = document.getElementById('company-address').value.trim() || null;
-    const vat_registered = document.getElementById('company-vat-registered').checked;
-    const vat_number = vat_registered ? (document.getElementById('company-vat-number').value.trim() || null) : null;
-    const registration_number = document.getElementById('company-registration-number').value.trim() || null;
-    const tracks_inventory = document.getElementById('company-tracks-inventory').checked;
-    const paye_reference_number = document.getElementById('company-paye-ref').value.trim() || null;
-    const sdl_reference_number = document.getElementById('company-sdl-ref').value.trim() || null;
-    const uif_reference_number = document.getElementById('company-uif-ref').value.trim() || null;
-    const contact_first_name = document.getElementById('company-contact-first-name').value.trim() || null;
-    const contact_surname = document.getElementById('company-contact-surname').value.trim() || null;
-    const contact_email = document.getElementById('company-contact-email').value.trim() || null;
-    const contact_phone = document.getElementById('company-contact-phone').value.trim() || null;
-    const coida_registration_number = document.getElementById('company-coida-registration-number').value.trim() || null;
-    const financial_year_end_month = parseInt(document.getElementById('company-financial-year-end-month').value) || 2;
-    const official_interest_rate_pct = parseFloat(document.getElementById('company-official-interest-rate').value) || 0;
-    const {error} = await sb.from('cc_companies').update({
-      address, vat_registered, vat_number, registration_number,
-      paye_reference_number, sdl_reference_number, uif_reference_number,
-      contact_first_name, contact_surname, contact_email, contact_phone,
-      coida_registration_number, financial_year_end_month, official_interest_rate_pct,
-      tracks_inventory
-    }).eq('id', state.company.id);
-    if(error){ toast(error.message); return; }
-    Object.assign(state.company, { address, vat_registered, vat_number, registration_number, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone, coida_registration_number, financial_year_end_month, official_interest_rate_pct, tracks_inventory });
-    render();
-    toast('Company details saved.');
-  });
   const backdrop = document.getElementById('member-modal-backdrop');
   document.getElementById('add-member-btn')?.addEventListener('click', ()=>{
     resetMemberForm();
@@ -6022,6 +5938,204 @@ function attachTeamHandlers(){
       await sb.from('cc_company_members').delete().eq('id', btn.dataset.delMember);
       await refreshAll(); render();
     });
+  });
+}
+
+
+/* ========================= SETTINGS ========================= */
+// Human-readable "field: old → new" diff summaries for the audit log, built from a config
+// array rather than hand-written per field so new settings fields stay easy to add.
+const SETTINGS_DIFF_FIELDS = [
+  {key:'name', label:'Company name'},
+  {key:'trading_as', label:'Trading as'},
+  {key:'address', label:'Address'},
+  {key:'vat_registered', label:'Registered for VAT', bool:true},
+  {key:'vat_number', label:'VAT number'},
+  {key:'tracks_inventory', label:'Carries stock/inventory', bool:true},
+  {key:'registration_number', label:'Registration number'},
+  {key:'coida_registration_number', label:'COIDA registration number'},
+  {key:'financial_year_end_month', label:'Financial year-end month'},
+  {key:'official_interest_rate_pct', label:'SARS official interest rate'},
+  {key:'paye_registered', label:'Registered for PAYE', bool:true},
+  {key:'paye_reference_number', label:'PAYE reference number'},
+  {key:'sdl_registered', label:'Registered for SDL', bool:true},
+  {key:'sdl_reference_number', label:'SDL reference number'},
+  {key:'uif_registered', label:'Registered for UIF', bool:true},
+  {key:'uif_reference_number', label:'UIF reference number'},
+  {key:'contact_first_name', label:'Payroll contact first name'},
+  {key:'contact_surname', label:'Payroll contact surname'},
+  {key:'contact_email', label:'Payroll contact email'},
+  {key:'contact_phone', label:'Payroll contact phone'},
+];
+function settingsFieldDisplay(f, v){
+  if(f.bool) return v === false ? 'No' : 'Yes';
+  return (v === null || v === undefined || v === '') ? '(none)' : String(v);
+}
+function summarizeSettingsDiff(before, after){
+  const changes = [];
+  SETTINGS_DIFF_FIELDS.forEach(f=>{
+    const a = before[f.key], b = after[f.key];
+    if(String(a) !== String(b)){
+      changes.push(`${f.label}: ${settingsFieldDisplay(f, a)} \u2192 ${settingsFieldDisplay(f, b)}`);
+    }
+  });
+  return changes.length ? changes.join('; ') : null;
+}
+function renderSettings(){
+  if(!isAdmin()){
+    return `<h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-settings);display:inline-block;"></span>Settings</h1>
+    <div class="panel"><p class="empty">Settings are only visible to management.</p></div>`;
+  }
+  return `
+    <h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-settings);display:inline-block;"></span>Settings</h1>
+    <div class="tabbar" style="margin-bottom:16px;">
+      <button class="btn ${state.settingsTab==='company'?'':'secondary'} small" data-settings-tab="company">Company Details</button>
+      <button class="btn ${state.settingsTab==='activity'?'':'secondary'} small" data-settings-tab="activity">Activity Log</button>
+    </div>
+    ${state.settingsTab==='activity' ? renderActivityLogBody() : renderSettingsCompanyDetails()}
+  `;
+}
+function renderSettingsCompanyDetails(){
+  return `
+    <div class="panel">
+      <h3 style="margin-top:0;">Company Details</h3>
+      <p style="color:var(--muted);font-size:.85rem;">Your registered address is required on tax invoices by SARS. VAT can only be charged on customer invoices and credit notes if you're registered for VAT.</p>
+      <form id="company-details-form" style="display:flex;flex-direction:column;gap:12px;max-width:480px;">
+        <div class="field"><label>Company name</label><input type="text" id="company-name" value="${state.company.name || ''}"></div>
+        <div class="field"><label>Trading as (optional)</label><input type="text" id="company-trading-as" placeholder="If different from the registered name above" value="${state.company.trading_as || ''}"></div>
+        <div class="field"><label>Company address (for tax invoices)</label><textarea id="company-address" rows="3" placeholder="Street, suburb, city, postal code">${state.company.address || ''}</textarea></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-vat-registered" style="width:auto;" ${weAreVatRegistered()?'checked':''}> Registered for VAT</label>
+        <div class="field" id="company-vat-number-field" style="${weAreVatRegistered()?'':'display:none;'}"><label>VAT number</label><input type="text" id="company-vat-number" value="${state.company.vat_number || ''}"></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-tracks-inventory" style="width:auto;" ${tracksInventory()?'checked':''}> This business carries stock/inventory</label>
+        <p style="font-size:.72rem;color:var(--muted);margin:-8px 0 0;">Uncheck this if you're a pure service provider with nothing to stock — it hides the Stock tab and the stock-item column on Invoice/Supplier Invoice line items app-wide.</p>
+        <div class="field"><label>Company registration number (CIPC)</label><input type="text" id="company-registration-number" placeholder="e.g. 2019/123456/07" value="${state.company.registration_number || ''}"></div>
+        <div class="field"><label>COIDA registration number (Compensation Fund)</label><input type="text" id="company-coida-registration-number" value="${state.company.coida_registration_number || ''}"></div>
+        <div class="field"><label>Financial year-end</label><select id="company-financial-year-end-month"><option value="1" ${state.company.financial_year_end_month==1?'selected':''}>January</option><option value="2" ${state.company.financial_year_end_month==2?'selected':''}>February</option><option value="3" ${state.company.financial_year_end_month==3?'selected':''}>March</option><option value="4" ${state.company.financial_year_end_month==4?'selected':''}>April</option><option value="5" ${state.company.financial_year_end_month==5?'selected':''}>May</option><option value="6" ${state.company.financial_year_end_month==6?'selected':''}>June</option><option value="7" ${state.company.financial_year_end_month==7?'selected':''}>July</option><option value="8" ${state.company.financial_year_end_month==8?'selected':''}>August</option><option value="9" ${state.company.financial_year_end_month==9?'selected':''}>September</option><option value="10" ${state.company.financial_year_end_month==10?'selected':''}>October</option><option value="11" ${state.company.financial_year_end_month==11?'selected':''}>November</option><option value="12" ${state.company.financial_year_end_month==12?'selected':''}>December</option></select></div>
+        <div class="field"><label>SARS official rate of interest (% p.a.)</label><input type="number" step="0.01" id="company-official-interest-rate" value="${state.company.official_interest_rate_pct}"><p style="font-size:.72rem;color:var(--muted);margin:2px 0 0;">Used for the low/no-interest employer loan fringe benefit. SARS updates this when the repo rate moves — check the current published rate before relying on it.</p></div>
+        <h3 style="margin-bottom:2px;">SARS statutory references</h3>
+        <p style="font-size:.78rem;color:var(--muted);margin-top:0;">Required for the bulk IRP5 export to e@syFile Employer. Turning a "Registered for" toggle off just hides that reference-number field here — it doesn't change how PAYE, SDL, or UIF are calculated or shown on Payroll.</p>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-paye-registered" style="width:auto;" ${payeRegistered()?'checked':''}> Registered for PAYE</label>
+        <div class="field" id="company-paye-ref-field" style="${payeRegistered()?'':'display:none;'}"><label>PAYE reference number</label><input type="text" id="company-paye-ref" placeholder="10 digits, starts with 7" value="${state.company.paye_reference_number || ''}"></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-sdl-registered" style="width:auto;" ${sdlRegistered()?'checked':''}> Registered for SDL</label>
+        <div class="field" id="company-sdl-ref-field" style="${sdlRegistered()?'':'display:none;'}"><label>SDL reference number</label><input type="text" id="company-sdl-ref" placeholder="10 digits, starts with 7" value="${state.company.sdl_reference_number || ''}"></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-uif-registered" style="width:auto;" ${uifRegistered()?'checked':''}> Registered for UIF</label>
+        <div class="field" id="company-uif-ref-field" style="${uifRegistered()?'':'display:none;'}"><label>UIF reference number</label><input type="text" id="company-uif-ref" value="${state.company.uif_reference_number || ''}"></div>
+        <h3 style="margin-bottom:2px;">Payroll contact person</h3>
+        <p style="font-size:.78rem;color:var(--muted);margin-top:0;">The person SARS/e@syFile can contact about this submission.</p>
+        <div class="row">
+          <div class="field"><label>First name</label><input type="text" id="company-contact-first-name" value="${state.company.contact_first_name || ''}"></div>
+          <div class="field"><label>Surname</label><input type="text" id="company-contact-surname" value="${state.company.contact_surname || ''}"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Email</label><input type="email" id="company-contact-email" value="${state.company.contact_email || ''}"></div>
+          <div class="field"><label>Phone</label><input type="text" id="company-contact-phone" value="${state.company.contact_phone || ''}"></div>
+        </div>
+        <div class="modal-actions" style="justify-content:flex-start;"><button type="submit" class="btn small">Save Company Details</button></div>
+      </form>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Data Export</h3>
+      <p style="color:var(--muted);font-size:.85rem;">Download your records as CSV — for backup, or to hand to your accountant.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;">
+        ${Object.entries(CSV_EXPORTS).map(([key,def])=>`<button type="button" class="btn small secondary" data-export-csv="${key}">${def.label}</button>`).join('')}
+      </div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Accounting Period Lock</h3>
+      <p style="color:var(--muted);font-size:.85rem;">Lock the books through a date so nothing can be added, edited, or deleted on or before it — Revenue, Expenses, Invoices, Credit Notes, Supplier Invoices, and Supplier Credit Notes. Move the date forward as you close each period; approvals, payments, and status changes on existing records still work as normal.</p>
+      ${state.company.locked_through_date
+        ? `<p style="font-weight:600;">🔒 Locked through ${state.company.locked_through_date}</p>`
+        : `<p style="color:var(--muted);">No lock set — all periods are open.</p>`}
+      <form id="period-lock-form" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+        <div class="field" style="margin-bottom:0;"><label>Locked through</label><input type="date" id="period-lock-date" value="${state.company.locked_through_date || ''}"></div>
+        <button type="submit" class="btn small">Save</button>
+        ${state.company.locked_through_date ? `<button type="button" class="btn small secondary" id="period-lock-clear">Clear lock</button>` : ''}
+      </form>
+    </div>
+  `;
+}
+function attachSettingsHandlers(){
+  document.querySelectorAll('[data-settings-tab]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{ state.settingsTab = btn.dataset.settingsTab; render(); });
+  });
+  document.querySelectorAll('[data-export-csv]').forEach(btn=>{
+    btn.addEventListener('click', ()=>exportCSV(btn.dataset.exportCsv));
+  });
+  document.getElementById('period-lock-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const locked_through_date = document.getElementById('period-lock-date').value || null;
+    const prevLock = state.company.locked_through_date || null;
+    const {error} = await sb.from('cc_companies').update({locked_through_date}).eq('id', state.company.id);
+    if(error){ toast(error.message); return; }
+    state.company.locked_through_date = locked_through_date;
+    if(prevLock !== locked_through_date){
+      await logActivity('update', 'company', state.company.id, `Accounting period lock: ${prevLock||'none'} \u2192 ${locked_through_date||'none'}`);
+    }
+    await refreshAll(); render();
+    toast(locked_through_date ? `Locked through ${locked_through_date}.` : 'Lock cleared.');
+  });
+  document.getElementById('period-lock-clear')?.addEventListener('click', async ()=>{
+    if(!confirm('Clear the period lock? All periods will be open again.')) return;
+    const prevLock = state.company.locked_through_date || null;
+    const {error} = await sb.from('cc_companies').update({locked_through_date: null}).eq('id', state.company.id);
+    if(error){ toast(error.message); return; }
+    state.company.locked_through_date = null;
+    if(prevLock){
+      await logActivity('update', 'company', state.company.id, `Accounting period lock: ${prevLock} \u2192 none`);
+    }
+    await refreshAll(); render();
+    toast('Lock cleared.');
+  });
+  document.getElementById('company-vat-registered')?.addEventListener('change', (e)=>{
+    document.getElementById('company-vat-number-field').style.display = e.target.checked ? '' : 'none';
+  });
+  document.getElementById('company-paye-registered')?.addEventListener('change', (e)=>{
+    document.getElementById('company-paye-ref-field').style.display = e.target.checked ? '' : 'none';
+  });
+  document.getElementById('company-sdl-registered')?.addEventListener('change', (e)=>{
+    document.getElementById('company-sdl-ref-field').style.display = e.target.checked ? '' : 'none';
+  });
+  document.getElementById('company-uif-registered')?.addEventListener('change', (e)=>{
+    document.getElementById('company-uif-ref-field').style.display = e.target.checked ? '' : 'none';
+  });
+  document.getElementById('company-details-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const before = { ...state.company };
+    const name = document.getElementById('company-name').value.trim() || state.company.name;
+    const trading_as = document.getElementById('company-trading-as').value.trim() || null;
+    const address = document.getElementById('company-address').value.trim() || null;
+    const vat_registered = document.getElementById('company-vat-registered').checked;
+    const vat_number = vat_registered ? (document.getElementById('company-vat-number').value.trim() || null) : null;
+    const registration_number = document.getElementById('company-registration-number').value.trim() || null;
+    const tracks_inventory = document.getElementById('company-tracks-inventory').checked;
+    const paye_registered = document.getElementById('company-paye-registered').checked;
+    const sdl_registered = document.getElementById('company-sdl-registered').checked;
+    const uif_registered = document.getElementById('company-uif-registered').checked;
+    const paye_reference_number = document.getElementById('company-paye-ref').value.trim() || null;
+    const sdl_reference_number = document.getElementById('company-sdl-ref').value.trim() || null;
+    const uif_reference_number = document.getElementById('company-uif-ref').value.trim() || null;
+    const contact_first_name = document.getElementById('company-contact-first-name').value.trim() || null;
+    const contact_surname = document.getElementById('company-contact-surname').value.trim() || null;
+    const contact_email = document.getElementById('company-contact-email').value.trim() || null;
+    const contact_phone = document.getElementById('company-contact-phone').value.trim() || null;
+    const coida_registration_number = document.getElementById('company-coida-registration-number').value.trim() || null;
+    const financial_year_end_month = parseInt(document.getElementById('company-financial-year-end-month').value) || 2;
+    const official_interest_rate_pct = parseFloat(document.getElementById('company-official-interest-rate').value) || 0;
+    const {error} = await sb.from('cc_companies').update({
+      name, trading_as, address, vat_registered, vat_number, registration_number,
+      paye_registered, sdl_registered, uif_registered,
+      paye_reference_number, sdl_reference_number, uif_reference_number,
+      contact_first_name, contact_surname, contact_email, contact_phone,
+      coida_registration_number, financial_year_end_month, official_interest_rate_pct,
+      tracks_inventory
+    }).eq('id', state.company.id);
+    if(error){ toast(error.message); return; }
+    Object.assign(state.company, { name, trading_as, address, vat_registered, vat_number, registration_number, paye_registered, sdl_registered, uif_registered, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone, coida_registration_number, financial_year_end_month, official_interest_rate_pct, tracks_inventory });
+    const diffSummary = summarizeSettingsDiff(before, state.company);
+    if(diffSummary) await logActivity('update', 'company', state.company.id, diffSummary);
+    document.getElementById('sidebar-company-name').textContent = state.company.name + (isAdmin() ? '' : ' (' + roleLabel(state.membership).toLowerCase() + ')');
+    await refreshAll(); render();
+    toast('Company details saved.');
   });
 }
 
