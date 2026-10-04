@@ -708,6 +708,90 @@ function generateSupplierCashflows(supplier, periodsCount, periodUnit){
   return cfs;
 }
 
+// Converts a recurring amount at any billing frequency to its monthly equivalent, so weekly/
+// quarterly/annual recurring entries, invoices etc. can all be projected onto the same monthly
+// Cash Budget grid.
+function monthlyEquivalent(amount, frequency){
+  const amt = Number(amount) || 0;
+  if(frequency === 'weekly') return amt * 52 / 12;
+  if(frequency === 'quarterly') return amt / 3;
+  if(frequency === 'annually' || frequency === 'annual') return amt / 12;
+  return amt; // monthly, or unspecified
+}
+// monthsAhead=1 -> the next full calendar month from today; 2 -> the one after that; etc.
+function futureMonthRange(monthsAhead){
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth() + monthsAhead, 1);
+  const end = new Date(now.getFullYear(), now.getMonth() + monthsAhead + 1, 0);
+  const iso = d => d.toISOString().slice(0,10);
+  return { start: iso(start), end: iso(end), label: start.toLocaleString(undefined, {month:'long', year:'numeric'}) };
+}
+// Cash Budget scenario: a hybrid auto-fill. Generates editable cc_scenario_cashflows-shaped lines
+// (period_number 1..monthsCount, one calendar month per period) seeded from real data — nothing
+// here is posted or final, it's a starting point the user edits afterward like any scenario line.
+function generateCashBudgetLines(monthsCount){
+  const n = Math.max(1, Math.round(Number(monthsCount)||6));
+  const months = [];
+  for(let m=1; m<=n; m++) months.push(futureMonthRange(m));
+  const lines = [];
+  function add(periodNumber, label, amount){
+    if(Math.abs(amount) < 0.005) return;
+    lines.push({period_number: periodNumber, label, amount});
+  }
+
+  // Recurring revenue/expense entries and recurring invoices, converted to a monthly-equivalent
+  // amount and applied to every forecast month (they recur regardless of when we're looking).
+  const recurringRevenueMonthly = state.entries.filter(e=>e.type==='revenue' && e.is_recurring)
+    .reduce((s,e)=>s+monthlyEquivalent(e.amount, e.recurrence_frequency), 0);
+  const recurringExpenseMonthly = state.entries.filter(e=>e.type==='expense' && e.is_recurring)
+    .reduce((s,e)=>s+monthlyEquivalent(e.amount, e.recurrence_frequency), 0);
+  const recurringInvoiceMonthly = (state.invoices||[]).filter(i=>i.is_recurring && i.approval_status==='approved')
+    .reduce((s,i)=>s+monthlyEquivalent(docTotal(state.invoiceItems[i.id]), i.recurrence_frequency), 0);
+
+  // Trailing 3-month average payroll cost, as a simple forward estimate.
+  const today = new Date();
+  let payrollTrailingTotal = 0, payrollTrailingMonths = 0;
+  for(let k=1; k<=3; k++){
+    const rs = new Date(today.getFullYear(), today.getMonth()-k, 1);
+    const re = new Date(today.getFullYear(), today.getMonth()-k+1, 0);
+    const iso = d=>d.toISOString().slice(0,10);
+    payrollTrailingTotal += computePL(iso(rs), iso(re)).payrollCost;
+    payrollTrailingMonths++;
+  }
+  const avgPayroll = payrollTrailingMonths ? payrollTrailingTotal / payrollTrailingMonths : 0;
+
+  months.forEach((mo, idx)=>{
+    const p = idx+1;
+    if(recurringRevenueMonthly) add(p, `Recurring revenue (${mo.label})`, recurringRevenueMonthly);
+    if(recurringInvoiceMonthly) add(p, `Recurring invoices (${mo.label})`, recurringInvoiceMonthly);
+    if(recurringExpenseMonthly) add(p, `Recurring expenses (${mo.label})`, -recurringExpenseMonthly);
+    if(avgPayroll) add(p, `Payroll, avg. of last 3 months (${mo.label})`, -avgPayroll);
+  });
+
+  // Outstanding invoices and outstanding bills/current-liabilities, bucketed into the forecast
+  // month whose end-of-month is the first to reach their due date — overdue items land in month 1.
+  function bucketFor(dueDate){
+    const idx = months.findIndex(mo => dueDate <= mo.end);
+    return idx === -1 ? months.length : idx + 1;
+  }
+  computeARAging().rows.forEach(r=>{
+    add(bucketFor(r.due_date), `Outstanding invoice — ${r.number} (${r.client})`, r.total);
+  });
+  computeAPAging().rows.forEach(r=>{
+    add(bucketFor(r.due_date), `Outstanding payment — ${r.description}`, -r.amount);
+  });
+
+  // Current VAT exposure, as a simple lump estimate in month 1 — this does not model exact
+  // VAT201 period/due dates (see the Company Tax report for the same style of estimate-only
+  // caveat); it just reflects what's owed so far.
+  if(state.company.vat_registered !== false){
+    const vatPayableNow = vatFor(todayIso()).vatPayable;
+    if(vatPayableNow > 0.005) add(1, 'VAT201 payment (estimate, current exposure)', -vatPayableNow);
+  }
+
+  return {months, lines};
+}
+
 /* ========================= STATE ========================= */
 let state = {
   user: null,
@@ -6949,10 +7033,10 @@ function attachTasksHandlers(){
 
 /* ========================= SCENARIO PLANNER ========================= */
 function scenarioCategoryLabel(cat){
-  return cat==='loan' ? 'Loan' : (cat==='supplier' ? 'Supplier' : 'General');
+  return cat==='loan' ? 'Loan' : (cat==='supplier' ? 'Supplier' : (cat==='cashbudget' ? 'Cash Budget' : 'General'));
 }
 function scenarioCategoryBadge(cat){
-  const colors = { loan:['#fef3de','#c9860b'], supplier:['#e3faf1','#0fb981'], general:['#ece7ff','#7c5cff'] };
+  const colors = { loan:['#fef3de','#c9860b'], supplier:['#e3faf1','#0fb981'], cashbudget:['#e0f2ff','#1d7fd1'], general:['#ece7ff','#7c5cff'] };
   const pair = colors[cat] || colors.general;
   return `<span class="status-pill" style="background:${pair[0]};color:${pair[1]};">${scenarioCategoryLabel(cat)}</span>`;
 }
@@ -6988,9 +7072,9 @@ function renderScenarioList(canEdit){
   const compareIds = state.scenarioCompareIds.filter(id => state.scenarios.some(s=>s.id===id));
   return `
     <div class="section-header" style="--accent-c:var(--c-scenarios);"><h1>Scenarios</h1>${canEdit ? `<button class="btn" id="add-scenario-btn">+ New Scenario</button>` : ''}</div>
-    <p class="section-caption">Model what-if decisions — comparing suppliers or a loan — before you commit.</p>
+    <p class="section-caption">Model what-if decisions — comparing suppliers, a loan, or your projected cash flow — before you commit.</p>
     <div class="panel">
-      <p style="color:var(--muted);font-size:.86rem;margin-top:0;">Model a what-if — a supplier option, a loan you're considering, or any other plan — as a scenario, then tick two or more to compare them side by side. Nothing here posts to your books until you say so.</p>
+      <p style="color:var(--muted);font-size:.86rem;margin-top:0;">Model a what-if — a supplier option, a loan you're considering, a cash budget for the months ahead, or any other plan — as a scenario, then tick two or more to compare them side by side. Nothing here posts to your books until you say so.</p>
       ${state.scenarios.length ? `<table><thead><tr><th></th><th>Name</th><th>Category</th><th>Discount Rate</th><th>Period</th><th>Cash Flow Lines</th><th>NPV</th><th>IRR</th><th></th></tr></thead><tbody>
         ${state.scenarios.map(sc=>{
           const npv = scenarioNPV(sc);
@@ -7021,6 +7105,7 @@ function renderScenarioList(canEdit){
           <option value="general">General — freeform cash flow lines</option>
           <option value="supplier">Supplier comparison — cost + payment timing</option>
           <option value="loan">Loan — amortization + NPV/IRR</option>
+          <option value="cashbudget">Cash Budget — projected cash flow for the entity</option>
         </select></div>
         <div class="field"><label>Discount rate (annual %, for NPV/IRR)</label><input type="number" step="0.1" id="scenario-discount-rate" value="10" required></div>
         <div class="field"><label>Period</label><select id="scenario-period-unit"><option value="month">Monthly</option><option value="quarter">Quarterly</option><option value="year">Yearly</option></select></div>
@@ -7051,11 +7136,27 @@ function renderScenarioComparison(ids){
       </div>
       ${allPeriods.length ? `<table><thead><tr><th>Period</th>${rows.map(r=>`<th>${r.sc.name}</th>`).join('')}</tr></thead><tbody>
         ${allPeriods.map(p=>`<tr><td>${p}</td>${rows.map(r=>{
-          const cf = r.cfs.find(x=>Number(x.period_number)===p);
-          return `<td class="${cf && Number(cf.amount)<0 ? 'negative' : ''}">${cf ? fmt(cf.amount) : '—'}</td>`;
+          const matching = r.cfs.filter(x=>Number(x.period_number)===p);
+          if(!matching.length) return '<td>—</td>';
+          const net = matching.reduce((s,x)=>s+Number(x.amount),0);
+          return `<td class="${net<0 ? 'negative' : ''}">${fmt(net)}</td>`;
         }).join('')}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No cash flow lines to compare yet — open a scenario and generate or add its cash flows first.</div>`}
     </div>
+  `;
+}
+
+function cashflowLinesEditor(cfs, canEdit){
+  return `
+    ${canEdit ? `<form id="scenario-line-form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+      <div class="field"><label>Period #</label><input type="number" id="line-period" required style="width:80px;"></div>
+      <div class="field"><label>Label</label><input type="text" id="line-label" placeholder="optional"></div>
+      <div class="field"><label>Amount (R, negative = outflow)</label><input type="number" step="0.01" id="line-amount" required></div>
+      <button type="submit" class="btn">Add Line</button>
+    </form>` : ''}
+    ${cfs.length ? `<table><thead><tr><th>Period</th><th>Label</th><th>Amount</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+      ${cfs.map(cf=>`<tr><td>${cf.period_number}</td><td>${cf.label||'—'}</td><td class="${Number(cf.amount)<0?'negative':''}">${fmt(cf.amount)}</td>${canEdit?`<td><button class="btn small danger" data-del-cashflow="${cf.id}">Delete</button></td>`:''}</tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No cash flow lines yet — add periods and amounts above (e.g. period 0 = today, period 1 = next month).</div>`}
   `;
 }
 
@@ -7121,19 +7222,46 @@ function renderScenarioDetail(sc, canEdit){
         ${cfs.length ? `<p style="color:var(--muted);font-size:.85rem;">Longer payment terms push the cash outflow later without changing the headline cost — so two suppliers charging the same amount can still look very different for cash flow timing. Create a second scenario for the other supplier to compare them.</p>` : `<div class="empty">Enter this supplier's cost and payment terms, then generate cash flows. Create a second scenario for the other supplier and tick both from the list to compare.</div>`}
       </div>
     `;
+  } else if(sc.category === 'cashbudget'){
+    const monthsCount = params.months_count || 6;
+    const todayCash = computeBS(todayIso()).cash;
+    const periodNumbers = [...new Set(cfs.map(cf=>Number(cf.period_number)))].sort((a,b)=>a-b);
+    let running = todayCash;
+    const summaryRows = periodNumbers.map(p=>{
+      const linesForP = cfs.filter(cf=>Number(cf.period_number)===p);
+      const inflow = linesForP.filter(cf=>Number(cf.amount)>0).reduce((s,cf)=>s+Number(cf.amount),0);
+      const outflow = linesForP.filter(cf=>Number(cf.amount)<0).reduce((s,cf)=>s+Number(cf.amount),0);
+      const net = inflow + outflow;
+      running += net;
+      return { period: p, label: futureMonthRange(p).label, inflow, outflow, net, balance: running };
+    });
+    categorySection = `
+      <div class="panel">
+        <h3 style="margin-top:0;">Generate projection</h3>
+        ${canEdit ? `<form id="scenario-cashbudget-form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+          <div class="field"><label>Months to project</label><input type="number" id="cashbudget-months" value="${monthsCount}" min="1" max="24" required></div>
+          <button type="submit" class="btn">Generate from current data</button>
+        </form>
+        <p style="color:var(--muted);font-size:.8rem;margin:8px 0 0;">Pulls recurring revenue/expense entries and recurring invoices (converted to a monthly amount), outstanding invoices and bills/current liabilities bucketed by their due date, a trailing 3-month payroll average, and your current VAT exposure if VAT-registered. Regenerating replaces every line below — add or edit lines individually afterwards if you just want to tweak one figure without regenerating.</p>` : ''}
+      </div>
+      <div class="panel">
+        <h3 style="margin-top:0;">Projected cash position</h3>
+        ${summaryRows.length ? `<table><thead><tr><th>Month</th><th>Inflows</th><th>Outflows</th><th>Net</th><th>Projected Cash Balance</th></tr></thead><tbody>
+          <tr style="color:var(--muted);"><td>Today</td><td></td><td></td><td></td><td style="font-weight:600;">${fmt(todayCash)}</td></tr>
+          ${summaryRows.map(r=>`<tr><td>${r.label}</td><td>${fmt(r.inflow)}</td><td class="negative">${fmt(r.outflow)}</td><td class="${r.net<0?'negative':''}">${fmt(r.net)}</td><td style="font-weight:600;" class="${r.balance<0?'negative':''}">${fmt(r.balance)}</td></tr>`).join('')}
+        </tbody></table>` : `<div class="empty">No lines yet — generate a projection above, or add lines manually below.</div>`}
+        <p style="color:var(--muted);font-size:.8rem;">Starting cash is today's actual Cash &amp; Bank balance from the Balance Sheet. This is a planning estimate, not a guarantee — review and adjust the lines below for anything you know is changing (a new client, a one-off expense, an exact VAT201 date). Not tax or financial advice.</p>
+      </div>
+      <div class="panel">
+        <h3 style="margin-top:0;">Cash flow lines</h3>
+        ${cashflowLinesEditor(cfs, canEdit)}
+      </div>
+    `;
   } else {
     categorySection = `
       <div class="panel">
         <h3 style="margin-top:0;">Cash flow lines</h3>
-        ${canEdit ? `<form id="scenario-line-form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
-          <div class="field"><label>Period #</label><input type="number" id="line-period" required style="width:80px;"></div>
-          <div class="field"><label>Label</label><input type="text" id="line-label" placeholder="optional"></div>
-          <div class="field"><label>Amount (R, negative = outflow)</label><input type="number" step="0.01" id="line-amount" required></div>
-          <button type="submit" class="btn">Add Line</button>
-        </form>` : ''}
-        ${cfs.length ? `<table><thead><tr><th>Period</th><th>Label</th><th>Amount</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-          ${cfs.map(cf=>`<tr><td>${cf.period_number}</td><td>${cf.label||'—'}</td><td class="${Number(cf.amount)<0?'negative':''}">${fmt(cf.amount)}</td>${canEdit?`<td><button class="btn small danger" data-del-cashflow="${cf.id}">Delete</button></td>`:''}</tr>`).join('')}
-        </tbody></table>` : `<div class="empty">No cash flow lines yet — add periods and amounts above (e.g. period 0 = today, period 1 = next month).</div>`}
+        ${cashflowLinesEditor(cfs, canEdit)}
       </div>
     `;
   }
@@ -7161,13 +7289,13 @@ function attachScenarioHandlers(){
   document.getElementById('scenario-category')?.addEventListener('change', (e)=>{
     const periodSel = document.getElementById('scenario-period-unit');
     if(!periodSel) return;
-    if(e.target.value === 'loan'){ periodSel.value = 'month'; periodSel.disabled = true; }
+    if(e.target.value === 'loan' || e.target.value === 'cashbudget'){ periodSel.value = 'month'; periodSel.disabled = true; }
     else { periodSel.disabled = false; }
   });
   document.getElementById('scenario-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
     const category = document.getElementById('scenario-category').value;
-    const periodUnit = category === 'loan' ? 'month' : document.getElementById('scenario-period-unit').value;
+    const periodUnit = (category === 'loan' || category === 'cashbudget') ? 'month' : document.getElementById('scenario-period-unit').value;
     const {error} = await sb.from('cc_scenarios').insert({
       company_id: state.company.id,
       name: document.getElementById('scenario-name').value.trim(),
@@ -7234,6 +7362,21 @@ function attachScenarioHandlers(){
     }
     await sb.from('cc_scenarios').update({params}).eq('id', sc.id);
     await refreshAll(); render(); toast('Cash flows generated.');
+  });
+
+  document.getElementById('scenario-cashbudget-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const sc = state.scenarios.find(s=>s.id===state.scenarioDetailId);
+    if(!sc) return;
+    const monthsCount = parseInt(document.getElementById('cashbudget-months').value) || 6;
+    const {lines} = generateCashBudgetLines(monthsCount);
+    await sb.from('cc_scenario_cashflows').delete().eq('scenario_id', sc.id);
+    if(lines.length){
+      const {error} = await sb.from('cc_scenario_cashflows').insert(lines.map(cf=>({scenario_id: sc.id, period_number: cf.period_number, label: cf.label, amount: cf.amount})));
+      if(error){ toast(error.message); return; }
+    }
+    await sb.from('cc_scenarios').update({params: {months_count: monthsCount, generated_at: todayIso()}}).eq('id', sc.id);
+    await refreshAll(); render(); toast('Cash budget generated.');
   });
 
   document.getElementById('scenario-supplier-form')?.addEventListener('submit', async (e)=>{
