@@ -18,7 +18,7 @@
     --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b; --c-reports:#1d4ed8;
     --c-settings:#334155;
     --c-scenarios:#059669; --c-supplierinvoices:#0ea5e9; --c-tasks:#7c3aed;
-    --c-quotes:#eab308; --c-stock:#84cc16;
+    --c-quotes:#eab308; --c-stock:#84cc16; --c-manualjournals:#b45309;
     --grid-line: rgba(25,26,35,.03);
   }
   /* Dark mode: follows the OS setting by default; a manual toggle (data-theme)
@@ -117,6 +117,7 @@
   #sidebar nav button[data-view="supplierinvoices"]{--dot:var(--c-supplierinvoices);}
   #sidebar nav button[data-view="quotes"]{--dot:var(--c-quotes);}
   #sidebar nav button[data-view="stock"]{--dot:var(--c-stock);}
+  #sidebar nav button[data-view="manualjournals"]{--dot:var(--c-manualjournals);}
   #sidebar .logout{margin-top:10px;font-size:.8rem;color:var(--muted);background:none;border:none;text-align:left;padding:9px 10px;}
 
   #main{flex:1;padding:26px 32px;max-width:1100px;}
@@ -265,6 +266,7 @@
       <button data-view="vat"><span class="dot"></span>VAT</button>
       <button data-view="reports"><span class="dot"></span>Reports</button>
       <button data-view="scenarios"><span class="dot"></span>Scenarios</button>
+      <button data-view="manualjournals"><span class="dot"></span>Manual Journals</button>
       <button data-view="bankfeed"><span class="dot"></span>Bank Feed</button>
       <button data-view="activitylog"><span class="dot"></span>Activity Log</button>
       <button data-view="team"><span class="dot"></span>Team</button>
@@ -693,6 +695,8 @@ let state = {
   assets: [],
   liabilities: [],
   liabilityPayments: [], // actual cash paid against liabilities/loans (principal + interest split)
+  manualJournals: [],
+  manualJournalLines: {}, // journalId -> lines[]
   clients: [],
   invoices: [],
   invoiceItems: {},   // invoiceId -> items[]
@@ -789,7 +793,7 @@ const ALL_VIEWS = [
   ['dashboard','Dashboard'], ['revenue','Revenue'], ['expenses','Expenses'], ['assets','Assets'], ['stock','Stock'],
   ['liabilities','Liabilities'], ['supplierinvoices','Supplier Invoices'], ['clients','Clients'], ['quotes','Quotes'],
   ['invoices','Invoices'], ['creditnotes','Credit Notes'], ['payroll','Payroll'], ['tasks','Tasks'],
-  ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'], ['settings','Settings'],
+  ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['manualjournals','Manual Journals'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'], ['settings','Settings'],
 ];
 // Owner/admin/viewer always see every tab. A staff member sees every tab UNLESS an admin has
 // explicitly restricted them to a specific list (m.permissions.tabs) via the Team page — so
@@ -1104,18 +1108,24 @@ async function refreshAll(){
   state.emp201Submissions = emp201Res.data || [];
   state.coidaReturns = coidaRes.data || [];
   state.liabilityPayments = liabilityPaymentsRes.data || [];
+  const manualJournalsRes = await sb.from('cc_manual_journals').select('*').eq('company_id', cid).order('journal_date', {ascending:false});
+  state.manualJournals = manualJournalsRes.data || [];
 
   const invoiceIds = state.invoices.map(i=>i.id);
   const creditNoteIds = state.creditNotes.map(cn=>cn.id);
   const supplierInvoiceIds = state.supplierInvoices.map(b=>b.id);
   const supplierCreditNoteIds = state.supplierCreditNotes.map(cn=>cn.id);
-  const [invItemsRes, cnItemsRes, supInvItemsRes, supCnItemsRes, supInvPaymentsRes] = await Promise.all([
+  const manualJournalIds = state.manualJournals.map(j=>j.id);
+  const [invItemsRes, cnItemsRes, supInvItemsRes, supCnItemsRes, supInvPaymentsRes, journalLinesRes] = await Promise.all([
     invoiceIds.length ? sb.from('cc_invoice_items').select('*').in('invoice_id', invoiceIds) : Promise.resolve({data:[]}),
     creditNoteIds.length ? sb.from('cc_credit_note_items').select('*').in('credit_note_id', creditNoteIds) : Promise.resolve({data:[]}),
     supplierInvoiceIds.length ? sb.from('cc_supplier_invoice_items').select('*').in('supplier_invoice_id', supplierInvoiceIds) : Promise.resolve({data:[]}),
     supplierCreditNoteIds.length ? sb.from('cc_supplier_credit_note_items').select('*').in('supplier_credit_note_id', supplierCreditNoteIds) : Promise.resolve({data:[]}),
-    supplierInvoiceIds.length ? sb.from('cc_supplier_invoice_payments').select('*').in('supplier_invoice_id', supplierInvoiceIds).order('payment_date', {ascending:false}) : Promise.resolve({data:[]})
+    supplierInvoiceIds.length ? sb.from('cc_supplier_invoice_payments').select('*').in('supplier_invoice_id', supplierInvoiceIds).order('payment_date', {ascending:false}) : Promise.resolve({data:[]}),
+    manualJournalIds.length ? sb.from('cc_manual_journal_lines').select('*').in('journal_id', manualJournalIds) : Promise.resolve({data:[]})
   ]);
+  state.manualJournalLines = {};
+  (journalLinesRes.data||[]).forEach(l=>{ (state.manualJournalLines[l.journal_id] = state.manualJournalLines[l.journal_id]||[]).push(l); });
   state.invoiceItems = {};
   (invItemsRes.data||[]).forEach(it=>{ (state.invoiceItems[it.invoice_id] = state.invoiceItems[it.invoice_id]||[]).push(it); });
   state.supplierInvoiceItems = {};
@@ -1821,6 +1831,7 @@ function render(){
     case 'reports': main.innerHTML = renderReports(); attachReportsHandlers(); break;
     case 'scenarios': main.innerHTML = renderScenarios(); attachScenarioHandlers(); break;
     case 'activitylog': main.innerHTML = renderActivityLog(); attachActivityLogHandlers(); break;
+    case 'manualjournals': main.innerHTML = renderManualJournals(); attachManualJournalHandlers(); break;
     case 'bankfeed': main.innerHTML = renderBankFeed(); attachBankFeedHandlers(); break;
     case 'team': main.innerHTML = renderTeam(); attachTeamHandlers(); break;
     case 'settings': main.innerHTML = renderSettings(); attachSettingsHandlers(); break;
@@ -1861,6 +1872,7 @@ function entrySourceLabel(e){
   if(tags.includes('depreciation')) return 'Depreciation';
   if(tags.includes('cost-of-sales') || tags.includes('stock')) return 'Stock';
   if(tags.includes('liability-payment')) return 'Loan interest payment';
+  if(tags.includes('manual-journal')) return 'Manual Journal';
   return 'Added manually';
 }
 function totalsFor(){
@@ -2463,6 +2475,217 @@ async function openLiabilityView(liabilityId){
       await refreshAll(); render();
       openLiabilityView(l.id);
     });
+  });
+}
+
+/* ========================= MANUAL JOURNALS ========================= */
+// A true double-entry journal: 2+ lines, each a debit or credit against Revenue, Expenses, an
+// Asset or a Liability, which must balance (total debits = total credits) to post. Revenue/
+// Expense lines create a new cc_entries row (tagged 'manual-journal' — see entrySourceLabel()).
+// Asset/Liability lines directly adjust that record's value/amount, since those are simple
+// balances here, not itemized ledgers. Owner/Management only; everyone who can see the tab can
+// view journals (read-only), matching how every other module in the app gates edit vs. view.
+function journalLineAccountLabel(l){
+  if(l.category === 'revenue') return 'Revenue';
+  if(l.category === 'expense') return 'Expense';
+  if(l.category === 'asset'){ const a = state.assets.find(x=>x.id===l.target_asset_id); return 'Asset: ' + (a ? a.description : '(deleted)'); }
+  if(l.category === 'liability'){ const li = state.liabilities.find(x=>x.id===l.target_liability_id); return 'Liability: ' + (li ? li.description : '(deleted)'); }
+  return '—';
+}
+function renderManualJournals(){
+  const canCreate = isAdmin();
+  return `
+    <div class="section-header" style="--accent-c:var(--c-manualjournals);"><h1>Manual Journals</h1>${canCreate ? `<button class="btn" id="add-journal-btn">+ New Journal</button>` : ''}</div>
+    <p class="section-caption">Double-entry adjustments across Revenue, Expenses, Assets and Liabilities — for period-end corrections and reclassifications.${canCreate ? '' : ' Only Owner/Management can post a new journal.'}</p>
+    ${state.manualJournals.length ? state.manualJournals.map(j=>{
+      const lines = state.manualJournalLines[j.id] || [];
+      const debits = lines.filter(l=>l.side==='debit').reduce((s,l)=>s+Number(l.amount),0);
+      const credits = lines.filter(l=>l.side==='credit').reduce((s,l)=>s+Number(l.amount),0);
+      return `
+      <details class="collapsible">
+        <summary>${j.journal_date} — ${j.description} (${fmt(debits)})</summary>
+        <div class="panel">
+          <table><thead><tr><th>Account</th><th>Debit</th><th>Credit</th><th>Memo</th></tr></thead><tbody>
+            ${lines.map(l=>`<tr><td>${journalLineAccountLabel(l)}</td><td>${l.side==='debit'?fmt(l.amount):'—'}</td><td>${l.side==='credit'?fmt(l.amount):'—'}</td><td>${l.memo||'—'}</td></tr>`).join('')}
+          </tbody><tfoot><tr><td style="font-weight:700;">Total</td><td style="font-weight:700;">${fmt(debits)}</td><td style="font-weight:700;">${fmt(credits)}</td><td></td></tr></tfoot></table>
+          <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+            <button type="button" class="btn small secondary" data-attachments="manual_journal|${j.id}" data-attachments-label="${j.description}">${attachmentCountFor('manual_journal',j.id) ? attachmentCountFor('manual_journal',j.id)+' file'+(attachmentCountFor('manual_journal',j.id)>1?'s':'') : 'Attach'}</button>
+            ${canCreate ? `<button type="button" class="btn small danger" data-del-journal="${j.id}">Delete</button>` : ''}
+          </div>
+        </div>
+      </details>`;
+    }).join('') : `<div class="empty">No manual journals recorded yet.</div>`}
+    ${canCreate ? journalModal() : ''}
+  `;
+}
+function journalModal(){
+  return `
+  <div class="modal-backdrop hidden" id="journal-modal-backdrop"><div class="modal" style="max-width:760px;">
+    <button class="close-x" id="journal-modal-close">✕</button>
+    <h2>New Manual Journal</h2>
+    <form id="journal-form">
+      <div class="row">
+        <div class="field"><label>Date</label><input type="date" id="journal-date" required></div>
+        <div class="field" style="flex:1;"><label>Description</label><input type="text" id="journal-description" required placeholder="e.g. Reclassify August telephone expense"></div>
+      </div>
+      <h3 style="margin-bottom:6px;">Journal lines</h3>
+      <table class="invoice-items-table"><thead><tr><th>Account</th><th style="width:100px;">Debit/Credit</th><th style="width:110px;">Amount</th><th>Memo</th><th></th></tr></thead>
+        <tbody id="journal-lines-body"></tbody>
+      </table>
+      <button type="button" class="btn secondary small" id="journal-add-line" style="margin-top:8px;">+ Add line</button>
+      <div id="journal-balance-display" style="margin-top:10px;font-size:.85rem;"></div>
+      ${attachmentCaptureField('journal-attachment-file')}
+      <div class="modal-actions">
+        <button type="button" class="btn secondary" id="journal-cancel">Cancel</button>
+        <button type="submit" class="btn">Post Journal</button>
+      </div>
+    </form>
+  </div></div>`;
+}
+function manualJournalLineRow(){
+  const assetOptions = state.assets.map(a=>`<option value="asset:${a.id}">${a.description}</option>`).join('');
+  const liabilityOptions = state.liabilities.map(l=>`<option value="liability:${l.id}">${l.description}</option>`).join('');
+  return `<tr>
+    <td><select class="mj-account" required>
+      <option value="">— choose —</option>
+      <option value="revenue">Revenue</option>
+      <option value="expense">Expense</option>
+      ${assetOptions ? `<optgroup label="Assets">${assetOptions}</optgroup>` : ''}
+      ${liabilityOptions ? `<optgroup label="Liabilities">${liabilityOptions}</optgroup>` : ''}
+    </select></td>
+    <td><select class="mj-side"><option value="debit">Debit</option><option value="credit">Credit</option></select></td>
+    <td><input type="number" class="mj-amount" step="0.01" value="0"></td>
+    <td><input type="text" class="mj-memo" placeholder="optional"></td>
+    <td><button type="button" class="btn small danger mj-remove">✕</button></td>
+  </tr>`;
+}
+function updateJournalBalanceDisplay(){
+  const el = document.getElementById('journal-balance-display');
+  if(!el) return;
+  const rows = [...document.querySelectorAll('#journal-lines-body tr')];
+  const debits = rows.filter(tr=>tr.querySelector('.mj-side').value==='debit').reduce((s,tr)=>s+(parseFloat(tr.querySelector('.mj-amount').value)||0),0);
+  const credits = rows.filter(tr=>tr.querySelector('.mj-side').value==='credit').reduce((s,tr)=>s+(parseFloat(tr.querySelector('.mj-amount').value)||0),0);
+  const diff = round2(debits - credits);
+  el.innerHTML = `Debits: <strong>${fmt(debits)}</strong> · Credits: <strong>${fmt(credits)}</strong> · ${diff===0 ? '<span style="color:var(--accent2);">Balanced ✓</span>' : `<span style="color:var(--danger);">Out of balance by ${fmt(Math.abs(diff))}</span>`}`;
+}
+function parseManualJournalLines(){
+  return [...document.querySelectorAll('#journal-lines-body tr')].map(tr=>{
+    const accVal = tr.querySelector('.mj-account').value;
+    const side = tr.querySelector('.mj-side').value;
+    const amount = parseFloat(tr.querySelector('.mj-amount').value) || 0;
+    const memo = tr.querySelector('.mj-memo').value.trim() || null;
+    let category = null, targetAssetId = null, targetLiabilityId = null;
+    if(accVal === 'revenue' || accVal === 'expense') category = accVal;
+    else if(accVal.startsWith('asset:')){ category = 'asset'; targetAssetId = accVal.slice(6); }
+    else if(accVal.startsWith('liability:')){ category = 'liability'; targetLiabilityId = accVal.slice(10); }
+    return {category, side, amount, memo, targetAssetId, targetLiabilityId};
+  }).filter(l=>l.category && l.amount > 0);
+}
+async function postManualJournalLine(line, journalId, journalDate, journalDescription){
+  let signedAmount = 0, entryId = null;
+  if(line.category === 'revenue'){
+    signedAmount = line.side === 'credit' ? line.amount : -line.amount;
+    const {data: entry} = await sb.from('cc_entries').insert({
+      company_id: state.company.id, type:'revenue', description: line.memo || journalDescription,
+      amount: signedAmount, entry_date: journalDate, tags:['manual-journal'],
+      vat_applicable: false, created_by: state.user.id
+    }).select().single();
+    entryId = entry && entry.id;
+  } else if(line.category === 'expense'){
+    signedAmount = line.side === 'debit' ? line.amount : -line.amount;
+    const {data: entry} = await sb.from('cc_entries').insert({
+      company_id: state.company.id, type:'expense', description: line.memo || journalDescription,
+      amount: signedAmount, entry_date: journalDate, tags:['manual-journal'],
+      vat_applicable: false, expense_category:'operating', created_by: state.user.id
+    }).select().single();
+    entryId = entry && entry.id;
+  } else if(line.category === 'asset'){
+    signedAmount = line.side === 'debit' ? line.amount : -line.amount;
+    const asset = state.assets.find(a=>a.id===line.targetAssetId);
+    if(asset) await sb.from('cc_assets').update({value: Number(asset.value) + signedAmount}).eq('id', asset.id);
+  } else if(line.category === 'liability'){
+    signedAmount = line.side === 'credit' ? line.amount : -line.amount;
+    const liability = state.liabilities.find(x=>x.id===line.targetLiabilityId);
+    if(liability) await sb.from('cc_liabilities').update({amount: Number(liability.amount) + signedAmount}).eq('id', liability.id);
+  }
+  await sb.from('cc_manual_journal_lines').insert({
+    journal_id: journalId, company_id: state.company.id, category: line.category, side: line.side, amount: line.amount,
+    signed_amount: signedAmount, target_asset_id: line.targetAssetId, target_liability_id: line.targetLiabilityId,
+    memo: line.memo, entry_id: entryId
+  });
+}
+function attachManualJournalHandlers(){
+  const canCreate = isAdmin();
+  wireAttachmentButtons(canCreate);
+  document.querySelectorAll('[data-del-journal]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this journal? This reverses its effect on Assets/Liabilities and removes any entries it created.')) return;
+      const journalId = btn.dataset.delJournal;
+      const lines = state.manualJournalLines[journalId] || [];
+      for(const line of lines){
+        if(line.entry_id) await sb.from('cc_entries').delete().eq('id', line.entry_id);
+        if(line.category === 'asset' && line.target_asset_id){
+          const asset = state.assets.find(a=>a.id===line.target_asset_id);
+          if(asset) await sb.from('cc_assets').update({value: Number(asset.value) - Number(line.signed_amount)}).eq('id', asset.id);
+        }
+        if(line.category === 'liability' && line.target_liability_id){
+          const liability = state.liabilities.find(x=>x.id===line.target_liability_id);
+          if(liability) await sb.from('cc_liabilities').update({amount: Number(liability.amount) - Number(line.signed_amount)}).eq('id', liability.id);
+        }
+      }
+      const delJournal = state.manualJournals.find(j=>j.id===journalId);
+      await deleteAttachmentsForEntity('manual_journal', journalId);
+      await sb.from('cc_manual_journals').delete().eq('id', journalId);
+      await logActivity('delete', 'manual_journal', journalId, delJournal ? delJournal.description : '');
+      await refreshAll(); render();
+    });
+  });
+  if(!canCreate) return;
+  const backdrop = document.getElementById('journal-modal-backdrop');
+  document.getElementById('add-journal-btn')?.addEventListener('click', ()=>{
+    document.getElementById('journal-date').value = new Date().toISOString().slice(0,10);
+    document.getElementById('journal-description').value = '';
+    document.getElementById('journal-lines-body').innerHTML = manualJournalLineRow() + manualJournalLineRow();
+    document.getElementById('journal-attachment-file').value = '';
+    updateJournalBalanceDisplay();
+    backdrop.classList.remove('hidden');
+  });
+  document.getElementById('journal-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('journal-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('journal-add-line')?.addEventListener('click', ()=>{
+    document.getElementById('journal-lines-body').insertAdjacentHTML('beforeend', manualJournalLineRow());
+    updateJournalBalanceDisplay();
+  });
+  document.getElementById('journal-lines-body')?.addEventListener('click', (e)=>{
+    if(e.target.classList.contains('mj-remove')){ e.target.closest('tr').remove(); updateJournalBalanceDisplay(); }
+  });
+  document.getElementById('journal-lines-body')?.addEventListener('input', updateJournalBalanceDisplay);
+  document.getElementById('journal-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const journalDate = document.getElementById('journal-date').value;
+    const description = document.getElementById('journal-description').value.trim();
+    if(!description){ toast('Enter a description for this journal.'); return; }
+    if(isPeriodLocked(journalDate)){ toast(periodLockMessage()); return; }
+    const parsed = parseManualJournalLines();
+    if(parsed.length < 2){ toast('Add at least 2 journal lines.'); return; }
+    const totalDebits = round2(parsed.filter(l=>l.side==='debit').reduce((s,l)=>s+l.amount,0));
+    const totalCredits = round2(parsed.filter(l=>l.side==='credit').reduce((s,l)=>s+l.amount,0));
+    if(Math.abs(totalDebits - totalCredits) > 0.005){ toast(`Debits (${fmt(totalDebits)}) must equal credits (${fmt(totalCredits)}) before you can post this journal.`); return; }
+    const {data: journal, error} = await sb.from('cc_manual_journals').insert({
+      company_id: state.company.id,
+      journal_date: journalDate,
+      description,
+      created_by: state.user.id
+    }).select().single();
+    if(error){ toast(error.message); return; }
+    for(const line of parsed){
+      await postManualJournalLine(line, journal.id, journalDate, description);
+    }
+    await uploadCapturedAttachment('journal-attachment-file', 'manual_journal', journal.id);
+    await logActivity('create', 'manual_journal', journal.id, `${description} (${fmt(totalDebits)})`);
+    backdrop.classList.add('hidden');
+    await refreshAll(); render();
+    toast('Journal posted.');
   });
 }
 

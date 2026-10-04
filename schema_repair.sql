@@ -1361,3 +1361,57 @@ create policy "scoped delete liability payments" on cc_liability_payments for de
 -- ---------- verify ----------
 select table_name from information_schema.tables where table_name = 'cc_liability_payments';
 select tablename, policyname, cmd from pg_policies where tablename = 'cc_liability_payments' order by cmd;
+
+-- ============ WAVE 35: Manual Journals (true double-entry adjustments) ============
+-- A journal has 2+ lines, each a debit or credit against Revenue, Expenses, an Asset or a
+-- Liability; the app enforces total debits = total credits before posting. Revenue/Expense
+-- lines create a new cc_entries row (tagged 'manual-journal'); Asset/Liability lines directly
+-- adjust that record's value/amount (they're simple balances here, not itemized ledgers).
+-- Owner/Management only (cc_is_admin); everyone who can see the tab can view journals.
+create table if not exists cc_manual_journals (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  journal_date date not null default current_date,
+  description text not null,
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now()
+);
+
+create table if not exists cc_manual_journal_lines (
+  id uuid primary key default gen_random_uuid(),
+  journal_id uuid not null references cc_manual_journals(id) on delete cascade,
+  company_id uuid references cc_companies(id) on delete cascade,
+  category text not null check (category in ('revenue','expense','asset','liability')),
+  side text not null check (side in ('debit','credit')),
+  amount numeric not null check (amount > 0),
+  -- the delta actually applied (positive=increase, negative=decrease) — lets a journal deletion
+  -- reverse an asset/liability adjustment exactly, and shows debit/credit intent either way.
+  signed_amount numeric not null,
+  target_asset_id uuid references cc_assets(id) on delete set null,
+  target_liability_id uuid references cc_liabilities(id) on delete set null,
+  memo text,
+  -- the cc_entries row this line created (revenue/expense lines only), so deleting the journal
+  -- can clean that entry back up too (mirrors cc_bank_transactions.linked_payment_id).
+  entry_id uuid references cc_entries(id) on delete set null,
+  created_at timestamptz default now()
+);
+
+alter table cc_manual_journals enable row level security;
+create policy "members select manual journals" on cc_manual_journals for select using (cc_is_member(company_id));
+create policy "admin write manual journals" on cc_manual_journals for insert with check (cc_is_admin(company_id));
+create policy "admin delete manual journals" on cc_manual_journals for delete using (cc_is_admin(company_id));
+
+alter table cc_manual_journal_lines enable row level security;
+create policy "members select manual journal lines" on cc_manual_journal_lines for select using (cc_is_member(company_id));
+create policy "admin write manual journal lines" on cc_manual_journal_lines for insert with check (cc_is_admin(company_id));
+create policy "admin delete manual journal lines" on cc_manual_journal_lines for delete using (cc_is_admin(company_id));
+
+-- Manual Journals can carry attachments too, same as every other capture-time entity.
+alter table cc_attachments drop constraint if exists cc_attachments_entity_type_check;
+alter table cc_attachments add constraint cc_attachments_entity_type_check
+  check (entity_type in ('revenue','expense','invoice','credit_note','supplier_invoice','supplier_credit_note','manual_journal'));
+
+-- ---------- verify ----------
+select table_name from information_schema.tables where table_name in ('cc_manual_journals','cc_manual_journal_lines');
+select tablename, policyname, cmd from pg_policies where tablename in ('cc_manual_journals','cc_manual_journal_lines') order by tablename, cmd;
+select conname, pg_get_constraintdef(oid) from pg_constraint where conrelid = 'cc_attachments'::regclass and contype = 'c';
