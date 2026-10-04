@@ -5904,6 +5904,7 @@ function renderReports(){
       <button class="btn ${state.reportsTab==='monthly'?'':'secondary'} small" data-report-tab="monthly">Monthly Accounts</button>
       <button class="btn ${state.reportsTab==='pl'?'':'secondary'} small" data-report-tab="pl">Profit &amp; Loss</button>
       <button class="btn ${state.reportsTab==='bs'?'':'secondary'} small" data-report-tab="bs">Balance Sheet</button>
+      <button class="btn ${state.reportsTab==='tb'?'':'secondary'} small" data-report-tab="tb">Trial Balance</button>
       <button class="btn ${state.reportsTab==='cf'?'':'secondary'} small" data-report-tab="cf">Cash Flow</button>
       <button class="btn ${state.reportsTab==='debtors'?'':'secondary'} small" data-report-tab="debtors">Debtors</button>
       <button class="btn ${state.reportsTab==='creditors'?'':'secondary'} small" data-report-tab="creditors">Creditors</button>
@@ -5916,6 +5917,7 @@ function renderReports(){
       monthly: "A full month's pack in one place — P&amp;L, balance sheet, fixed assets, and outstanding balances.",
       pl: "Revenue minus expenses for the period — how much the business made.",
       bs: "What the business owns, owes, and is worth, as at a point in time.",
+      tb: "Every account's debit or credit balance for the period, side by side — they should always total the same on both sides.",
       cf: "Cash actually received and paid — excludes non-cash items like depreciation, unlike the P&amp;L.",
       debtors: "Money owed to you by clients, and how overdue it is.",
       creditors: "Money you owe to suppliers, and when it's due.",
@@ -5942,7 +5944,7 @@ function renderReports(){
       <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">P&amp;L: ${period.start} to ${period.end}<br>Balance sheet as of ${period.end}</div>
     </div>
     `}
-    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : state.reportsTab==='companytax' ? renderCompanyTax() : renderPL(pl)}
+    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='tb' ? renderTB(computeTB(pl, bs)) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : state.reportsTab==='companytax' ? renderCompanyTax() : renderPL(pl)}
   `;
 }
 
@@ -6073,6 +6075,54 @@ function renderBS(bs){
     <p style="color:var(--muted);font-size:.8rem;margin-bottom:0;">This is a computed balancing figure, not tracked via separate share capital / drawings accounts — treat it as retained earnings plus any capital introduced.</p>
   </div>
   <p style="color:var(--muted);font-size:.8rem;">As at ${bs.asOf}. Fixed assets are shown at net book value (cost less accumulated depreciation) where depreciation has been run under Assets.</p>
+  `;
+}
+
+// A trial balance derived entirely from the same P&L/Balance Sheet figures used elsewhere in
+// Reports — there's no separate chart of accounts here. "Retained Earnings / Owner's Equity b/f"
+// is deliberately computed as the balancing plug (closing equity minus the period's net profit),
+// not a separately-snapshotted opening balance, so debits = credits exactly, by construction, for
+// any period, even if an asset or liability was ever added directly without a matching entry.
+function computeTB(pl, bs){
+  const rows = [];
+  function row(label, amount, normalSide){
+    const v = Number(amount) || 0;
+    if(Math.abs(v) < 0.005) return;
+    if(normalSide === 'debit'){
+      rows.push(v >= 0 ? {label, debit: v, credit: 0} : {label, debit: 0, credit: -v});
+    } else {
+      rows.push(v >= 0 ? {label, debit: 0, credit: v} : {label, debit: -v, credit: 0});
+    }
+  }
+  row('Cash & Bank', bs.cash, 'debit');
+  row('Accounts Receivable', bs.accountsReceivable, 'debit');
+  row('VAT Receivable', bs.vatReceivableAmt, 'debit');
+  row('Other Current Assets', bs.otherCurrentAssets, 'debit');
+  row('Fixed Assets (net book value)', bs.fixedAssets, 'debit');
+  row('Cost of Sales (period)', pl.cos, 'debit');
+  row('Operating Expenses (period)', pl.opex, 'debit');
+  row('Payroll & Staff Costs (period)', pl.payrollCost, 'debit');
+  row('VAT Payable', bs.vatPayableAmt, 'credit');
+  row('Accounts Payable', bs.accountsPayableFromBills, 'credit');
+  row('Other Current Liabilities', bs.currentLiabOther - bs.accountsPayableFromBills, 'credit');
+  row('Non-Current Liabilities', bs.nonCurrentLiab, 'credit');
+  row('Revenue (period)', pl.revenue, 'credit');
+  row("Retained Earnings / Owner's Equity b/f", bs.equity - pl.netProfit, 'credit');
+  const totalDebit = rows.reduce((s,r)=>s+r.debit, 0);
+  const totalCredit = rows.reduce((s,r)=>s+r.credit, 0);
+  return {rows, totalDebit, totalCredit, diff: round2(totalDebit - totalCredit), period_end: bs.asOf};
+}
+
+function renderTB(tb){
+  return `
+  <div class="panel">
+    <table class="report-table"><thead><tr><th>Account</th><th style="text-align:right;">Debit</th><th style="text-align:right;">Credit</th></tr></thead><tbody>
+      ${tb.rows.map(r=>`<tr><td>${r.label}</td><td style="text-align:right;">${r.debit?fmt(r.debit):''}</td><td style="text-align:right;">${r.credit?fmt(r.credit):''}</td></tr>`).join('')}
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Total</td><td style="text-align:right;">${fmt(tb.totalDebit)}</td><td style="text-align:right;">${fmt(tb.totalCredit)}</td></tr>
+    </tbody></table>
+    ${Math.abs(tb.diff) >= 0.01 ? `<p class="negative" style="font-weight:600;margin-bottom:0;">Out of balance by ${fmt(tb.diff)} — this shouldn't normally happen; worth checking for a data issue.</p>` : ''}
+  </div>
+  <p style="color:var(--muted);font-size:.8rem;">Debits and credits for the selected period, drawn from the same figures as the Profit &amp; Loss and Balance Sheet above (balance sheet lines as at ${tb.period_end}). "Retained Earnings / Owner's Equity b/f" is a balancing figure carried forward from before this period, not a separately tracked account. Not tax advice — confirm with your accountant before relying on this for statutory reporting.</p>
   `;
 }
 
