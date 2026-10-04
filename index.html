@@ -95,6 +95,9 @@
   #sidebar h2{font-size:1.1rem;margin:4px 8px 2px;}
   #sidebar .company-name{font-size:.78rem;color:var(--muted);margin:0 8px 18px;}
   #sidebar nav{display:flex;flex-direction:column;gap:2px;flex:1;}
+  #sidebar nav .nav-group{display:flex;flex-direction:column;gap:2px;}
+  #sidebar nav .nav-group.hidden{display:none;}
+  #sidebar nav .nav-group-label{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:10px 10px 2px;}
   #sidebar nav button{text-align:left;background:none;border:none;color:var(--text);padding:9px 10px;border-radius:10px;font-size:.9rem;display:flex;align-items:center;gap:9px;}
   #sidebar nav button:hover{background:var(--panel2);}
   #sidebar nav button.active{background:var(--panel2);color:var(--dot,var(--accent));font-weight:600;box-shadow:inset 3px 0 0 0 var(--dot);}
@@ -251,26 +254,47 @@
     <div class="company-name" id="sidebar-company-name">Loading…</div>
     <nav id="nav">
       <button data-view="dashboard" class="active"><span class="dot"></span>Dashboard</button>
-      <button data-view="revenue"><span class="dot"></span>Revenue</button>
-      <button data-view="expenses"><span class="dot"></span>Expenses</button>
-      <button data-view="assets"><span class="dot"></span>Assets</button>
-      <button data-view="stock"><span class="dot"></span>Stock</button>
-      <button data-view="liabilities"><span class="dot"></span>Liabilities</button>
-      <button data-view="supplierinvoices"><span class="dot"></span>Supplier Invoices</button>
-      <button data-view="clients"><span class="dot"></span>Clients</button>
-      <button data-view="quotes"><span class="dot"></span>Quotes</button>
-      <button data-view="invoices"><span class="dot"></span>Invoices</button>
-      <button data-view="creditnotes"><span class="dot"></span>Credit Notes</button>
-      <button data-view="payroll"><span class="dot"></span>Payroll</button>
-      <button data-view="tasks"><span class="dot"></span>Tasks</button>
-      <button data-view="vat"><span class="dot"></span>VAT</button>
-      <button data-view="reports"><span class="dot"></span>Reports</button>
-      <button data-view="scenarios"><span class="dot"></span>Scenarios</button>
-      <button data-view="manualjournals"><span class="dot"></span>Manual Journals</button>
-      <button data-view="bankfeed"><span class="dot"></span>Bank Feed</button>
-      <button data-view="activitylog"><span class="dot"></span>Activity Log</button>
-      <button data-view="team"><span class="dot"></span>Team</button>
-      <button data-view="settings"><span class="dot"></span>Settings</button>
+      <div class="nav-group" data-nav-group="accounting">
+        <div class="nav-group-label">Accounting</div>
+        <button data-view="revenue"><span class="dot"></span>Revenue</button>
+        <button data-view="expenses"><span class="dot"></span>Expenses</button>
+        <button data-view="assets"><span class="dot"></span>Assets</button>
+        <button data-view="stock"><span class="dot"></span>Stock</button>
+        <button data-view="liabilities"><span class="dot"></span>Liabilities</button>
+        <button data-view="manualjournals"><span class="dot"></span>Manual Journals</button>
+        <button data-view="bankfeed"><span class="dot"></span>Bank Feed</button>
+      </div>
+      <div class="nav-group" data-nav-group="sales">
+        <div class="nav-group-label">Sales</div>
+        <button data-view="clients"><span class="dot"></span>Clients</button>
+        <button data-view="quotes"><span class="dot"></span>Quotes</button>
+        <button data-view="invoices"><span class="dot"></span>Invoices</button>
+        <button data-view="creditnotes"><span class="dot"></span>Credit Notes</button>
+      </div>
+      <div class="nav-group" data-nav-group="purchases">
+        <div class="nav-group-label">Purchases</div>
+        <button data-view="supplierinvoices"><span class="dot"></span>Supplier Invoices</button>
+      </div>
+      <div class="nav-group" data-nav-group="payroll">
+        <div class="nav-group-label">Payroll</div>
+        <button data-view="payroll"><span class="dot"></span>Payroll</button>
+        <button data-view="tasks"><span class="dot"></span>Tasks</button>
+      </div>
+      <div class="nav-group" data-nav-group="compliance">
+        <div class="nav-group-label">Tax &amp; Compliance</div>
+        <button data-view="vat"><span class="dot"></span>VAT</button>
+      </div>
+      <div class="nav-group" data-nav-group="reporting">
+        <div class="nav-group-label">Reports &amp; Planning</div>
+        <button data-view="reports"><span class="dot"></span>Reports</button>
+        <button data-view="scenarios"><span class="dot"></span>Scenarios</button>
+      </div>
+      <div class="nav-group" data-nav-group="admin">
+        <div class="nav-group-label">Admin</div>
+        <button data-view="activitylog"><span class="dot"></span>Activity Log</button>
+        <button data-view="team"><span class="dot"></span>Team</button>
+        <button data-view="settings"><span class="dot"></span>Settings</button>
+      </div>
     </nav>
     <div class="legal-links sidebar-legal-links">
       <a href="#" data-open-legal="terms">Terms</a> · <a href="#" data-open-legal="privacy">Privacy</a>
@@ -818,6 +842,12 @@ function firstAllowedView(){
 function applyNavVisibility(){
   document.querySelectorAll('#nav button[data-view]').forEach(btn=>{
     btn.classList.toggle('hidden', !canSeeTab(btn.dataset.view));
+  });
+  // A restricted staff member may lose every tab in a group (e.g. no Sales access at all) —
+  // hide that group's heading too rather than showing an orphaned label with nothing under it.
+  document.querySelectorAll('#nav .nav-group').forEach(group=>{
+    const anyVisible = [...group.querySelectorAll('button[data-view]')].some(b=>!b.classList.contains('hidden'));
+    group.classList.toggle('hidden', !anyVisible);
   });
 }
 function roleLabel(m){
