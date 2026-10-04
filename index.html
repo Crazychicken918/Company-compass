@@ -152,6 +152,7 @@
   .field{display:flex;flex-direction:column;gap:4px;font-size:.8rem;color:var(--muted);}
   .field input,.field select{min-width:140px;}
   .tag-pill{display:inline-block;background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:.72rem;margin-right:4px;}
+  .source-pill{display:inline-block;background:#E3F8F0;color:#0E8F63;border-radius:999px;padding:2px 9px;font-size:.72rem;font-weight:600;white-space:nowrap;}
   .status-pill{display:inline-block;border-radius:999px;padding:2px 10px;font-size:.72rem;font-weight:600;}
   .status-draft{background:var(--panel2);color:var(--muted);}
   .status-sent{background:#e6edff;color:#3757d6;}
@@ -691,6 +692,7 @@ let state = {
   entries: [],
   assets: [],
   liabilities: [],
+  liabilityPayments: [], // actual cash paid against liabilities/loans (principal + interest split)
   clients: [],
   invoices: [],
   invoiceItems: {},   // invoiceId -> items[]
@@ -1084,14 +1086,15 @@ async function refreshAll(){
   state.leaveEntries = leaveEntriesRes.data || [];
   state.taskNotes = taskNotesRes.data || [];
   state.attachments = attachmentsRes.data || [];
-  const [auditLogRes, bankTxRes, stockRes, quotesRes, provTaxRes, emp201Res, coidaRes] = await Promise.all([
+  const [auditLogRes, bankTxRes, stockRes, quotesRes, provTaxRes, emp201Res, coidaRes, liabilityPaymentsRes] = await Promise.all([
     sb.from('cc_audit_log').select('*').eq('company_id', cid).order('created_at', {ascending:false}).limit(300),
     sb.from('cc_bank_transactions').select('*').eq('company_id', cid).order('tx_date', {ascending:false}),
     sb.from('cc_stock_items').select('*').eq('company_id', cid).order('name', {ascending:true}),
     sb.from('cc_quotes').select('*').eq('company_id', cid).order('issue_date', {ascending:false}),
     sb.from('cc_provisional_tax').select('*').eq('company_id', cid),
     sb.from('cc_emp201_submissions').select('*').eq('company_id', cid),
-    sb.from('cc_coida_returns').select('*').eq('company_id', cid)
+    sb.from('cc_coida_returns').select('*').eq('company_id', cid),
+    sb.from('cc_liability_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false})
   ]);
   state.auditLog = auditLogRes.data || [];
   state.bankTransactions = bankTxRes.data || [];
@@ -1100,6 +1103,7 @@ async function refreshAll(){
   state.provisionalTax = provTaxRes.data || [];
   state.emp201Submissions = emp201Res.data || [];
   state.coidaReturns = coidaRes.data || [];
+  state.liabilityPayments = liabilityPaymentsRes.data || [];
 
   const invoiceIds = state.invoices.map(i=>i.id);
   const creditNoteIds = state.creditNotes.map(cn=>cn.id);
@@ -1786,12 +1790,15 @@ function renderImportPreviewTable(preview){
 }
 
 /* ========================= NAV / RENDER ========================= */
+function goToView(view){
+  state.view = view;
+  document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active', b.dataset.view===view));
+  render();
+}
 document.getElementById('nav').addEventListener('click', (e)=>{
   const btn = e.target.closest('button[data-view]');
   if(!btn) return;
-  state.view = btn.dataset.view;
-  document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active', b===btn));
-  render();
+  goToView(btn.dataset.view);
 });
 
 function render(){
@@ -1821,6 +1828,7 @@ function render(){
 }
 
 function attachDashboardHandlers(){
+  document.getElementById('dashboard-bankfeed-btn')?.addEventListener('click', ()=>goToView('bankfeed'));
   const months = last6MonthsRange();
   const revenueData = months.map(m=>state.entries.filter(e=>e.type==='revenue' && e.entry_date>=m.start && e.entry_date<=m.end).reduce((s,e)=>s+Number(e.amount),0));
   const expenseData = months.map(m=>state.entries.filter(e=>e.type==='expense' && e.entry_date>=m.start && e.entry_date<=m.end).reduce((s,e)=>s+Number(e.amount),0));
@@ -1842,6 +1850,18 @@ function isNonCashEntry(e){
   // Depreciation is a book expense; invoice-linked entries are accrual revenue/expense
   // recognized at invoice time. None of these are actual cash movements.
   return (e.tags||[]).includes('depreciation') || !!e.source_invoice_id || !!e.source_supplier_invoice_id;
+}
+// Human-readable "where did this entry come from" label, derived from existing tags/links —
+// no new schema. Distinct from the raw system-tag pills already shown in the Tags column.
+function entrySourceLabel(e){
+  const tags = e.tags || [];
+  if(e.source_invoice_id) return 'From Invoice';
+  if(e.source_supplier_invoice_id) return 'From Supplier Invoice';
+  if(tags.includes('bank-import')) return 'Imported via Bank Feed';
+  if(tags.includes('depreciation')) return 'Depreciation';
+  if(tags.includes('cost-of-sales') || tags.includes('stock')) return 'Stock';
+  if(tags.includes('liability-payment')) return 'Loan interest payment';
+  return 'Added manually';
 }
 function totalsFor(){
   const revenue = state.entries.filter(e=>e.type==='revenue' && !isNonCashEntry(e)).reduce((s,e)=>s+Number(e.amount),0);
@@ -1897,6 +1917,7 @@ function vatForPeriod(from, to){
 function renderDashboard(){
   const t = totalsFor();
   const v = vatFor();
+  const unmatchedBankTx = state.bankTransactions.filter(x=>x.status==='unmatched');
   const today = todayIso();
   const outstandingInvoices = state.invoices.filter(i=>i.status==='sent'||i.status==='overdue');
   const overdueInvoices = outstandingInvoices.filter(i=>i.due_date && i.due_date < today);
@@ -1913,6 +1934,7 @@ function renderDashboard(){
       <div class="card" style="--accent-c:var(--c-revenue);"><h3>Revenue vs Expenses</h3><div class="value">${fmt(t.revenue - t.expenses)}</div><div class="sub">${fmt(t.revenue)} revenue, ${fmt(t.expenses)} expenses</div></div>
       <div class="card" style="--accent-c:var(--c-assets);"><h3>Net Worth</h3><div class="value ${t.netWorth<0?'negative':'positive'}">${fmt(t.netWorth)}</div><div class="sub">Assets + balance − liabilities</div></div>
       <div class="card" style="--accent-c:var(--c-vat);"><h3>VAT Payable (current)</h3><div class="value">${fmt(v.vatPayable)}</div><div class="sub">Collected ${fmt(v.vatCollected)} − paid ${fmt(v.vatPaid)}</div></div>
+      <div class="card" style="--accent-c:#0FB981;"><h3>Bank Feed</h3><div class="value ${unmatchedBankTx.length?'negative':'positive'}">${unmatchedBankTx.length}</div><div class="sub">Unmatched transaction${unmatchedBankTx.length===1?'':'s'}</div><button type="button" class="btn small secondary" id="dashboard-bankfeed-btn" style="margin-top:8px;">Go to Bank Feed →</button></div>
     </div>
     <div class="chart-wrap">
       <h3 style="margin-top:0;">Revenue vs Expenses — last 6 months</h3>
@@ -1976,12 +1998,13 @@ function renderEntries(type){
     <p class="section-caption">${type==='revenue' ? 'Money coming into the business.' : 'Money going out of the business.'}</p>
     <div class="grid"><div class="card" style="--accent-c:${accent};"><h3>Total ${label}</h3><div class="value">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${rows.length ? `<table><thead><tr><th>Date</th><th>Description</th>${type==='expense'?'<th>Category</th>':''}<th>Amount</th><th>Tags</th><th>VAT</th><th>Recurring</th><th>Docs</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+      ${rows.length ? `<table><thead><tr><th>Date</th><th>Description</th>${type==='expense'?'<th>Category</th>':''}<th>Amount</th><th>Source</th><th>Tags</th><th>VAT</th><th>Recurring</th><th>Docs</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${rows.map(e=>`<tr>
           <td>${e.entry_date}</td>
           <td>${e.description}</td>
           ${type==='expense'?`<td>${e.expense_category==='cost_of_sales'?'Cost of Sales':'Operating'}</td>`:''}
           <td>${fmt(e.amount)}</td>
+          <td><span class="source-pill">${entrySourceLabel(e)}</span></td>
           <td>${(e.tags||[]).map(t=>`<span class="tag-pill">${t}</span>`).join('')}</td>
           <td>${e.vat_applicable?'Yes':'No'}</td>
           <td>${e.is_recurring ? (e.recurrence_frequency||'yes') : '—'}</td>
@@ -2290,10 +2313,11 @@ function renderLiabilities(){
     <p class="section-caption">What the business owes — loans, supplier balances, and other obligations.</p>
     <div class="grid"><div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Liabilities</h3><div class="value negative">${fmt(total)}</div></div></div>
     <div class="panel">
-      ${state.liabilities.length ? `<table><thead><tr><th>Description</th><th>Type</th><th>Amount</th><th>Rate</th><th>Term</th><th>Due Date</th><th>Current?</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.liabilities.map(l=>`<tr><td>${l.description}</td><td>${l.type}</td><td>${fmt(l.amount)}</td><td>${l.interest_rate?l.interest_rate+'%':'—'}</td><td>${l.term_months?l.term_months+' mo':'—'}</td><td>${l.due_date||'—'}</td><td>${l.is_current?'Yes':'No'}</td>${canEdit?`<td><button class="btn small danger" data-del-liability="${l.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.liabilities.length ? `<table><thead><tr><th>Description</th><th>Type</th><th>Amount</th><th>Balance</th><th>Rate</th><th>Term</th><th>Due Date</th><th>Current?</th><th></th></tr></thead><tbody>
+        ${state.liabilities.map(l=>`<tr><td>${l.description}</td><td>${l.type}</td><td>${fmt(l.amount)}</td><td>${fmt(liabilityBalance(l).balance)}</td><td>${l.interest_rate?l.interest_rate+'%':'—'}</td><td>${l.term_months?l.term_months+' mo':'—'}</td><td>${l.due_date||'—'}</td><td>${l.is_current?'Yes':'No'}</td><td><button type="button" class="btn small secondary" data-view-liability="${l.id}">Payments</button>${canEdit?` <button class="btn small danger" data-del-liability="${l.id}">Delete</button>`:''}</td></tr>`).join('')}
       </tbody></table>` : `<div class="empty">No liabilities recorded yet.</div>`}
     </div>
+    <div class="modal-backdrop hidden" id="liability-view-backdrop"><div class="modal" id="liability-view-content"></div></div>
     ${canEdit ? `
     <div class="modal-backdrop hidden" id="liability-modal-backdrop"><div class="modal">
       <button class="close-x" id="liability-modal-close">✕</button>
@@ -2343,6 +2367,101 @@ function attachLiabilityHandlers(){
       await sb.from('cc_liabilities').delete().eq('id', btn.dataset.delLiability);
       await logActivity('delete', 'liability', btn.dataset.delLiability, delLiability ? `${delLiability.description} (${fmt(delLiability.amount)})` : '');
       await refreshAll(); render();
+    });
+  });
+  document.querySelectorAll('[data-view-liability]').forEach(btn=>{
+    btn.addEventListener('click', ()=>openLiabilityView(btn.dataset.viewLiability));
+  });
+}
+async function openLiabilityView(liabilityId){
+  const l = state.liabilities.find(x=>x.id===liabilityId);
+  if(!l) return;
+  const canEdit = hasModule('liabilities');
+  const bal = liabilityBalance(l);
+  const payments = (state.liabilityPayments||[]).filter(p=>p.liability_id===l.id)
+    .slice().sort((a,b)=> (b.payment_date||'').localeCompare(a.payment_date||''));
+  const backdrop = document.getElementById('liability-view-backdrop');
+  document.getElementById('liability-view-content').innerHTML = `
+    <button class="close-x" id="liability-view-close">✕</button>
+    <h2>${l.description}</h2>
+    <p style="font-size:.85rem;color:var(--muted);">${l.type.charAt(0).toUpperCase()+l.type.slice(1)}${l.interest_rate?' · '+l.interest_rate+'% p.a.':''}${l.due_date?' · Due '+l.due_date:''}</p>
+    <div style="text-align:right;margin-top:10px;font-size:.9rem;">
+      <div>Original amount: ${fmt(l.amount)}</div>
+      ${bal.principalPaid ? `<div style="color:var(--accent2);">Principal paid: ${fmt(bal.principalPaid)}</div>` : ''}
+      ${bal.interestPaid ? `<div>Interest paid: ${fmt(bal.interestPaid)}</div>` : ''}
+      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Balance: ${fmt(bal.balance)}</div>
+    </div>
+    <div class="panel" style="margin-top:14px;">
+      <h3 style="margin-top:0;">Payments made</h3>
+      ${payments.length ? `<table class="payment-list"><thead><tr><th>Date</th><th>Principal</th><th>Interest</th><th>Notes</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.principal_amount||0)}</td><td>${fmt(p.interest_amount||0)}</td><td>${p.notes||'—'}</td>${canEdit?`<td><button class="btn small danger" data-del-liability-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
+      ${canEdit ? `<button type="button" class="btn secondary small" id="add-liability-payment-btn" style="margin-top:10px;">+ Record Payment</button>
+      <form id="liability-payment-form" class="hidden" style="margin-top:10px;">
+        <div class="row">
+          <div class="field"><label>Date</label><input type="date" id="liability-payment-date" required></div>
+          <div class="field"><label>Principal (R)</label><input type="number" step="0.01" id="liability-payment-principal" value="${bal.balance.toFixed(2)}"></div>
+          <div class="field"><label>Interest (R)</label><input type="number" step="0.01" id="liability-payment-interest" value="0"></div>
+        </div>
+        <p style="font-size:.76rem;color:var(--muted);margin:2px 0 0;">Principal reduces this liability's balance. Interest is posted as a new Expense entry.</p>
+        <div class="field"><label>Notes (optional)</label><input type="text" id="liability-payment-notes"></div>
+        <div class="modal-actions"><button type="submit" class="btn small">Save Payment</button></div>
+      </form>` : ''}
+    </div>
+  `;
+  backdrop.classList.remove('hidden');
+  document.getElementById('liability-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('add-liability-payment-btn')?.addEventListener('click', ()=>{
+    document.getElementById('liability-payment-date').value = new Date().toISOString().slice(0,10);
+    document.getElementById('liability-payment-form').classList.remove('hidden');
+  });
+  document.getElementById('liability-payment-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const principal = parseFloat(document.getElementById('liability-payment-principal').value) || 0;
+    const interest = parseFloat(document.getElementById('liability-payment-interest').value) || 0;
+    if(principal <= 0 && interest <= 0){ toast('Enter a principal and/or interest amount.'); return; }
+    const paymentDate = document.getElementById('liability-payment-date').value;
+    const notes = document.getElementById('liability-payment-notes').value.trim() || null;
+    let interestEntryId = null;
+    if(interest > 0){
+      const {data: interestEntry, error: entryErr} = await sb.from('cc_entries').insert({
+        company_id: state.company.id,
+        type: 'expense',
+        description: `Interest — ${l.description}`,
+        amount: interest,
+        entry_date: paymentDate,
+        tags: ['liability-payment'],
+        vat_applicable: false,
+        expense_category: 'operating',
+        created_by: state.user.id
+      }).select().single();
+      if(entryErr){ toast(entryErr.message); return; }
+      interestEntryId = interestEntry && interestEntry.id;
+    }
+    const {error} = await sb.from('cc_liability_payments').insert({
+      liability_id: l.id,
+      company_id: state.company.id,
+      payment_date: paymentDate,
+      principal_amount: principal,
+      interest_amount: interest,
+      interest_entry_id: interestEntryId,
+      notes,
+      created_by: state.user.id
+    });
+    if(error){ toast(error.message); return; }
+    await logActivity('create', 'liability_payment', l.id, `${l.description}: principal ${fmt(principal)}, interest ${fmt(interest)}`);
+    await refreshAll(); render();
+    openLiabilityView(l.id);
+    toast('Payment recorded.');
+  });
+  document.querySelectorAll('[data-del-liability-payment]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      if(!confirm('Delete this payment?')) return;
+      const pay = (state.liabilityPayments||[]).find(p=>p.id===btn.dataset.delLiabilityPayment);
+      if(pay && pay.interest_entry_id) await sb.from('cc_entries').delete().eq('id', pay.interest_entry_id);
+      await sb.from('cc_liability_payments').delete().eq('id', btn.dataset.delLiabilityPayment);
+      await refreshAll(); render();
+      openLiabilityView(l.id);
     });
   });
 }
@@ -2399,6 +2518,16 @@ function invoiceBalance(inv){
   const total = docTotalZAR(inv, state.invoiceItems[inv.id]);
   const paid = (state.invoicePayments||[]).filter(p=>p.invoice_id===inv.id).reduce((s,p)=>s+Number(p.amount),0);
   return {total, paid, balance: Math.max(0, total - paid)};
+}
+// Liability (loan) equivalent of billBalance()/invoiceBalance(). Only the principal portion of a
+// payment reduces the balance — interest is a P&L expense, posted separately as a cc_entries row
+// (see openLiabilityView()'s payment form), so it's tracked here for display but not subtracted.
+function liabilityBalance(l){
+  const total = Number(l.amount);
+  const payments = (state.liabilityPayments||[]).filter(p=>p.liability_id===l.id);
+  const principalPaid = payments.reduce((s,p)=>s+Number(p.principal_amount||0),0);
+  const interestPaid = payments.reduce((s,p)=>s+Number(p.interest_amount||0),0);
+  return {total, principalPaid, interestPaid, balance: Math.max(0, total - principalPaid)};
 }
 // Approved invoices/bills that still have money owing on them — used both by the bank
 // reconciliation auto-suggestions and by the "Find & Match" search picker.

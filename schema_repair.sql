@@ -1324,3 +1324,40 @@ alter table cc_bank_transactions add column if not exists linked_payment_id uuid
 -- ---------- verify ----------
 select conname, pg_get_constraintdef(oid) from pg_constraint where conrelid = 'cc_attachments'::regclass and contype = 'c';
 select column_name, data_type from information_schema.columns where table_name = 'cc_bank_transactions' and column_name = 'linked_payment_id';
+
+-- ============ WAVE 34: Dashboard Bank Feed shortcut, entry Source labels, loan repayments ============
+
+-- ---------- Loan/liability repayments (principal/interest split) ----------
+-- Mirrors cc_invoice_payments / cc_supplier_invoice_payments: a subledger of actual cash paid
+-- against a Liability (typically a loan), split into principal (reduces the liability's balance,
+-- not a P&L event) and interest (posted as a new Expense entry, tagged 'liability-payment', since
+-- only interest is P&L-relevant for a loan repayment).
+create table if not exists cc_liability_payments (
+  id uuid primary key default gen_random_uuid(),
+  liability_id uuid not null references cc_liabilities(id) on delete cascade,
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  payment_date date not null default current_date,
+  principal_amount numeric not null default 0,
+  interest_amount numeric not null default 0,
+  -- set when the interest portion was posted as an Expense entry, so deleting this payment can
+  -- clean that entry back up again (mirrors cc_bank_transactions.linked_payment_id).
+  interest_entry_id uuid references cc_entries(id) on delete set null,
+  notes text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now()
+);
+
+alter table cc_liability_payments enable row level security;
+
+drop policy if exists "members select liability payments" on cc_liability_payments;
+create policy "members select liability payments" on cc_liability_payments for select using (cc_is_member(company_id));
+drop policy if exists "scoped write liability payments" on cc_liability_payments;
+create policy "scoped write liability payments" on cc_liability_payments for insert with check (cc_has_module(company_id, 'liabilities'));
+drop policy if exists "scoped update liability payments" on cc_liability_payments;
+create policy "scoped update liability payments" on cc_liability_payments for update using (cc_has_module(company_id, 'liabilities'));
+drop policy if exists "scoped delete liability payments" on cc_liability_payments;
+create policy "scoped delete liability payments" on cc_liability_payments for delete using (cc_has_module(company_id, 'liabilities'));
+
+-- ---------- verify ----------
+select table_name from information_schema.tables where table_name = 'cc_liability_payments';
+select tablename, policyname, cmd from pg_policies where tablename = 'cc_liability_payments' order by cmd;
