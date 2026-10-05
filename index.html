@@ -18,7 +18,7 @@
     --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b; --c-reports:#1d4ed8;
     --c-settings:#334155;
     --c-scenarios:#059669; --c-supplierinvoices:#0ea5e9; --c-tasks:#7c3aed;
-    --c-quotes:#eab308; --c-stock:#84cc16; --c-manualjournals:#b45309;
+    --c-quotes:#eab308; --c-stock:#84cc16; --c-manualjournals:#b45309; --c-chartofaccounts:#0e7490;
     --grid-line: rgba(25,26,35,.03);
   }
   /* Dark mode: follows the OS setting by default; a manual toggle (data-theme)
@@ -121,6 +121,7 @@
   #sidebar nav button[data-view="quotes"]{--dot:var(--c-quotes);}
   #sidebar nav button[data-view="stock"]{--dot:var(--c-stock);}
   #sidebar nav button[data-view="manualjournals"]{--dot:var(--c-manualjournals);}
+  #sidebar nav button[data-view="chartofaccounts"]{--dot:var(--c-chartofaccounts);}
   #sidebar .logout{margin-top:10px;font-size:.8rem;color:var(--muted);background:none;border:none;text-align:left;padding:9px 10px;}
 
   #main{flex:1;padding:26px 32px;max-width:1100px;}
@@ -262,6 +263,7 @@
         <button data-view="stock"><span class="dot"></span>Stock</button>
         <button data-view="liabilities"><span class="dot"></span>Liabilities</button>
         <button data-view="manualjournals"><span class="dot"></span>Manual Journals</button>
+        <button data-view="chartofaccounts"><span class="dot"></span>Chart of Accounts</button>
         <button data-view="bankfeed"><span class="dot"></span>Bank Feed</button>
       </div>
       <div class="nav-group" data-nav-group="sales">
@@ -804,6 +806,8 @@ let state = {
   liabilities: [],
   liabilityPayments: [], // actual cash paid against liabilities/loans (principal + interest split)
   manualJournals: [],
+  chartAccounts: [],   // cc_chart_accounts rows (stored names/codes for the ledger's accounts)
+  glAccount: 'BANK',   // account shown on the General Ledger report
   manualJournalLines: {}, // journalId -> lines[]
   clients: [],
   invoices: [],
@@ -901,7 +905,7 @@ const ALL_VIEWS = [
   ['dashboard','Dashboard'], ['revenue','Revenue'], ['expenses','Expenses'], ['assets','Assets'], ['stock','Stock'],
   ['liabilities','Liabilities'], ['supplierinvoices','Supplier Invoices'], ['clients','Clients'], ['quotes','Quotes'],
   ['invoices','Invoices'], ['creditnotes','Credit Notes'], ['payroll','Payroll'], ['tasks','Tasks'],
-  ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['manualjournals','Manual Journals'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'], ['settings','Settings'],
+  ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['manualjournals','Manual Journals'], ['chartofaccounts','Chart of Accounts'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'], ['settings','Settings'],
 ];
 // Owner/admin/viewer always see every tab. A staff member sees every tab UNLESS an admin has
 // explicitly restricted them to a specific list (m.permissions.tabs) via the Team page — so
@@ -1224,6 +1228,8 @@ async function refreshAll(){
   state.liabilityPayments = liabilityPaymentsRes.data || [];
   const manualJournalsRes = await sb.from('cc_manual_journals').select('*').eq('company_id', cid).order('journal_date', {ascending:false});
   state.manualJournals = manualJournalsRes.data || [];
+  const chartRes = await sb.from('cc_chart_accounts').select('*').eq('company_id', cid);
+  state.chartAccounts = chartRes.data || [];
 
   const invoiceIds = state.invoices.map(i=>i.id);
   const creditNoteIds = state.creditNotes.map(cn=>cn.id);
@@ -1388,7 +1394,7 @@ async function logActivity(action, entityType, entityId, summary){
     });
   } catch(e){ /* best-effort — never block the underlying action if logging fails */ }
 }
-const AUDIT_ENTITY_LABELS = {
+const AUDIT_ENTITY_LABELS = { chart_account:'Chart of Accounts',
   company:'Company Settings',
   revenue:'Revenue', expense:'Expense', asset:'Asset', liability:'Liability',
   invoice:'Invoice', supplier_invoice:'Supplier Invoice', credit_note:'Credit Note', supplier_credit_note:'Supplier Credit Note',
@@ -1946,6 +1952,7 @@ function render(){
     case 'scenarios': main.innerHTML = renderScenarios(); attachScenarioHandlers(); break;
     case 'activitylog': main.innerHTML = renderActivityLog(); attachActivityLogHandlers(); break;
     case 'manualjournals': main.innerHTML = renderManualJournals(); attachManualJournalHandlers(); break;
+    case 'chartofaccounts': main.innerHTML = renderChartOfAccounts(); attachChartHandlers(); break;
     case 'bankfeed': main.innerHTML = renderBankFeed(); attachBankFeedHandlers(); break;
     case 'team': main.innerHTML = renderTeam(); attachTeamHandlers(); break;
     case 'settings': main.innerHTML = renderSettings(); attachSettingsHandlers(); break;
@@ -1996,9 +2003,9 @@ function totalsFor(){
   const payrollPaid = state.payrollPayments.filter(p=>p.paid).reduce((s,p)=>s+Number(p.net),0);
   const invoicePaymentsIn = (state.invoicePayments||[]).reduce((s,p)=>s+Number(p.amount),0);
   const supplierPaymentsOut = (state.supplierInvoicePayments||[]).reduce((s,p)=>s+Number(p.amount),0);
-  const predictedBalance = startingBalance + revenue - expenses - payrollPaid + invoicePaymentsIn - supplierPaymentsOut;
+  const predictedBalance = startingBalance + revenue - expenses - payrollPaid + invoicePaymentsIn - supplierPaymentsOut - totalPrincipalPaid();
   const totalAssets = state.assets.reduce((s,a)=>s+Number(a.value),0);
-  const totalLiabilities = state.liabilities.reduce((s,l)=>s+Number(l.amount),0);
+  const totalLiabilities = state.liabilities.reduce((s,l)=>s+liabilityBalanceAsOf(l),0);
   const netWorth = totalAssets + predictedBalance - totalLiabilities;
   return {revenue, expenses, predictedBalance, totalAssets, totalLiabilities, netWorth, payrollPaid};
 }
@@ -2433,7 +2440,7 @@ function attachAssetHandlers(){
 /* ========================= LIABILITIES ========================= */
 function renderLiabilities(){
   const canEdit = hasModule('liabilities');
-  const total = state.liabilities.reduce((s,l)=>s+Number(l.amount),0);
+  const total = state.liabilities.reduce((s,l)=>s+liabilityBalanceAsOf(l),0);
   return `
     <div class="section-header" style="--accent-c:var(--c-liabilities);"><h1>Liabilities</h1>${canEdit ? `<button class="btn" id="add-liability-btn">+ Add Liability</button>` : ''}</div>
     <p class="section-caption">What the business owes — loans, supplier balances, and other obligations.</p>
@@ -2589,6 +2596,367 @@ async function openLiabilityView(liabilityId){
       await refreshAll(); render();
       openLiabilityView(l.id);
     });
+  });
+}
+
+/* ========================= CHART OF ACCOUNTS & GENERAL LEDGER ========================= */
+// The general ledger is DERIVED from the app's existing records every time it's needed — nothing is
+// stored twice, so it can never drift out of sync. Every source below becomes a balanced journal
+// (total debits = total credits) against the accounts in this chart. cc_chart_accounts only stores
+// each company's account names/codes (seeded from DEFAULT_CHART the first time an admin opens the
+// Chart of Accounts tab); the ledger itself always works from the built-in account keys.
+const LEDGER_EPOCH = '1900-01-01';
+const DEFAULT_CHART = [
+  {key:'BANK', code:'1000', name:'Bank & Cash', type:'asset'},
+  {key:'AR', code:'1100', name:'Accounts Receivable', type:'asset'},
+  {key:'INV', code:'1200', name:'Inventory / Stock', type:'asset'},
+  {key:'OCA', code:'1300', name:'Other Current Assets', type:'asset'},
+  {key:'FA_COST', code:'1500', name:'Fixed Assets — Cost', type:'asset'},
+  {key:'FA_DEP', code:'1510', name:'Fixed Assets — Accumulated Depreciation', type:'asset'},
+  {key:'AP', code:'2000', name:'Accounts Payable', type:'liability'},
+  {key:'OCL', code:'2100', name:'Other Current Liabilities', type:'liability'},
+  {key:'NCL', code:'2200', name:'Non-Current Liabilities (Loans)', type:'liability'},
+  {key:'VAT', code:'2300', name:'VAT Control', type:'liability'},
+  {key:'OBE', code:'3000', name:'Opening Balance Equity', type:'equity'},
+  {key:'CAPITAL', code:'3100', name:"Share Capital / Owner's Capital", type:'equity'},
+  {key:'DRAW', code:'3200', name:'Drawings / Dividends', type:'equity'},
+  {key:'RE', code:'3300', name:'Retained Earnings', type:'equity'},
+  {key:'REV', code:'4000', name:'Sales Revenue', type:'revenue'},
+  {key:'COS', code:'5000', name:'Cost of Sales', type:'expense'},
+  {key:'OPEX', code:'6000', name:'Operating Expenses', type:'expense'},
+  {key:'PAYROLL', code:'6100', name:'Payroll & Staff Costs', type:'expense'},
+  {key:'DEPR', code:'6200', name:'Depreciation', type:'expense'},
+  {key:'INT', code:'6300', name:'Interest Expense', type:'expense'},
+];
+const CHART_TYPE_LABELS = {asset:'Assets', liability:'Liabilities', equity:'Equity', revenue:'Revenue', expense:'Expenses'};
+
+function chartAccountList(){
+  const stored = state.chartAccounts || [];
+  const byKey = {};
+  stored.forEach(r=>{ if(r.system_key) byKey[r.system_key] = r; });
+  const list = DEFAULT_CHART.map(d=>{
+    const s = byKey[d.key];
+    return {key:d.key, id: s ? s.id : null, code: s ? s.code : d.code, name: s ? s.name : d.name, type:d.type, system:true, active:true};
+  });
+  stored.filter(r=>!r.system_key).forEach(r=>list.push({key:null, id:r.id, code:r.code, name:r.name, type:r.type, system:false, active:r.is_active}));
+  return list.sort((a,b)=>String(a.code).localeCompare(String(b.code)));
+}
+function ledgerSplitVat(amount, vatApplicable){
+  const a = round2(Number(amount)||0);
+  if(!vatApplicable) return {gross:a, net:a, vat:0};
+  const vat = round2(a - a/(1+VAT_RATE));
+  return {gross:a, net: round2(a - vat), vat};
+}
+function ledgerStockLike(a){ return /stock|inventory/i.test((a && a.category) || ''); }
+
+// Returns an array of balanced journals: {date, source, memo, seq, lines:[{key, debit, credit}]}.
+function buildLedger(){
+  const journals = [];
+  // post(date, source, memo, [[accountKey, signedAmount], ...]) — positive = debit, negative = credit.
+  function post(date, source, memo, lines){
+    const out = [];
+    lines.forEach(([key, signed])=>{
+      const v = round2(signed);
+      if(Math.abs(v) < 0.005) return;
+      out.push(v > 0 ? {key, debit:v, credit:0} : {key, debit:0, credit:-v});
+    });
+    if(out.length) journals.push({date: date || LEDGER_EPOCH, source, memo: memo || '', lines: out, seq: journals.length});
+  }
+
+  // Manual-journal bookkeeping: journals mutate entries/assets/liabilities when posted (Wave 35),
+  // so their entries are excluded below and their asset/liability deltas are backed out of the
+  // base balances — the journal's own lines are then posted exactly as the user entered them.
+  const journalLines = [];
+  Object.keys(state.manualJournalLines||{}).forEach(k=>(state.manualJournalLines[k]||[]).forEach(l=>journalLines.push(l)));
+  const journalEntryIds = new Set(journalLines.map(l=>l.entry_id).filter(Boolean));
+  const assetDelta = {}, liabDelta = {};
+  journalLines.forEach(l=>{
+    if(l.target_asset_id) assetDelta[l.target_asset_id] = (assetDelta[l.target_asset_id]||0) + Number(l.signed_amount||0);
+    if(l.target_liability_id) liabDelta[l.target_liability_id] = (liabDelta[l.target_liability_id]||0) + Number(l.signed_amount||0);
+  });
+  const isJournalEntry = e => (e.tags||[]).includes('manual-journal') || journalEntryIds.has(e.id);
+
+  // Opening bank balances.
+  (state.accounts||[]).forEach(a=>{
+    const sbal = Number(a.starting_balance)||0;
+    post(LEDGER_EPOCH, 'Opening Balance', `Opening balance — ${a.name||'bank account'}`, [['BANK', sbal],['OBE', -sbal]]);
+  });
+
+  // Revenue & expense entries.
+  (state.entries||[]).forEach(e=>{
+    if(isJournalEntry(e)) return;
+    const tags = e.tags || [];
+    const {gross, net, vat} = ledgerSplitVat(e.amount, e.vat_applicable);
+    if(e.type === 'revenue'){
+      if(e.source_invoice_id) post(e.entry_date, 'Invoice', e.description, [['AR', gross],['REV', -net],['VAT', -vat]]);
+      else post(e.entry_date, 'Revenue', e.description, [['BANK', gross],['REV', -net],['VAT', -vat]]);
+    } else {
+      if(tags.includes('depreciation')){
+        post(e.entry_date, 'Depreciation', e.description, [['DEPR', gross],['FA_DEP', -gross]]);
+      } else {
+        const key = tags.includes('liability-payment') ? 'INT' : (e.expense_category === 'cost_of_sales' ? 'COS' : 'OPEX');
+        if(e.source_supplier_invoice_id) post(e.entry_date, 'Supplier Invoice', e.description, [[key, net],['VAT', vat],['AP', -gross]]);
+        else post(e.entry_date, 'Expense', e.description, [[key, net],['VAT', vat],['BANK', -gross]]);
+      }
+    }
+  });
+
+  // Customer invoice payments & credit notes.
+  (state.invoicePayments||[]).forEach(p=>{
+    const inv = (state.invoices||[]).find(i=>i.id===p.invoice_id);
+    post(p.payment_date, 'Invoice Payment', `Payment received${inv ? ' — '+inv.invoice_number : ''}`, [['BANK', Number(p.amount)||0],['AR', -(Number(p.amount)||0)]]);
+  });
+  (state.creditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').forEach(cn=>{
+    const items = (state.creditNoteItems||{})[cn.id] || [];
+    const {gross, net, vat} = ledgerSplitVat(docTotal(items), items.some(it=>it.vat_applicable));
+    post(cn.issue_date, 'Credit Note', `Credit note ${cn.credit_note_number}`, [['REV', net],['VAT', vat],['AR', -gross]]);
+  });
+
+  // Supplier invoice payments & supplier credit notes.
+  (state.supplierInvoicePayments||[]).forEach(p=>{
+    const bill = (state.supplierInvoices||[]).find(b=>b.id===p.supplier_invoice_id);
+    post(p.payment_date, 'Supplier Payment', `Payment made${bill ? ' — '+bill.bill_number : ''}`, [['AP', Number(p.amount)||0],['BANK', -(Number(p.amount)||0)]]);
+  });
+  (state.supplierCreditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').forEach(cn=>{
+    const items = (state.supplierCreditNoteItems||{})[cn.id] || [];
+    const {gross, net, vat} = ledgerSplitVat(docTotal(items), items.some(it=>it.vat_applicable));
+    post(cn.issue_date, 'Supplier Credit Note', `Supplier credit note ${cn.credit_note_number}`, [['AP', gross],['OPEX', -net],['VAT', -vat]]);
+  });
+
+  // Payroll actually paid (net pay — same basis the P&L and Balance Sheet already use).
+  (state.payrollPayments||[]).filter(p=>p.paid).forEach(p=>{
+    const net = Number(p.net)||0;
+    post(p.pay_date, 'Payroll', 'Payroll paid', [['PAYROLL', net],['BANK', -net]]);
+  });
+
+  // Assets and liabilities recorded directly: the other side goes to Opening Balance Equity.
+  (state.assets||[]).forEach(a=>{
+    const base = round2((Number(a.value)||0) - (assetDelta[a.id]||0));
+    const key = a.is_current ? (ledgerStockLike(a) ? 'INV' : 'OCA') : 'FA_COST';
+    post(a.purchase_date, 'Asset', a.description, [[key, base],['OBE', -base]]);
+  });
+  const accumTotal = (state.assets||[]).reduce((s,a)=>s+Number(a.accumulated_depreciation||0), 0);
+  const depEntriesTotal = (state.entries||[]).filter(e=>e.type==='expense' && (e.tags||[]).includes('depreciation') && !isJournalEntry(e))
+    .reduce((s,e)=>s+round2(Number(e.amount)||0), 0);
+  const depResidual = round2(accumTotal - depEntriesTotal);
+  post(LEDGER_EPOCH, 'Opening Balance', 'Accumulated depreciation brought forward (not backed by a depreciation entry)', [['OBE', depResidual],['FA_DEP', -depResidual]]);
+
+  (state.liabilities||[]).forEach(l=>{
+    const base = round2((Number(l.amount)||0) - (liabDelta[l.id]||0));
+    post(l.start_date, 'Liability', l.description, [['OBE', base],[l.is_current ? 'OCL' : 'NCL', -base]]);
+  });
+  (state.liabilityPayments||[]).forEach(p=>{
+    const l = (state.liabilities||[]).find(x=>x.id===p.liability_id);
+    const principal = Number(p.principal_amount)||0;
+    post(p.payment_date, 'Loan Repayment', `Principal repaid${l ? ' — '+l.description : ''}`, [[l && l.is_current ? 'OCL' : 'NCL', principal],['BANK', -principal]]);
+  });
+
+  // Manual journals, exactly as entered (debit/credit per line).
+  (state.manualJournals||[]).forEach(j=>{
+    const lines = ((state.manualJournalLines||{})[j.id] || []).map(l=>{
+      let key;
+      if(l.category === 'revenue') key = 'REV';
+      else if(l.category === 'expense') key = 'OPEX';
+      else if(l.category === 'asset'){
+        const a = (state.assets||[]).find(x=>x.id===l.target_asset_id);
+        key = !a ? 'OCA' : (a.is_current ? (ledgerStockLike(a) ? 'INV' : 'OCA') : 'FA_COST');
+      } else {
+        const li = (state.liabilities||[]).find(x=>x.id===l.target_liability_id);
+        key = li && !li.is_current ? 'NCL' : 'OCL';
+      }
+      const amt = Number(l.amount)||0;
+      return [key, l.side === 'debit' ? amt : -amt];
+    });
+    post(j.journal_date, 'Manual Journal', j.description, lines);
+  });
+
+  return journals;
+}
+// Flat, date-ordered list of ledger lines.
+function ledgerLines(){
+  const lines = [];
+  buildLedger().forEach(j=>j.lines.forEach(l=>lines.push({date:j.date, source:j.source, memo:j.memo, seq:j.seq, key:l.key, debit:l.debit, credit:l.credit})));
+  lines.sort((a,b)=> a.date < b.date ? -1 : a.date > b.date ? 1 : a.seq - b.seq);
+  return lines;
+}
+// Sum of debits/credits per account key for lines dated within [from, to] (either bound optional).
+function ledgerTotals(lines, from, to){
+  const t = {};
+  lines.forEach(l=>{
+    if(from && l.date < from) return;
+    if(to && l.date > to) return;
+    const row = t[l.key] || (t[l.key] = {debit:0, credit:0});
+    row.debit += l.debit; row.credit += l.credit;
+  });
+  return t;
+}
+const DEFAULT_CHART_TYPE = {};
+DEFAULT_CHART.forEach(d=>{ DEFAULT_CHART_TYPE[d.key] = d.type; });
+
+// Trial balance from the ledger. Balance-sheet accounts show their balance as at `end`; revenue and
+// expense accounts show movement within start..end; anything earned/spent before `start` is rolled
+// into "Retained Earnings b/f" — a real figure from the ledger, not a balancing plug, so if the
+// ledger ever went out of balance this would show it.
+function computeLedgerTB(start, end){
+  const lines = ledgerLines();
+  const upToEnd = ledgerTotals(lines, null, end);
+  const inPeriod = ledgerTotals(lines, start, end);
+  const beforeStart = ledgerTotals(lines, null, dayBeforeIso(start));
+  let priorPLNet = 0; // debit-positive net of P&L accounts before the period (a loss is positive)
+  DEFAULT_CHART.filter(d=>d.type==='revenue' || d.type==='expense').forEach(d=>{
+    const b = beforeStart[d.key]; if(b) priorPLNet += b.debit - b.credit;
+  });
+  const rows = [];
+  chartAccountList().filter(a=>a.key).forEach(acc=>{
+    const isPL = acc.type === 'revenue' || acc.type === 'expense';
+    const t = (isPL ? inPeriod : upToEnd)[acc.key] || {debit:0, credit:0};
+    let net = t.debit - t.credit;
+    if(acc.key === 'RE') net += priorPLNet;
+    if(Math.abs(net) < 0.005) return;
+    rows.push({key:acc.key, code:acc.code, name: acc.key==='RE' ? `${acc.name} b/f` : acc.name, type:acc.type, debit: net > 0 ? round2(net) : 0, credit: net < 0 ? round2(-net) : 0});
+  });
+  // Retained earnings b/f has no stored balance yet but prior-period results must still appear.
+  if(!rows.find(r=>r.key==='RE') && Math.abs(priorPLNet) >= 0.005){
+    const acc = chartAccountList().find(a=>a.key==='RE');
+    rows.push({key:'RE', code:acc.code, name:`${acc.name} b/f`, type:'equity', debit: priorPLNet > 0 ? round2(priorPLNet) : 0, credit: priorPLNet < 0 ? round2(-priorPLNet) : 0});
+    rows.sort((a,b)=>String(a.code).localeCompare(String(b.code)));
+  }
+  const totalDebit = round2(rows.reduce((s,r)=>s+r.debit, 0));
+  const totalCredit = round2(rows.reduce((s,r)=>s+r.credit, 0));
+  return {rows, totalDebit, totalCredit, diff: round2(totalDebit - totalCredit), start, end};
+}
+// How the ledger's closing position compares with the legacy Balance Sheet figures (computeBS), so
+// differences are visible rather than silent. Differences usually mean the Balance Sheet is missing
+// something the ledger records properly (e.g. credit notes, manual journals).
+function computeLedgerVsBS(end){
+  const lines = ledgerLines();
+  const t = ledgerTotals(lines, null, end);
+  const bal = k => { const r = t[k]; return r ? r.debit - r.credit : 0; };
+  const vatNet = bal('VAT');
+  const assetKeys = ['BANK','AR','INV','OCA','FA_COST','FA_DEP'];
+  const liabKeys = ['AP','OCL','NCL'];
+  const ledgerAssets = assetKeys.reduce((s,k)=>s+bal(k),0) + Math.max(0, vatNet);
+  const ledgerLiabs = liabKeys.reduce((s,k)=>s-bal(k),0) + Math.max(0, -vatNet);
+  const bs = computeBS(end);
+  const items = [
+    ['Cash & Bank', bal('BANK'), bs.cash],
+    ['Accounts Receivable', bal('AR'), bs.accountsReceivable],
+    ['Total Assets', ledgerAssets, bs.totalAssets],
+    ['Total Liabilities', ledgerLiabs, bs.totalLiabilities],
+  ].map(([label, ledger, sheet])=>({label, ledger: round2(ledger), balanceSheet: round2(sheet), diff: round2(ledger - sheet)}));
+  return {items, hasDifferences: items.some(i=>Math.abs(i.diff) >= 0.01)};
+}
+
+function renderGeneralLedger(start, end){
+  const accounts = chartAccountList().filter(a=>a.key);
+  const key = accounts.some(a=>a.key===state.glAccount) ? state.glAccount : 'BANK';
+  const acc = accounts.find(a=>a.key===key);
+  const creditNormal = acc.type==='liability' || acc.type==='equity' || acc.type==='revenue' || key==='FA_DEP';
+  const signed = (d,c)=> creditNormal ? c - d : d - c;
+  const all = ledgerLines().filter(l=>l.key===key);
+  const opening = all.filter(l=>l.date < start).reduce((s,l)=>s+signed(l.debit,l.credit), 0);
+  const inRange = all.filter(l=>l.date >= start && l.date <= end);
+  let running = opening;
+  const rowsHtml = inRange.map(l=>{
+    running += signed(l.debit, l.credit);
+    return `<tr><td>${l.date===LEDGER_EPOCH?'—':l.date}</td><td>${l.source}</td><td>${l.memo||'—'}</td><td style="text-align:right;">${l.debit?fmt(l.debit):''}</td><td style="text-align:right;">${l.credit?fmt(l.credit):''}</td><td style="text-align:right;font-weight:600;" class="${running<0?'negative':''}">${fmt(running)}</td></tr>`;
+  }).join('');
+  const totalDr = inRange.reduce((s,l)=>s+l.debit,0), totalCr = inRange.reduce((s,l)=>s+l.credit,0);
+  return `
+  <div class="panel period-bar">
+    <div class="field" style="min-width:280px;"><label>Account</label>
+      <select id="gl-account-select">${accounts.map(a=>`<option value="${a.key}" ${a.key===key?'selected':''}>${a.code} — ${a.name}</option>`).join('')}</select></div>
+    <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">${start} to ${end}</div>
+  </div>
+  <div class="panel">
+    <table><thead><tr><th>Date</th><th>Source</th><th>Description</th><th style="text-align:right;">Debit</th><th style="text-align:right;">Credit</th><th style="text-align:right;">Balance</th></tr></thead><tbody>
+      <tr style="color:var(--muted);"><td colspan="5">Opening balance</td><td style="text-align:right;font-weight:600;">${fmt(opening)}</td></tr>
+      ${rowsHtml || `<tr><td colspan="6"><div class="empty">No postings to this account in the period.</div></td></tr>`}
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td colspan="3">Closing balance</td><td style="text-align:right;">${fmt(totalDr)}</td><td style="text-align:right;">${fmt(totalCr)}</td><td style="text-align:right;">${fmt(running)}</td></tr>
+    </tbody></table>
+  </div>
+  <p style="color:var(--muted);font-size:.8rem;">${creditNormal ? 'Credit-normal account: balances shown as credits less debits.' : 'Debit-normal account: balances shown as debits less credits.'} The ledger is built from your existing records — invoices, bills, payments, payroll, assets, loans and manual journals — so it is always in step with them. Postings dated "—" are opening balances.</p>
+  `;
+}
+
+function renderChartOfAccounts(){
+  const canEdit = isAdmin();
+  const today = todayIso();
+  const totals = ledgerTotals(ledgerLines(), null, today);
+  const accounts = chartAccountList();
+  const sections = ['asset','liability','equity','revenue','expense'].map(type=>{
+    const rows = accounts.filter(a=>a.type===type);
+    if(!rows.length) return '';
+    return `<h3 style="margin:16px 0 6px;">${CHART_TYPE_LABELS[type]}</h3>
+      <table><thead><tr><th style="width:90px;">Code</th><th>Account</th><th style="text-align:right;">Balance (today)</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+      ${rows.map(a=>{
+        const t = totals[a.key] || {debit:0, credit:0};
+        const creditNormal = type==='liability' || type==='equity' || type==='revenue' || a.key==='FA_DEP';
+        const balance = creditNormal ? t.credit - t.debit : t.debit - t.credit;
+        return `<tr><td>${a.code}</td><td>${a.name}${a.system?'':' <span class="tag-pill">custom</span>'}</td><td style="text-align:right;" class="${balance<0?'negative':''}">${fmt(balance)}</td>${canEdit && a.key?`<td><button type="button" class="btn small secondary" data-edit-chart="${a.key}">Rename / renumber</button></td>`:(canEdit?'<td></td>':'')}</tr>`;
+      }).join('')}
+      </tbody></table>`;
+  }).join('');
+  return `
+    <div class="section-header" style="--accent-c:var(--c-chartofaccounts);"><h1>Chart of Accounts</h1></div>
+    <p class="section-caption">The accounts every transaction is recorded against — the backbone of the general ledger and trial balance.</p>
+    <div class="panel">
+      <p style="color:var(--muted);font-size:.86rem;margin-top:0;">Each invoice, bill, payment, payroll run, asset, loan and manual journal is turned into balanced debit/credit lines against these accounts (see Reports → General Ledger and Trial Balance). Balances shown are as at today. Money entered without a matching cash movement — opening bank balances, directly-recorded assets and loans — is balanced against <strong>Opening Balance Equity</strong>, which you can reclassify with a manual journal.</p>
+      ${sections}
+    </div>
+    ${canEdit ? `
+    <div class="modal-backdrop hidden" id="chart-modal-backdrop"><div class="modal">
+      <button class="close-x" id="chart-modal-close">✕</button>
+      <h2>Edit Account</h2>
+      <form id="chart-form">
+        <input type="hidden" id="chart-key">
+        <div class="field"><label>Code</label><input type="text" id="chart-code" required></div>
+        <div class="field"><label>Name</label><input type="text" id="chart-name" required></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="chart-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
+      </form>
+    </div></div>` : ''}
+  `;
+}
+function attachChartHandlers(){
+  // First time an admin opens this tab: seed the default chart so names/codes can be edited.
+  if(isAdmin() && !(state.chartAccounts||[]).length && !state._chartSeeding){
+    state._chartSeeding = true;
+    (async()=>{
+      const rows = DEFAULT_CHART.map(d=>({company_id: state.company.id, system_key: d.key, code: d.code, name: d.name, type: d.type}));
+      const {error} = await sb.from('cc_chart_accounts').insert(rows);
+      if(error){ toast(error.message); return; }
+      await refreshAll(); state._chartSeeding = false; render();
+    })();
+  }
+  const backdrop = document.getElementById('chart-modal-backdrop');
+  const close = ()=>backdrop && backdrop.classList.add('hidden');
+  document.getElementById('chart-modal-close')?.addEventListener('click', close);
+  document.getElementById('chart-cancel')?.addEventListener('click', close);
+  document.querySelectorAll('[data-edit-chart]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const acc = chartAccountList().find(a=>a.key===btn.dataset.editChart);
+      if(!acc) return;
+      document.getElementById('chart-key').value = acc.key;
+      document.getElementById('chart-code').value = acc.code;
+      document.getElementById('chart-name').value = acc.name;
+      backdrop.classList.remove('hidden');
+    });
+  });
+  document.getElementById('chart-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const key = document.getElementById('chart-key').value;
+    const code = document.getElementById('chart-code').value.trim();
+    const name = document.getElementById('chart-name').value.trim();
+    if(!code || !name){ toast('Enter a code and a name.'); return; }
+    const acc = chartAccountList().find(a=>a.key===key);
+    if(chartAccountList().some(a=>a.key!==key && String(a.code)===code)){ toast('Another account already uses that code.'); return; }
+    const existing = (state.chartAccounts||[]).find(r=>r.system_key===key);
+    const {error} = existing
+      ? await sb.from('cc_chart_accounts').update({code, name}).eq('id', existing.id)
+      : await sb.from('cc_chart_accounts').insert({company_id: state.company.id, system_key: key, code, name, type: acc.type});
+    if(error){ toast(error.message); return; }
+    await logActivity('update', 'chart_account', existing ? existing.id : null, `${acc.code} ${acc.name} → ${code} ${name}`);
+    await refreshAll(); render(); toast('Account updated.');
   });
 }
 
@@ -2859,6 +3227,20 @@ function invoiceBalance(inv){
 // Liability (loan) equivalent of billBalance()/invoiceBalance(). Only the principal portion of a
 // payment reduces the balance — interest is a P&L expense, posted separately as a cc_entries row
 // (see openLiabilityView()'s payment form), so it's tracked here for display but not subtracted.
+// Principal repaid against a liability up to (and including) asOf — undefined asOf = all time.
+function liabilityPrincipalPaidAsOf(l, asOf){
+  return (state.liabilityPayments||[])
+    .filter(p=>p.liability_id===l.id && (!asOf || p.payment_date <= asOf))
+    .reduce((s,p)=>s+Number(p.principal_amount||0),0);
+}
+function totalPrincipalPaid(from, to){
+  return (state.liabilityPayments||[])
+    .filter(p=>(!from || p.payment_date >= from) && (!to || p.payment_date <= to))
+    .reduce((s,p)=>s+Number(p.principal_amount||0),0);
+}
+function liabilityBalanceAsOf(l, asOf){
+  return Math.max(0, Number(l.amount) - liabilityPrincipalPaidAsOf(l, asOf));
+}
 function liabilityBalance(l){
   const total = Number(l.amount);
   const payments = (state.liabilityPayments||[]).filter(p=>p.liability_id===l.id);
@@ -5611,7 +5993,8 @@ function computeBS(asOf){
   const payrollPaid = state.payrollPayments.filter(p=>p.paid && upTo(p.pay_date)).reduce((s,p)=>s+Number(p.net),0);
   const invoicePaymentsReceived = (state.invoicePayments||[]).filter(p=>upTo(p.payment_date)).reduce((s,p)=>s+Number(p.amount),0);
   const supplierPaymentsMade = (state.supplierInvoicePayments||[]).filter(p=>upTo(p.payment_date)).reduce((s,p)=>s+Number(p.amount),0);
-  const cash = startingBalance + revenue - expenses - payrollPaid + invoicePaymentsReceived - supplierPaymentsMade;
+  const principalRepaid = totalPrincipalPaid(null, asOf);
+  const cash = startingBalance + revenue - expenses - payrollPaid + invoicePaymentsReceived - supplierPaymentsMade - principalRepaid;
 
   // Accounts Receivable: invoice total minus what's actually been paid on it (not just
   // its status), so partial payments are reflected correctly.
@@ -5648,8 +6031,8 @@ function computeBS(asOf){
   const supplierCreditNoteTotal = issuedSupplierCreditNotes.reduce((s,cn)=>s+docTotal(state.supplierCreditNoteItems[cn.id]),0);
   const accountsPayableFromBills = Math.max(0, accountsPayableFromBillsGross - supplierCreditNoteTotal);
 
-  const currentLiabOther = state.liabilities.filter(l=>l.is_current).reduce((s,l)=>s+Number(l.amount),0) + accountsPayableFromBills;
-  const nonCurrentLiab = state.liabilities.filter(l=>!l.is_current).reduce((s,l)=>s+Number(l.amount),0);
+  const currentLiabOther = state.liabilities.filter(l=>l.is_current).reduce((s,l)=>s+liabilityBalanceAsOf(l, asOf),0) + accountsPayableFromBills;
+  const nonCurrentLiab = state.liabilities.filter(l=>!l.is_current).reduce((s,l)=>s+liabilityBalanceAsOf(l, asOf),0);
   const currentLiabilities = currentLiabOther + vatPayableAmt;
   const totalLiabilities = currentLiabilities + nonCurrentLiab;
 
@@ -5717,7 +6100,8 @@ function computeCashFlow(start, end){
   // Financing activities — new liabilities drawn down (cash in) during the period,
   // based on each liability's start date.
   const liabilityDraws = state.liabilities.filter(l=>inRange(l.start_date)).reduce((s,l)=>s+Number(l.amount),0);
-  const netFinancing = liabilityDraws;
+  const liabilityPrincipalRepaid = totalPrincipalPaid(start, end);
+  const netFinancing = liabilityDraws - liabilityPrincipalRepaid;
 
   const netChange = netOperating + netInvesting + netFinancing;
   const openingCash = computeBS(dayBeforeIso(start)).cash;
@@ -5727,7 +6111,7 @@ function computeCashFlow(start, end){
   return {
     start, end, cashFromRevenue: cashFromRevenueTotal, invoicePaymentsIn, cosOut, opexOut, supplierPaymentsOut, payrollOut, netOperating,
     depreciationExcluded, invoiceAccrualExcluded, supplierInvoiceAccrualExcluded,
-    assetPurchases, netInvesting, liabilityDraws, netFinancing,
+    assetPurchases, netInvesting, liabilityDraws, liabilityPrincipalRepaid, netFinancing,
     netChange, openingCash, closingCashDerived, closingCashActual,
     reconciles: Math.abs(closingCashDerived - closingCashActual) < 0.01
   };
@@ -5754,6 +6138,7 @@ function renderCF(cf){
 
       <tr style="font-weight:600;"><td colspan="2" style="padding-top:16px;">Financing Activities</td></tr>
       <tr><td>New loans / liabilities drawn</td><td style="text-align:right;">${fmt(cf.liabilityDraws)}</td></tr>
+      ${cf.liabilityPrincipalRepaid ? `<tr><td>Loan principal repaid</td><td style="text-align:right;">(${fmt(cf.liabilityPrincipalRepaid)})</td></tr>` : ''}
       <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Net cash from financing activities</td><td style="text-align:right;" class="${cf.netFinancing<0?'negative':'positive'}">${fmt(cf.netFinancing)}</td></tr>
 
       <tr style="font-weight:700;border-top:2px solid var(--border);padding-top:10px;"><td style="padding-top:10px;">Net change in cash</td><td style="text-align:right;padding-top:10px;" class="${cf.netChange<0?'negative':'positive'}">${fmt(cf.netChange)}</td></tr>
@@ -5989,6 +6374,7 @@ function renderReports(){
       <button class="btn ${state.reportsTab==='pl'?'':'secondary'} small" data-report-tab="pl">Profit &amp; Loss</button>
       <button class="btn ${state.reportsTab==='bs'?'':'secondary'} small" data-report-tab="bs">Balance Sheet</button>
       <button class="btn ${state.reportsTab==='tb'?'':'secondary'} small" data-report-tab="tb">Trial Balance</button>
+      <button class="btn ${state.reportsTab==='gl'?'':'secondary'} small" data-report-tab="gl">General Ledger</button>
       <button class="btn ${state.reportsTab==='cf'?'':'secondary'} small" data-report-tab="cf">Cash Flow</button>
       <button class="btn ${state.reportsTab==='debtors'?'':'secondary'} small" data-report-tab="debtors">Debtors</button>
       <button class="btn ${state.reportsTab==='creditors'?'':'secondary'} small" data-report-tab="creditors">Creditors</button>
@@ -6001,7 +6387,8 @@ function renderReports(){
       monthly: "A full month's pack in one place — P&amp;L, balance sheet, fixed assets, and outstanding balances.",
       pl: "Revenue minus expenses for the period — how much the business made.",
       bs: "What the business owns, owes, and is worth, as at a point in time.",
-      tb: "Every account's debit or credit balance for the period, side by side — they should always total the same on both sides.",
+      tb: "Every ledger account's debit or credit balance, side by side — they must total the same on both sides.",
+      gl: "Every posting to one account, with a running balance — the full trail behind any figure.",
       cf: "Cash actually received and paid — excludes non-cash items like depreciation, unlike the P&amp;L.",
       debtors: "Money owed to you by clients, and how overdue it is.",
       creditors: "Money you owe to suppliers, and when it's due.",
@@ -6028,7 +6415,7 @@ function renderReports(){
       <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">P&amp;L: ${period.start} to ${period.end}<br>Balance sheet as of ${period.end}</div>
     </div>
     `}
-    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='tb' ? renderTB(computeTB(pl, bs)) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : state.reportsTab==='companytax' ? renderCompanyTax() : renderPL(pl)}
+    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='tb' ? renderTB(computeLedgerTB(period.start, period.end)) : state.reportsTab==='gl' ? renderGeneralLedger(period.start, period.end) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : state.reportsTab==='companytax' ? renderCompanyTax() : renderPL(pl)}
   `;
 }
 
@@ -6162,51 +6549,25 @@ function renderBS(bs){
   `;
 }
 
-// A trial balance derived entirely from the same P&L/Balance Sheet figures used elsewhere in
-// Reports — there's no separate chart of accounts here. "Retained Earnings / Owner's Equity b/f"
-// is deliberately computed as the balancing plug (closing equity minus the period's net profit),
-// not a separately-snapshotted opening balance, so debits = credits exactly, by construction, for
-// any period, even if an asset or liability was ever added directly without a matching entry.
-function computeTB(pl, bs){
-  const rows = [];
-  function row(label, amount, normalSide){
-    const v = Number(amount) || 0;
-    if(Math.abs(v) < 0.005) return;
-    if(normalSide === 'debit'){
-      rows.push(v >= 0 ? {label, debit: v, credit: 0} : {label, debit: 0, credit: -v});
-    } else {
-      rows.push(v >= 0 ? {label, debit: 0, credit: v} : {label, debit: -v, credit: 0});
-    }
-  }
-  row('Cash & Bank', bs.cash, 'debit');
-  row('Accounts Receivable', bs.accountsReceivable, 'debit');
-  row('VAT Receivable', bs.vatReceivableAmt, 'debit');
-  row('Other Current Assets', bs.otherCurrentAssets, 'debit');
-  row('Fixed Assets (net book value)', bs.fixedAssets, 'debit');
-  row('Cost of Sales (period)', pl.cos, 'debit');
-  row('Operating Expenses (period)', pl.opex, 'debit');
-  row('Payroll & Staff Costs (period)', pl.payrollCost, 'debit');
-  row('VAT Payable', bs.vatPayableAmt, 'credit');
-  row('Accounts Payable', bs.accountsPayableFromBills, 'credit');
-  row('Other Current Liabilities', bs.currentLiabOther - bs.accountsPayableFromBills, 'credit');
-  row('Non-Current Liabilities', bs.nonCurrentLiab, 'credit');
-  row('Revenue (period)', pl.revenue, 'credit');
-  row("Retained Earnings / Owner's Equity b/f", bs.equity - pl.netProfit, 'credit');
-  const totalDebit = rows.reduce((s,r)=>s+r.debit, 0);
-  const totalCredit = rows.reduce((s,r)=>s+r.credit, 0);
-  return {rows, totalDebit, totalCredit, diff: round2(totalDebit - totalCredit), period_end: bs.asOf};
-}
-
 function renderTB(tb){
+  const rec = computeLedgerVsBS(tb.end);
   return `
   <div class="panel">
-    <table class="report-table"><thead><tr><th>Account</th><th style="text-align:right;">Debit</th><th style="text-align:right;">Credit</th></tr></thead><tbody>
-      ${tb.rows.map(r=>`<tr><td>${r.label}</td><td style="text-align:right;">${r.debit?fmt(r.debit):''}</td><td style="text-align:right;">${r.credit?fmt(r.credit):''}</td></tr>`).join('')}
-      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Total</td><td style="text-align:right;">${fmt(tb.totalDebit)}</td><td style="text-align:right;">${fmt(tb.totalCredit)}</td></tr>
+    <table class="report-table"><thead><tr><th style="width:80px;">Code</th><th>Account</th><th style="text-align:right;">Debit</th><th style="text-align:right;">Credit</th></tr></thead><tbody>
+      ${tb.rows.map(r=>`<tr><td>${r.code}</td><td>${r.name}</td><td style="text-align:right;">${r.debit?fmt(r.debit):''}</td><td style="text-align:right;">${r.credit?fmt(r.credit):''}</td></tr>`).join('') || `<tr><td colspan="4"><div class="empty">Nothing recorded yet.</div></td></tr>`}
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td></td><td>Total</td><td style="text-align:right;">${fmt(tb.totalDebit)}</td><td style="text-align:right;">${fmt(tb.totalCredit)}</td></tr>
     </tbody></table>
-    ${Math.abs(tb.diff) >= 0.01 ? `<p class="negative" style="font-weight:600;margin-bottom:0;">Out of balance by ${fmt(tb.diff)} — this shouldn't normally happen; worth checking for a data issue.</p>` : ''}
+    ${Math.abs(tb.diff) >= 0.01 ? `<p class="negative" style="font-weight:600;margin-bottom:0;">Out of balance by ${fmt(tb.diff)} — the ledger has an unbalanced posting; please report this.</p>` : `<p style="color:var(--muted);font-size:.82rem;margin-bottom:0;">Debits equal credits — every posting in the ledger balances.</p>`}
   </div>
-  <p style="color:var(--muted);font-size:.8rem;">Debits and credits for the selected period, drawn from the same figures as the Profit &amp; Loss and Balance Sheet above (balance sheet lines as at ${tb.period_end}). "Retained Earnings / Owner's Equity b/f" is a balancing figure carried forward from before this period, not a separately tracked account. Not tax advice — confirm with your accountant before relying on this for statutory reporting.</p>
+  ${rec.hasDifferences ? `
+  <div class="panel">
+    <h3 style="margin-top:0;">Ledger vs Balance Sheet</h3>
+    <table><thead><tr><th>Figure (as at ${tb.end})</th><th style="text-align:right;">Ledger</th><th style="text-align:right;">Balance Sheet</th><th style="text-align:right;">Difference</th></tr></thead><tbody>
+      ${rec.items.map(i=>`<tr><td>${i.label}</td><td style="text-align:right;">${fmt(i.ledger)}</td><td style="text-align:right;">${fmt(i.balanceSheet)}</td><td style="text-align:right;" class="${Math.abs(i.diff)>=0.01?'negative':''}">${fmt(i.diff)}</td></tr>`).join('')}
+    </tbody></table>
+    <p style="color:var(--muted);font-size:.8rem;margin-bottom:0;">The ledger is the more complete record: it takes VAT out of revenue and expenses, applies credit notes to revenue, and posts manual journals only once. Differences show where the existing Balance Sheet figures don't yet do the same.</p>
+  </div>` : ''}
+  <p style="color:var(--muted);font-size:.8rem;">Balance-sheet accounts are as at ${tb.end}; revenue and expense accounts cover ${tb.start} to ${tb.end}. Anything earned or spent before ${tb.start} is carried in Retained Earnings b/f. Directly-entered assets, loans and opening bank balances are balanced against Opening Balance Equity. Not tax advice — confirm with your accountant before relying on this for statutory reporting.</p>
   `;
 }
 
@@ -6295,6 +6656,7 @@ function attachReportsHandlers(){
       options: {responsive:true, maintainAspectRatio:false}
     });
   }
+  document.getElementById('gl-account-select')?.addEventListener('change', (e)=>{ state.glAccount = e.target.value; render(); });
   document.querySelectorAll('[data-report-tab]').forEach(btn=>{
     btn.addEventListener('click', ()=>{ state.reportsTab = btn.dataset.reportTab; render(); });
   });

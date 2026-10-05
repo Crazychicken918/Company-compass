@@ -1363,3 +1363,27 @@ alter table cc_attachments add constraint cc_attachments_entity_type_check
 select table_name from information_schema.tables where table_name in ('cc_manual_journals','cc_manual_journal_lines');
 select tablename, policyname, cmd from pg_policies where tablename in ('cc_manual_journals','cc_manual_journal_lines') order by tablename, cmd;
 select conname, pg_get_constraintdef(oid) from pg_constraint where conrelid = 'cc_attachments'::regclass and contype = 'c';
+
+-- ============ WAVE 40: Chart of Accounts + derived General Ledger ============
+-- The general ledger itself is DERIVED in the app from existing records (entries, invoices, bills,
+-- payroll, payments, assets, liabilities, manual journals) — nothing is double-posted. This table
+-- only stores each company's chart of accounts: the default set seeded on first open (system_key
+-- links a row to the ledger's built-in account), which admins can rename/renumber. Custom accounts
+-- (system_key null) are reserved for manual journals to post against in a later update.
+create table if not exists cc_chart_accounts (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references cc_companies(id) on delete cascade,
+  system_key text,
+  code text not null,
+  name text not null,
+  type text not null check (type in ('asset','liability','equity','revenue','expense')),
+  is_active boolean not null default true,
+  created_at timestamptz default now(),
+  unique (company_id, code)
+);
+
+alter table cc_chart_accounts enable row level security;
+create policy "members select chart accounts" on cc_chart_accounts for select using (cc_is_member(company_id));
+create policy "admin insert chart accounts" on cc_chart_accounts for insert with check (cc_is_admin(company_id));
+create policy "admin update chart accounts" on cc_chart_accounts for update using (cc_is_admin(company_id));
+create policy "admin delete chart accounts" on cc_chart_accounts for delete using (cc_is_admin(company_id));
