@@ -1394,3 +1394,24 @@ alter table public.cc_manual_journal_lines add column if not exists account_id u
 alter table public.cc_manual_journal_lines drop constraint if exists cc_manual_journal_lines_category_check;
 alter table public.cc_manual_journal_lines add constraint cc_manual_journal_lines_category_check check (category in ('revenue','expense','asset','liability','ledger'));
 alter table public.cc_chart_accounts add column if not exists is_current boolean not null default true;
+
+-- ============ WAVE 42: maker-checker, year-end close ============
+-- Company setting: when on, manual journals and manually-entered payments are saved as 'pending'
+-- and only count once someone other than the person who entered them approves.
+alter table public.cc_companies add column if not exists maker_checker boolean not null default false;
+
+alter table public.cc_manual_journals add column if not exists approval_status text not null default 'approved' check (approval_status in ('pending','approved','rejected')), add column if not exists approved_by uuid, add column if not exists approved_at timestamptz, add column if not exists rejection_note text, add column if not exists kind text, add column if not exists fy_end date;
+alter table public.cc_invoice_payments add column if not exists approval_status text not null default 'approved' check (approval_status in ('pending','approved','rejected')), add column if not exists approved_by uuid, add column if not exists approved_at timestamptz, add column if not exists rejection_note text;
+alter table public.cc_supplier_invoice_payments add column if not exists approval_status text not null default 'approved' check (approval_status in ('pending','approved','rejected')), add column if not exists approved_by uuid, add column if not exists approved_at timestamptz, add column if not exists rejection_note text;
+alter table public.cc_liability_payments add column if not exists approval_status text not null default 'approved' check (approval_status in ('pending','approved','rejected')), add column if not exists approved_by uuid, add column if not exists approved_at timestamptz, add column if not exists rejection_note text;
+
+-- Database-level guard: a pending item can't be approved by the user who entered it (when the setting is on).
+create or replace function public.cc_maker_checker_guard() returns trigger language plpgsql set search_path = public as $fn$ begin if tg_op = 'UPDATE' and old.approval_status = 'pending' and new.approval_status = 'approved' and old.created_by is not null and old.created_by = auth.uid() and exists (select 1 from public.cc_companies c where c.id = new.company_id and c.maker_checker) then raise exception 'Maker-checker: the person who entered this cannot approve it.'; end if; return new; end $fn$;
+drop trigger if exists cc_manual_journals_maker_checker on public.cc_manual_journals;
+create trigger cc_manual_journals_maker_checker before update on public.cc_manual_journals for each row execute function public.cc_maker_checker_guard();
+drop trigger if exists cc_invoice_payments_maker_checker on public.cc_invoice_payments;
+create trigger cc_invoice_payments_maker_checker before update on public.cc_invoice_payments for each row execute function public.cc_maker_checker_guard();
+drop trigger if exists cc_supplier_invoice_payments_maker_checker on public.cc_supplier_invoice_payments;
+create trigger cc_supplier_invoice_payments_maker_checker before update on public.cc_supplier_invoice_payments for each row execute function public.cc_maker_checker_guard();
+drop trigger if exists cc_liability_payments_maker_checker on public.cc_liability_payments;
+create trigger cc_liability_payments_maker_checker before update on public.cc_liability_payments for each row execute function public.cc_maker_checker_guard();

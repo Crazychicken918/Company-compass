@@ -1203,7 +1203,8 @@ async function refreshAll(){
   state.suppliers = suppliersRes.data || [];
   state.supplierInvoices = supplierInvoicesRes.data || [];
   state.supplierCreditNotes = supplierCreditNotesRes.data || [];
-  state.invoicePayments = invoicePaymentsRes.data || [];
+  state.invoicePayments = splitApproval(invoicePaymentsRes.data).ok;
+  state._invoicePaymentsPending = splitApproval(invoicePaymentsRes.data).pending;
   state.leaveBalances = leaveBalancesRes.data || [];
   state.leaveEntries = leaveEntriesRes.data || [];
   state.taskNotes = taskNotesRes.data || [];
@@ -1225,7 +1226,8 @@ async function refreshAll(){
   state.provisionalTax = provTaxRes.data || [];
   state.emp201Submissions = emp201Res.data || [];
   state.coidaReturns = coidaRes.data || [];
-  state.liabilityPayments = liabilityPaymentsRes.data || [];
+  state.liabilityPayments = splitApproval(liabilityPaymentsRes.data).ok;
+  state.liabilityPaymentsAll = liabilityPaymentsRes.data || [];
   const manualJournalsRes = await sb.from('cc_manual_journals').select('*').eq('company_id', cid).order('journal_date', {ascending:false});
   state.manualJournals = manualJournalsRes.data || [];
   const chartRes = await sb.from('cc_chart_accounts').select('*').eq('company_id', cid);
@@ -1252,13 +1254,125 @@ async function refreshAll(){
   (supInvItemsRes.data||[]).forEach(it=>{ (state.supplierInvoiceItems[it.supplier_invoice_id] = state.supplierInvoiceItems[it.supplier_invoice_id]||[]).push(it); });
   state.supplierCreditNoteItems = {};
   (supCnItemsRes.data||[]).forEach(it=>{ (state.supplierCreditNoteItems[it.supplier_credit_note_id] = state.supplierCreditNoteItems[it.supplier_credit_note_id]||[]).push(it); });
-  state.supplierInvoicePayments = supInvPaymentsRes.data || [];
+  state.supplierInvoicePayments = splitApproval(supInvPaymentsRes.data).ok;
+  state._supplierPaymentsPending = splitApproval(supInvPaymentsRes.data).pending;
   state.creditNoteItems = {};
   (cnItemsRes.data||[]).forEach(it=>{ (state.creditNoteItems[it.credit_note_id] = state.creditNoteItems[it.credit_note_id]||[]).push(it); });
   const quoteIds = state.quotes.map(q=>q.id);
   const quoteItemsRes = quoteIds.length ? await sb.from('cc_quote_items').select('*').in('quote_id', quoteIds) : {data:[]};
   state.quoteItems = {};
   (quoteItemsRes.data||[]).forEach(it=>{ (state.quoteItems[it.quote_id] = state.quoteItems[it.quote_id]||[]).push(it); });
+  rebuildPendingItems();
+}
+
+/* ========================= MAKER-CHECKER (second-person approval) ========================= */
+// When Settings → "Maker-checker" is on, manual journals and manually-entered payments are saved as
+// 'pending' and only count (ledger, reports, balances) once a DIFFERENT person who can approve signs
+// them off. Payments matched from the Bank Feed are exempt — the bank statement line is the evidence.
+// A database trigger enforces the "not by the same person" rule as well as this screen does.
+function splitApproval(rows){
+  const out = {ok:[], pending:[], rejected:[]};
+  (rows||[]).forEach(r=>{
+    const s = r.approval_status || 'approved';
+    (s === 'pending' ? out.pending : s === 'rejected' ? out.rejected : out.ok).push(r);
+  });
+  return out;
+}
+function makerCheckerOn(){ return !!(state.company && state.company.maker_checker); }
+function approvalStatusForNew(){ return makerCheckerOn() ? 'pending' : 'approved'; }
+function memberEmailFor(userId){
+  const m = (state.members||[]).find(x=>x.user_id === userId);
+  return m && m.email ? m.email : 'a colleague';
+}
+function canApproveItem(row){
+  if(!canApprove()) return false;
+  if(!makerCheckerOn()) return true;
+  return !(row && row.created_by && state.user && row.created_by === state.user.id);
+}
+const APPROVAL_TABLES = {journal:'cc_manual_journals', invoice_payment:'cc_invoice_payments', supplier_payment:'cc_supplier_invoice_payments', liability_payment:'cc_liability_payments'};
+const APPROVAL_KIND_LABELS = {journal:'Manual journal', invoice_payment:'Customer payment', supplier_payment:'Supplier payment', liability_payment:'Loan payment'};
+function rebuildPendingItems(){
+  const items = [];
+  (state.manualJournals||[]).filter(j=>j.approval_status==='pending').forEach(j=>{
+    const lines = (state.manualJournalLines||{})[j.id] || [];
+    const amount = lines.filter(l=>l.side==='debit').reduce((s,l)=>s+Number(l.amount||0), 0);
+    items.push({kind:'journal', id:j.id, row:j, date:j.journal_date, label:j.description, amount});
+  });
+  (state._invoicePaymentsPending||[]).forEach(p=>{
+    const inv = (state.invoices||[]).find(i=>i.id===p.invoice_id);
+    items.push({kind:'invoice_payment', id:p.id, row:p, date:p.payment_date, label:`Payment received${inv ? ' — '+inv.invoice_number : ''}`, amount:Number(p.amount)||0});
+  });
+  (state._supplierPaymentsPending||[]).forEach(p=>{
+    const bill = (state.supplierInvoices||[]).find(b=>b.id===p.supplier_invoice_id);
+    items.push({kind:'supplier_payment', id:p.id, row:p, date:p.payment_date, label:`Payment made${bill ? ' — '+bill.bill_number : ''}`, amount:Number(p.amount)||0});
+  });
+  (state.liabilityPaymentsAll||[]).filter(p=>p.approval_status==='pending').forEach(p=>{
+    const l = (state.liabilities||[]).find(x=>x.id===p.liability_id);
+    items.push({kind:'liability_payment', id:p.id, row:p, date:p.payment_date, label:`Loan payment${l ? ' — '+l.description : ''}`, amount:(Number(p.principal_amount)||0)+(Number(p.interest_amount)||0)});
+  });
+  items.sort((a,b)=> a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+  state.pendingItems = items;
+  return items;
+}
+function renderApprovalsPanel(){
+  const items = state.pendingItems || [];
+  if(!makerCheckerOn() || !items.length || !canApprove()) return '';
+  return `
+  <div class="panel" id="approvals-panel" style="border-left:4px solid var(--c-manualjournals);">
+    <h3 style="margin-top:0;">Awaiting your approval (${items.length})</h3>
+    <table><thead><tr><th>Type</th><th>Date</th><th>Description</th><th style="text-align:right;">Amount</th><th>Entered by</th><th></th></tr></thead><tbody>
+      ${items.map(it=>{
+        const own = !canApproveItem(it.row);
+        return `<tr><td>${APPROVAL_KIND_LABELS[it.kind]}</td><td>${it.date||'—'}</td><td>${it.label||'—'}</td><td style="text-align:right;">${fmt(it.amount)}</td><td>${own ? 'You' : memberEmailFor(it.row.created_by)}</td>
+          <td style="white-space:nowrap;">${own ? `<span style="color:var(--muted);font-size:.78rem;">A different person must approve this</span>` : `<button type="button" class="btn small" data-approve-item="${it.kind}|${it.id}">Approve</button> <button type="button" class="btn small danger" data-reject-item="${it.kind}|${it.id}">Reject</button>`}</td></tr>`;
+      }).join('')}
+    </tbody></table>
+  </div>`;
+}
+async function approvePendingItem(kind, id){
+  const item = (state.pendingItems||[]).find(i=>i.kind===kind && i.id===id);
+  if(!item){ toast('That item is no longer pending.'); return false; }
+  if(!canApproveItem(item.row)){ toast('A different person must approve this — you entered it.'); return false; }
+  if(isPeriodLocked(item.date)){ toast(periodLockMessage()); return false; }
+  const patch = {approval_status:'approved', approved_by: state.user.id, approved_at: new Date().toISOString()};
+  if(kind === 'liability_payment'){
+    const interest = Number(item.row.interest_amount)||0;
+    if(interest > 0 && !item.row.interest_entry_id){
+      const l = (state.liabilities||[]).find(x=>x.id===item.row.liability_id);
+      const {data: interestEntry, error: entryErr} = await sb.from('cc_entries').insert({
+        company_id: state.company.id, type:'expense', description:`Interest — ${l ? l.description : 'loan'}`, amount: interest,
+        entry_date: item.row.payment_date, tags:['liability-payment'], vat_applicable:false, expense_category:'operating', created_by: state.user.id
+      }).select().single();
+      if(entryErr){ toast(entryErr.message); return false; }
+      patch.interest_entry_id = interestEntry && interestEntry.id;
+    }
+  }
+  const {error} = await sb.from(APPROVAL_TABLES[kind]).update(patch).eq('id', id);
+  if(error){ toast(error.message); return false; }
+  await logActivity('approve', kind, id, `${APPROVAL_KIND_LABELS[kind]} approved: ${item.label} (${fmt(item.amount)})`);
+  await refreshAll(); render(); toast('Approved.');
+  return true;
+}
+async function rejectPendingItem(kind, id, note){
+  const item = (state.pendingItems||[]).find(i=>i.kind===kind && i.id===id);
+  if(!item){ toast('That item is no longer pending.'); return false; }
+  const {error} = await sb.from(APPROVAL_TABLES[kind]).update({approval_status:'rejected', approved_by: state.user.id, approved_at: new Date().toISOString(), rejection_note: note || null}).eq('id', id);
+  if(error){ toast(error.message); return false; }
+  await logActivity('reject', kind, id, `${APPROVAL_KIND_LABELS[kind]} rejected: ${item.label}${note ? ' — '+note : ''}`);
+  await refreshAll(); render(); toast('Rejected.');
+  return true;
+}
+function attachApprovalHandlers(){
+  document.querySelectorAll('[data-approve-item]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{ const [kind, id] = btn.dataset.approveItem.split('|'); approvePendingItem(kind, id); });
+  });
+  document.querySelectorAll('[data-reject-item]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const [kind, id] = btn.dataset.rejectItem.split('|');
+      const note = prompt('Reason for rejecting (optional):') || null;
+      rejectPendingItem(kind, id, note);
+    });
+  });
 }
 
 
@@ -1960,6 +2074,7 @@ function render(){
 }
 
 function attachDashboardHandlers(){
+  attachApprovalHandlers();
   document.getElementById('dashboard-bankfeed-btn')?.addEventListener('click', ()=>goToView('bankfeed'));
   const months = last6MonthsRange();
   const revenueData = months.map(m=>state.entries.filter(e=>e.type==='revenue' && e.entry_date>=m.start && e.entry_date<=m.end).reduce((s,e)=>s+Number(e.amount),0));
@@ -2063,6 +2178,7 @@ function renderDashboard(){
     <p class="section-caption">Your business at a glance — cash, profit, net worth, and anything that needs attention.</p>
     ${overdueInvoices.length ? `<div class="alert-banner overdue">⚠ ${overdueInvoices.length} client invoice${overdueInvoices.length>1?'s are':' is'} past due: ${overdueInvoices.map(i=>`${i.invoice_number} (${clientName(i.client_id)}, due ${i.due_date})`).join(', ')}</div>` : ''}
     ${overdueLiabilities.length ? `<div class="alert-banner overdue">⚠ ${overdueLiabilities.length} supplier/liability payment${overdueLiabilities.length>1?'s are':' is'} past due: ${overdueLiabilities.map(l=>`${l.description} (due ${l.due_date})`).join(', ')}</div>` : ''}
+    ${renderApprovalsPanel()}
     ${dueSoonLiabilities.length ? `<div class="alert-banner due">⏰ ${dueSoonLiabilities.length} supplier/liability payment${dueSoonLiabilities.length>1?'s are':' is'} due within 7 days: ${dueSoonLiabilities.map(l=>`${l.description} (due ${l.due_date})`).join(', ')}</div>` : ''}
     <div class="grid">
       <div class="card" style="--accent-c:var(--c-dashboard);"><h3>Predicted Balance</h3><div class="value ${t.predictedBalance<0?'negative':'positive'}">${fmt(t.predictedBalance)}</div><div class="sub">Starting balance + revenue − expenses − payroll</div></div>
@@ -2515,6 +2631,7 @@ async function openLiabilityView(liabilityId){
   const bal = liabilityBalance(l);
   const payments = (state.liabilityPayments||[]).filter(p=>p.liability_id===l.id)
     .slice().sort((a,b)=> (b.payment_date||'').localeCompare(a.payment_date||''));
+  const awaitingLiabilityPayments = (state.liabilityPaymentsAll||[]).filter(p=>p.liability_id===l.id && p.approval_status && p.approval_status !== 'approved');
   const backdrop = document.getElementById('liability-view-backdrop');
   document.getElementById('liability-view-content').innerHTML = `
     <button class="close-x" id="liability-view-close">✕</button>
@@ -2531,6 +2648,7 @@ async function openLiabilityView(liabilityId){
       ${payments.length ? `<table class="payment-list"><thead><tr><th>Date</th><th>Principal</th><th>Interest</th><th>Notes</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.principal_amount||0)}</td><td>${fmt(p.interest_amount||0)}</td><td>${p.notes||'—'}</td>${canEdit?`<td><button class="btn small danger" data-del-liability-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
+      ${awaitingLiabilityPayments.length ? `<p style="font-size:.8rem;color:var(--muted);margin:8px 0 2px;">Not yet counted:</p>${awaitingLiabilityPayments.map(p=>`<div style="font-size:.82rem;">${p.payment_date} — principal ${fmt(p.principal_amount||0)}, interest ${fmt(p.interest_amount||0)} ${approvalPill(p)}${p.approval_status==='rejected' && p.rejection_note ? ' — '+p.rejection_note : ''}${canEdit?` <button class="btn small danger" data-del-liability-payment="${p.id}">Delete</button>`:''}</div>`).join('')}` : ''}
       ${canEdit ? `<button type="button" class="btn secondary small" id="add-liability-payment-btn" style="margin-top:10px;">+ Record Payment</button>
       <form id="liability-payment-form" class="hidden" style="margin-top:10px;">
         <div class="row">
@@ -2558,7 +2676,8 @@ async function openLiabilityView(liabilityId){
     const paymentDate = document.getElementById('liability-payment-date').value;
     const notes = document.getElementById('liability-payment-notes').value.trim() || null;
     let interestEntryId = null;
-    if(interest > 0){
+    // With maker-checker on, the interest expense is only booked when the payment is approved.
+    if(interest > 0 && !makerCheckerOn()){
       const {data: interestEntry, error: entryErr} = await sb.from('cc_entries').insert({
         company_id: state.company.id,
         type: 'expense',
@@ -2581,13 +2700,14 @@ async function openLiabilityView(liabilityId){
       interest_amount: interest,
       interest_entry_id: interestEntryId,
       notes,
-      created_by: state.user.id
+      created_by: state.user.id,
+      approval_status: approvalStatusForNew()
     });
     if(error){ toast(error.message); return; }
-    await logActivity('create', 'liability_payment', l.id, `${l.description}: principal ${fmt(principal)}, interest ${fmt(interest)}`);
+    await logActivity('create', 'liability_payment', l.id, `${l.description}: principal ${fmt(principal)}, interest ${fmt(interest)}${makerCheckerOn() ? ' (pending approval)' : ''}`);
     await refreshAll(); render();
     openLiabilityView(l.id);
-    toast('Payment recorded.');
+    toast(makerCheckerOn() ? 'Payment submitted for approval.' : 'Payment recorded.');
   });
   document.querySelectorAll('[data-del-liability-payment]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
@@ -2657,14 +2777,14 @@ function ledgerStockLike(a){ return /stock|inventory/i.test((a && a.category) ||
 function buildLedger(){
   const journals = [];
   // post(date, source, memo, [[accountKey, signedAmount], ...]) — positive = debit, negative = credit.
-  function post(date, source, memo, lines){
+  function post(date, source, memo, lines, ref){
     const out = [];
     lines.forEach(([key, signed])=>{
       const v = round2(signed);
       if(Math.abs(v) < 0.005) return;
       out.push(v > 0 ? {key, debit:v, credit:0} : {key, debit:0, credit:-v});
     });
-    if(out.length) journals.push({date: date || LEDGER_EPOCH, source, memo: memo || '', lines: out, seq: journals.length});
+    if(out.length) journals.push({date: date || LEDGER_EPOCH, source, memo: memo || '', lines: out, seq: journals.length, ref: ref || null});
   }
 
   // Manual-journal bookkeeping: journals mutate entries/assets/liabilities when posted (Wave 35),
@@ -2693,14 +2813,14 @@ function buildLedger(){
     const {gross, net, vat} = ledgerSplitVat(e.amount, e.vat_applicable);
     if(e.type === 'revenue'){
       if(e.source_invoice_id) post(e.entry_date, 'Invoice', e.description, [['AR', gross],['REV', -net],['VAT', -vat]]);
-      else post(e.entry_date, 'Revenue', e.description, [['BANK', gross],['REV', -net],['VAT', -vat]]);
+      else post(e.entry_date, 'Revenue', e.description, [['BANK', gross],['REV', -net],['VAT', -vat]], e.id);
     } else {
       if(tags.includes('depreciation')){
         post(e.entry_date, 'Depreciation', e.description, [['DEPR', gross],['FA_DEP', -gross]]);
       } else {
         const key = tags.includes('liability-payment') ? 'INT' : (e.expense_category === 'cost_of_sales' ? 'COS' : 'OPEX');
         if(e.source_supplier_invoice_id) post(e.entry_date, 'Supplier Invoice', e.description, [[key, net],['VAT', vat],['AP', -gross]]);
-        else post(e.entry_date, 'Expense', e.description, [[key, net],['VAT', vat],['BANK', -gross]]);
+        else post(e.entry_date, 'Expense', e.description, [[key, net],['VAT', vat],['BANK', -gross]], e.id);
       }
     }
   });
@@ -2708,7 +2828,7 @@ function buildLedger(){
   // Customer invoice payments & credit notes.
   (state.invoicePayments||[]).forEach(p=>{
     const inv = (state.invoices||[]).find(i=>i.id===p.invoice_id);
-    post(p.payment_date, 'Invoice Payment', `Payment received${inv ? ' — '+inv.invoice_number : ''}`, [['BANK', Number(p.amount)||0],['AR', -(Number(p.amount)||0)]]);
+    post(p.payment_date, 'Invoice Payment', `Payment received${inv ? ' — '+inv.invoice_number : ''}`, [['BANK', Number(p.amount)||0],['AR', -(Number(p.amount)||0)]], p.id);
   });
   (state.creditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').forEach(cn=>{
     const items = (state.creditNoteItems||{})[cn.id] || [];
@@ -2719,7 +2839,7 @@ function buildLedger(){
   // Supplier invoice payments & supplier credit notes.
   (state.supplierInvoicePayments||[]).forEach(p=>{
     const bill = (state.supplierInvoices||[]).find(b=>b.id===p.supplier_invoice_id);
-    post(p.payment_date, 'Supplier Payment', `Payment made${bill ? ' — '+bill.bill_number : ''}`, [['AP', Number(p.amount)||0],['BANK', -(Number(p.amount)||0)]]);
+    post(p.payment_date, 'Supplier Payment', `Payment made${bill ? ' — '+bill.bill_number : ''}`, [['AP', Number(p.amount)||0],['BANK', -(Number(p.amount)||0)]], p.id);
   });
   (state.supplierCreditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').forEach(cn=>{
     const items = (state.supplierCreditNoteItems||{})[cn.id] || [];
@@ -2761,6 +2881,7 @@ function buildLedger(){
 
   // Manual journals, exactly as entered (debit/credit per line).
   (state.manualJournals||[]).forEach(j=>{
+    if(j.approval_status === 'pending' || j.approval_status === 'rejected') return;   // maker-checker: not posted yet
     const lines = ((state.manualJournalLines||{})[j.id] || []).map(l=>{
       let key;
       if(l.account_key) key = l.account_key;   // Wave 41: posted straight to a chart account
@@ -2776,7 +2897,7 @@ function buildLedger(){
       const amt = Number(l.amount)||0;
       return [key, l.side === 'debit' ? amt : -amt];
     });
-    post(j.journal_date, 'Manual Journal', j.description, lines);
+    post(j.journal_date, j.kind === 'year_end_close' ? 'Year-End Close' : 'Manual Journal', j.description, lines);
   });
 
   return journals;
@@ -2794,16 +2915,17 @@ function withLedgerMemo(fn){
 function ledgerLines(){
   if(_ledgerMemo) return _ledgerMemo;
   const lines = [];
-  buildLedger().forEach(j=>j.lines.forEach(l=>lines.push({date:j.date, source:j.source, memo:j.memo, seq:j.seq, key:l.key, debit:l.debit, credit:l.credit})));
+  buildLedger().forEach(j=>j.lines.forEach(l=>lines.push({date:j.date, source:j.source, memo:j.memo, seq:j.seq, ref:j.ref, key:l.key, debit:l.debit, credit:l.credit})));
   lines.sort((a,b)=> a.date < b.date ? -1 : a.date > b.date ? 1 : a.seq - b.seq);
   return lines;
 }
 // Sum of debits/credits per account key for lines dated within [from, to] (either bound optional).
-function ledgerTotals(lines, from, to){
+function ledgerTotals(lines, from, to, skip){
   const t = {};
   lines.forEach(l=>{
     if(from && l.date < from) return;
     if(to && l.date > to) return;
+    if(skip && skip(l)) return;
     const row = t[l.key] || (t[l.key] = {debit:0, credit:0});
     row.debit += l.debit; row.credit += l.credit;
   });
@@ -2818,8 +2940,11 @@ DEFAULT_CHART.forEach(d=>{ DEFAULT_CHART_TYPE[d.key] = d.type; });
 // ledger ever went out of balance this would show it.
 function computeLedgerTB(start, end){
   const lines = ledgerLines();
-  const upToEnd = ledgerTotals(lines, null, end);
-  const inPeriod = ledgerTotals(lines, start, end);
+  // A year-end close inside the period would move the period's profit into Retained Earnings;
+  // the P&L accounts already show it, so those closing lines are left out of both views here.
+  const isClose = l => l.source === 'Year-End Close';
+  const upToEnd = ledgerTotals(lines, null, end, l=>isClose(l) && l.date >= start);
+  const inPeriod = ledgerTotals(lines, start, end, isClose);
   const beforeStart = ledgerTotals(lines, null, dayBeforeIso(start));
   let priorPLNet = 0; // debit-positive net of P&L accounts before the period (a loss is positive)
   chartAccountList().filter(a=>a.key && (a.type==='revenue' || a.type==='expense')).forEach(a=>{
@@ -3063,20 +3188,24 @@ function renderManualJournals(){
   return `
     <div class="section-header" style="--accent-c:var(--c-manualjournals);"><h1>Manual Journals</h1>${canCreate ? `<button class="btn" id="add-journal-btn">+ New Journal</button>` : ''}</div>
     <p class="section-caption">Double-entry adjustments posted straight to any account in your Chart of Accounts — for period-end corrections, reclassifications, accruals and equity movements.${canCreate ? '' : ' Only Owner/Management can post a new journal.'}</p>
+    ${renderApprovalsPanel()}
+    ${makerCheckerOn() ? `<p style="font-size:.82rem;color:var(--muted);">Maker-checker is on: new journals stay <em>pending</em> and don't touch the ledger or reports until someone other than the person who entered them approves.</p>` : ''}
     ${state.manualJournals.length ? state.manualJournals.map(j=>{
       const lines = state.manualJournalLines[j.id] || [];
       const debits = lines.filter(l=>l.side==='debit').reduce((s,l)=>s+Number(l.amount),0);
       const credits = lines.filter(l=>l.side==='credit').reduce((s,l)=>s+Number(l.amount),0);
       return `
       <details class="collapsible">
-        <summary>${j.journal_date} — ${j.description} (${fmt(debits)})</summary>
+        <summary>${j.journal_date} — ${j.description} (${fmt(debits)}) ${approvalPill(j)}${j.kind==='year_end_close' ? ' <span class="tag-pill">year-end close</span>' : ''}</summary>
         <div class="panel">
           <table><thead><tr><th>Account</th><th>Debit</th><th>Credit</th><th>Memo</th></tr></thead><tbody>
             ${lines.map(l=>`<tr><td>${journalLineAccountLabel(l)}</td><td>${l.side==='debit'?fmt(l.amount):'—'}</td><td>${l.side==='credit'?fmt(l.amount):'—'}</td><td>${l.memo||'—'}</td></tr>`).join('')}
           </tbody><tfoot><tr><td style="font-weight:700;">Total</td><td style="font-weight:700;">${fmt(debits)}</td><td style="font-weight:700;">${fmt(credits)}</td><td></td></tr></tfoot></table>
           <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
             <button type="button" class="btn small secondary" data-attachments="manual_journal|${j.id}" data-attachments-label="${j.description}">${attachmentCountFor('manual_journal',j.id) ? attachmentCountFor('manual_journal',j.id)+' file'+(attachmentCountFor('manual_journal',j.id)>1?'s':'') : 'Attach'}</button>
-            ${canCreate ? `<button type="button" class="btn small danger" data-del-journal="${j.id}">Delete</button>` : ''}
+            ${j.approval_status==='rejected' && j.rejection_note ? `<span style="font-size:.82rem;color:var(--danger);">Rejected: ${j.rejection_note}</span>` : ''}
+            ${canCreate && j.kind!=='year_end_close' ? `<button type="button" class="btn small danger" data-del-journal="${j.id}">Delete</button>` : ''}
+            ${j.kind==='year_end_close' ? `<span style="font-size:.78rem;color:var(--muted);">Reverse this from Reports → Year-End ("Reopen year").</span>` : ''}
           </div>
         </div>
       </details>`;
@@ -3187,6 +3316,7 @@ async function postManualJournalLine(line, journalId, journalDate, journalDescri
 function attachManualJournalHandlers(){
   const canCreate = isAdmin();
   wireAttachmentButtons(canCreate);
+  attachApprovalHandlers();
   document.querySelectorAll('[data-del-journal]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this journal? Its postings disappear from the ledger and reports (journals posted before the ledger update also reverse their effect on Assets/Liabilities and remove any entries they created).')) return;
@@ -3245,7 +3375,8 @@ function attachManualJournalHandlers(){
       company_id: state.company.id,
       journal_date: journalDate,
       description,
-      created_by: state.user.id
+      created_by: state.user.id,
+      approval_status: approvalStatusForNew()
     }).select().single();
     if(error){ toast(error.message); return; }
     for(const line of parsed){
@@ -3255,7 +3386,7 @@ function attachManualJournalHandlers(){
     await logActivity('create', 'manual_journal', journal.id, `${description} (${fmt(totalDebits)})`);
     backdrop.classList.add('hidden');
     await refreshAll(); render();
-    toast('Journal posted.');
+    toast(makerCheckerOn() ? 'Journal submitted for approval.' : 'Journal posted.');
   });
 }
 
@@ -3659,7 +3790,9 @@ async function openSupplierInvoiceView(billId){
   const bill = state.supplierInvoices.find(b=>b.id===billId);
   const {data: items} = await sb.from('cc_supplier_invoice_items').select('*').eq('supplier_invoice_id', billId);
   const {data: paymentsData} = await sb.from('cc_supplier_invoice_payments').select('*').eq('supplier_invoice_id', billId).order('payment_date', {ascending:false});
-  const payments = paymentsData || [];
+  const allPayments = paymentsData || [];
+  const payments = splitApproval(allPayments).ok;
+  const awaitingPayments = allPayments.filter(p=>p.approval_status && p.approval_status !== 'approved');
   const supplier = state.suppliers.find(s=>s.id===bill.supplier_id);
   const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
   const vatTotal = items.reduce((s,it)=> s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
@@ -3690,6 +3823,7 @@ async function openSupplierInvoiceView(billId){
       ${payments.length ? `<table class="payment-list"><thead><tr><th>Date</th><th>Amount</th><th>Notes</th>${canRecordPayment?'<th></th>':''}</tr></thead><tbody>
         ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.amount)}</td><td>${p.notes||'—'}</td>${canRecordPayment?`<td><button class="btn small danger" data-del-supplier-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
+      ${awaitingPayments.length ? `<p style="font-size:.8rem;color:var(--muted);margin:8px 0 2px;">Not yet counted:</p>${awaitingPayments.map(p=>`<div style="font-size:.82rem;">${p.payment_date} — ${fmt(p.amount)} ${approvalPill(p)}${p.approval_status==='rejected' && p.rejection_note ? ' — '+p.rejection_note : ''}${canRecordPayment?` <button class="btn small danger" data-del-supplier-payment="${p.id}">Delete</button>`:''}</div>`).join('')}` : ''}
       ${canRecordPayment ? `<button type="button" class="btn secondary small" id="add-supplier-payment-btn" style="margin-top:10px;">+ Record Payment</button>
       <form id="supplier-payment-form" class="hidden" style="margin-top:10px;">
         <div class="row">
@@ -3724,12 +3858,13 @@ async function openSupplierInvoiceView(billId){
       payment_date: document.getElementById('supplier-payment-date').value,
       amount,
       notes: document.getElementById('supplier-payment-notes').value.trim() || null,
-      created_by: state.user.id
+      created_by: state.user.id,
+      approval_status: approvalStatusForNew()
     });
     if(error){ toast(error.message); return; }
     await refreshAll(); render();
     openSupplierInvoiceView(bill.id);
-    toast('Payment recorded.');
+    toast(makerCheckerOn() ? 'Payment submitted for approval.' : 'Payment recorded.');
   });
   document.querySelectorAll('[data-del-supplier-payment]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
@@ -4482,7 +4617,9 @@ async function openInvoiceView(invoiceId){
   const inv = state.invoices.find(i=>i.id===invoiceId);
   const {data: items} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', invoiceId);
   const {data: paymentsData} = await sb.from('cc_invoice_payments').select('*').eq('invoice_id', invoiceId).order('payment_date', {ascending:false});
-  const payments = paymentsData || [];
+  const allPayments = paymentsData || [];
+  const payments = splitApproval(allPayments).ok;
+  const awaitingPayments = allPayments.filter(p=>p.approval_status && p.approval_status !== 'approved');
   const client = state.clients.find(c=>c.id===inv.client_id);
   const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
   const vatTotal = items.reduce((s,it)=> s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
@@ -4520,6 +4657,7 @@ async function openInvoiceView(invoiceId){
       ${payments.length ? `<table class="payment-list"><thead><tr><th>Date</th><th>Amount</th><th>Notes</th>${canRecordPayment?'<th></th>':''}</tr></thead><tbody>
         ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.amount)}</td><td>${p.notes||'—'}</td>${canRecordPayment?`<td><button class="btn small danger" data-del-invoice-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
+      ${awaitingPayments.length ? `<p style="font-size:.8rem;color:var(--muted);margin:8px 0 2px;">Not yet counted:</p>${awaitingPayments.map(p=>`<div style="font-size:.82rem;">${p.payment_date} — ${fmt(p.amount)} ${approvalPill(p)}${p.approval_status==='rejected' && p.rejection_note ? ' — '+p.rejection_note : ''}${canRecordPayment?` <button class="btn small danger" data-del-invoice-payment="${p.id}">Delete</button>`:''}</div>`).join('')}` : ''}
       ${canRecordPayment ? `<button type="button" class="btn secondary small" id="add-invoice-payment-btn" style="margin-top:10px;">+ Record Payment</button>
       <form id="invoice-payment-form" class="hidden" style="margin-top:10px;">
         <div class="row">
@@ -4574,12 +4712,13 @@ async function openInvoiceView(invoiceId){
       payment_date: document.getElementById('invoice-payment-date').value,
       amount,
       notes: document.getElementById('invoice-payment-notes').value.trim() || null,
-      created_by: state.user.id
+      created_by: state.user.id,
+      approval_status: approvalStatusForNew()
     });
     if(error){ toast(error.message); return; }
     await refreshAll(); render();
     openInvoiceView(inv.id);
-    toast('Payment recorded.');
+    toast(makerCheckerOn() ? 'Payment submitted for approval.' : 'Payment recorded.');
   });
   document.querySelectorAll('[data-del-invoice-payment]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
@@ -5978,6 +6117,31 @@ function periodRange(mode){
   if(mode==='year'){ return {start: iso(new Date(y,0,1)), end: iso(new Date(y,11,31))}; }
   return {start: '2000-01-01', end: iso(now)}; // 'all'
 }
+// Prior-period comparatives: 'year' = the same dates one year earlier, 'previous' = the period of
+// equal length immediately before, 'none' = no comparison.
+function shiftIsoYears(iso, years){
+  const [y, m, d] = iso.split('-').map(Number);
+  const last = new Date(Date.UTC(y + years, m, 0)).getUTCDate();
+  const dd = Math.min(d, last);
+  return `${y+years}-${String(m).padStart(2,'0')}-${String(dd).padStart(2,'0')}`;
+}
+function shiftIsoDays(iso, days){
+  const d = new Date(iso + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0,10);
+}
+function priorPeriodRange(start, end, mode){
+  if(!mode || mode === 'none') return null;
+  if(mode === 'year') return {start: shiftIsoYears(start, -1), end: shiftIsoYears(end, -1)};
+  const len = daysBetween(start, end) + 1;
+  const pe = shiftIsoDays(start, -1);
+  return {start: shiftIsoDays(pe, -(len - 1)), end: pe};
+}
+function varianceCells(cur, prior){
+  const diff = round2(cur - prior);
+  const pct = Math.abs(prior) >= 0.005 ? (diff / Math.abs(prior)) : null;
+  return `<td style="text-align:right;">${fmt(prior)}</td><td style="text-align:right;" class="${diff<0?'negative':''}">${fmt(diff)}</td><td style="text-align:right;color:var(--muted);">${pct===null ? '—' : fmtPct(pct)}</td>`;
+}
 function currentPeriod(){
   const rp = state.reportsPeriod || {mode:'month'};
   if(rp.mode === 'custom'){
@@ -6057,7 +6221,7 @@ function computeProvisionalTax(fy){
 // and Payroll keep their own lines; everything else (operating, depreciation, interest and any
 // custom expense account) falls under Operating Expenses, as before.
 function computePL(start, end){
-  const t = ledgerTotals(ledgerLines(), start, end);
+  const t = ledgerTotals(ledgerLines(), start, end, l=>l.source==='Year-End Close');
   let revenue = 0, cos = 0, opex = 0, payrollCost = 0;
   chartAccountList().filter(a=>a.key).forEach(a=>{
     const r = t[a.key]; if(!r) return;
@@ -6469,6 +6633,10 @@ function renderReportsInner(){
   const bs = computeBS(period.end);
   const cf = computeCashFlow(period.start, period.end);
   const ratios = computeRatios(pl, bs);
+  const cmpMode = state.reportsCompare || 'year';
+  const priorRange = (state.reportsPeriod && state.reportsPeriod.mode === 'all') ? null : priorPeriodRange(period.start, period.end, cmpMode);
+  const plPrior = priorRange ? computePL(priorRange.start, priorRange.end) : null;
+  const bsPrior = priorRange ? computeBS(priorRange.end) : null;
 
   return `
     <div class="section-header" style="--accent-c:var(--c-reports);"><h1>Reports</h1><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
@@ -6486,6 +6654,9 @@ function renderReportsInner(){
       <button class="btn ${state.reportsTab==='financials'?'':'secondary'} small" data-report-tab="financials">Signed Financials</button>
       <button class="btn ${state.reportsTab==='ratios'?'':'secondary'} small" data-report-tab="ratios">Ratios</button>
       <button class="btn ${state.reportsTab==='companytax'?'':'secondary'} small" data-report-tab="companytax">Company Tax</button>
+      <button class="btn ${state.reportsTab==='bankrec'?'':'secondary'} small" data-report-tab="bankrec">Bank Reconciliation</button>
+      <button class="btn ${state.reportsTab==='vatrec'?'':'secondary'} small" data-report-tab="vatrec">VAT 201 Reconciliation</button>
+      <button class="btn ${state.reportsTab==='yearend'?'':'secondary'} small" data-report-tab="yearend">Year-End</button>
     </div>
     <p class="section-caption">${({
       monthly: "A full month's pack in one place — P&amp;L, balance sheet, fixed assets, and outstanding balances.",
@@ -6500,6 +6671,9 @@ function renderReportsInner(){
       financials: "Signed-off financial statements, filed for the record.",
       ratios: "Key ratios that summarise financial health at a glance.",
       companytax: "Estimated company income tax and the two annual provisional tax (IRP6) payment windows.",
+      bankrec: "Does the bank balance in your books agree with the bank statement? Lists what's on one side but not the other.",
+      vatrec: "Ties the VAT you'd declare on the VAT201 to the VAT Control account in the ledger, line by line.",
+      yearend: "Close a financial year: profit moves into Retained Earnings and the period is locked.",
     })[state.reportsTab] || "Revenue minus expenses for the period — how much the business made."}</p>
     ${state.reportsTab==='monthly' ? `
     <div class="panel period-bar">
@@ -6516,10 +6690,16 @@ function renderReportsInner(){
         <div class="field"><label>To</label><input type="date" id="reports-custom-end" value="${state.reportsPeriod.end||period.end}"></div>
         <button class="btn small" id="reports-custom-apply">Apply</button>
       ` : ''}
+      ${(state.reportsTab==='pl' || state.reportsTab==='bs' || !state.reportsTab) && state.reportsPeriod.mode!=='all' ? `
+        <div class="field"><label>Compare with</label><select id="reports-compare">
+          <option value="year" ${cmpMode==='year'?'selected':''}>Same period last year</option>
+          <option value="previous" ${cmpMode==='previous'?'selected':''}>Previous period</option>
+          <option value="none" ${cmpMode==='none'?'selected':''}>No comparison</option>
+        </select></div>` : ''}
       <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">P&amp;L: ${period.start} to ${period.end}<br>Balance sheet as of ${period.end}</div>
     </div>
     `}
-    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs) : state.reportsTab==='tb' ? renderTB(computeLedgerTB(period.start, period.end)) : state.reportsTab==='gl' ? renderGeneralLedger(period.start, period.end) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : state.reportsTab==='companytax' ? renderCompanyTax() : renderPL(pl)}
+    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs, bsPrior) : state.reportsTab==='tb' ? renderTB(computeLedgerTB(period.start, period.end)) : state.reportsTab==='gl' ? renderGeneralLedger(period.start, period.end) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : state.reportsTab==='companytax' ? renderCompanyTax() : state.reportsTab==='bankrec' ? renderBankRec(computeBankRec(period.end, state.bankRecStatement)) : state.reportsTab==='vatrec' ? renderVatRec(computeVatRec(period.start, period.end)) : state.reportsTab==='yearend' ? renderYearEnd() : renderPL(pl, plPrior)}
   `;
 }
 
@@ -6590,29 +6770,47 @@ function renderMonthlyAccountsInner(){
   `;
 }
 
-function renderPL(pl){
+function renderPL(pl, prior){
+  const cmp = !!prior;
+  const row = (label, cur, pr, opts)=>{
+    opts = opts || {};
+    const shown = opts.neg ? `(${fmt(cur)})` : fmt(cur);
+    const style = opts.bold ? 'font-weight:700;border-top:2px solid var(--border);' : '';
+    return `<tr style="${style}"><td${opts.pad?' style="padding-top:16px;"':''}>${label}</td><td style="text-align:right;${opts.pad?'padding-top:16px;':''}" class="${opts.cls?opts.cls(cur):''}">${shown}</td>${cmp ? varianceCells(cur, pr) : ''}</tr>`;
+  };
+  const margin = (label, cur, pr)=>`<tr><td style="color:var(--muted);font-size:.82rem;">${label}</td><td style="text-align:right;color:var(--muted);font-size:.82rem;">${fmtPct(cur)}</td>${cmp ? `<td style="text-align:right;color:var(--muted);font-size:.82rem;">${fmtPct(pr)}</td><td></td><td></td>` : ''}</tr>`;
   return `
   <div class="chart-wrap">
     <h3 style="margin-top:0;">P&amp;L breakdown</h3>
     <canvas id="pl-chart" style="height:220px;"></canvas>
   </div>
   <div class="panel">
-    <table class="report-table"><tbody>
-      <tr><td>Revenue</td><td style="text-align:right;">${fmt(pl.revenue)}</td></tr>
-      <tr><td>Cost of Sales</td><td style="text-align:right;">(${fmt(pl.cos)})</td></tr>
-      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Gross Profit</td><td style="text-align:right;">${fmt(pl.grossProfit)}</td></tr>
-      <tr><td style="color:var(--muted);font-size:.82rem;">Gross Margin</td><td style="text-align:right;color:var(--muted);font-size:.82rem;">${fmtPct(pl.grossMargin)}</td></tr>
-      <tr><td style="padding-top:16px;">Operating Expenses</td><td style="text-align:right;padding-top:16px;">(${fmt(pl.opex)})</td></tr>
-      <tr><td>Payroll &amp; Staff Costs</td><td style="text-align:right;">(${fmt(pl.payrollCost)})</td></tr>
-      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Net Profit</td><td style="text-align:right;" class="${pl.netProfit<0?'negative':'positive'}">${fmt(pl.netProfit)}</td></tr>
-      <tr><td style="color:var(--muted);font-size:.82rem;">Net Margin</td><td style="text-align:right;color:var(--muted);font-size:.82rem;">${fmtPct(pl.netMargin)}</td></tr>
+    <table class="report-table">${cmp ? `<thead><tr><th></th><th style="text-align:right;">${pl.start} to ${pl.end}</th><th style="text-align:right;">${prior.start} to ${prior.end}</th><th style="text-align:right;">Variance</th><th style="text-align:right;">%</th></tr></thead>` : ''}<tbody>
+      ${row('Revenue', pl.revenue, cmp && prior.revenue)}
+      ${row('Cost of Sales', pl.cos, cmp && prior.cos, {neg:true})}
+      ${row('Gross Profit', pl.grossProfit, cmp && prior.grossProfit, {bold:true})}
+      ${margin('Gross Margin', pl.grossMargin, cmp && prior.grossMargin)}
+      ${row('Operating Expenses', pl.opex, cmp && prior.opex, {neg:true, pad:true})}
+      ${row('Payroll &amp; Staff Costs', pl.payrollCost, cmp && prior.payrollCost, {neg:true})}
+      ${row('Net Profit', pl.netProfit, cmp && prior.netProfit, {bold:true, cls:v=>v<0?'negative':'positive'})}
+      ${margin('Net Margin', pl.netMargin, cmp && prior.netMargin)}
     </tbody></table>
   </div>
-  <p style="color:var(--muted);font-size:.8rem;">Figures come from the general ledger for the selected period: revenue and expenses excluding VAT, credit notes deducted from revenue, payroll paid, and any manual journals posted to revenue or expense accounts. Not tax advice — confirm with your accountant before relying on these for statutory reporting.</p>
+  <p style="color:var(--muted);font-size:.8rem;">Figures come from the general ledger for the selected period: revenue and expenses excluding VAT, credit notes deducted from revenue, payroll paid, and any manual journals posted to revenue or expense accounts.${cmp ? ' Variance = current less comparative period; % is relative to the comparative.' : ''} Not tax advice — confirm with your accountant before relying on these for statutory reporting.</p>
   `;
 }
 
-function renderBS(bs){
+function renderBS(bs, prior){
+  const cmp = !!prior;
+  const row = (label, cur, pr, opts)=>{
+    opts = opts || {};
+    const style = opts.bold ? `font-weight:${opts.bold};border-top:${opts.bold>=700?'2px':'1px'} solid var(--border);` : '';
+    return `<tr style="${style}"><td${opts.pad?' style="padding-top:10px;"':''}>${label}</td><td style="text-align:right;${opts.pad?'padding-top:10px;':''}" class="${opts.cls?opts.cls(cur):''}">${fmt(cur)}</td>${cmp ? varianceCells(cur, pr) : ''}</tr>`;
+  };
+  const head = cmp ? `<thead><tr><th></th><th style="text-align:right;">As at ${bs.asOf}</th><th style="text-align:right;">As at ${prior.asOf}</th><th style="text-align:right;">Variance</th><th style="text-align:right;">%</th></tr></thead>` : '';
+  const priorEquity = label => { const l = cmp && (prior.equityLines||[]).find(x=>x.label===label); return l ? l.amount : 0; };
+  const equityLabels = [...(bs.equityLines||[]).map(l=>l.label), ...(cmp ? (prior.equityLines||[]).map(l=>l.label).filter(x=>!(bs.equityLines||[]).some(l=>l.label===x)) : [])];
+  const curEquity = label => { const l = (bs.equityLines||[]).find(x=>x.label===label); return l ? l.amount : 0; };
   return `
   <div class="chart-wrap">
     <h3 style="margin-top:0;">Assets vs Liabilities vs Equity</h3>
@@ -6625,35 +6823,35 @@ function renderBS(bs){
   </div>
   <div class="panel">
     <h3 style="margin-top:0;">Assets</h3>
-    <table class="report-table"><tbody>
-      <tr><td>Cash &amp; Bank</td><td style="text-align:right;">${fmt(bs.cash)}</td></tr>
-      <tr><td>Accounts Receivable</td><td style="text-align:right;">${fmt(bs.accountsReceivable)}</td></tr>
-      ${bs.vatReceivableAmt>0?`<tr><td>VAT Receivable</td><td style="text-align:right;">${fmt(bs.vatReceivableAmt)}</td></tr>`:''}
-      <tr><td>Other Current Assets</td><td style="text-align:right;">${fmt(bs.otherCurrentAssets)}</td></tr>
-      <tr style="font-weight:600;border-top:1px solid var(--border);"><td>Total Current Assets</td><td style="text-align:right;">${fmt(bs.currentAssets)}</td></tr>
-      <tr><td style="padding-top:10px;">Fixed / Non-Current Assets</td><td style="text-align:right;padding-top:10px;">${fmt(bs.fixedAssets)}</td></tr>
-      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Total Assets</td><td style="text-align:right;">${fmt(bs.totalAssets)}</td></tr>
+    <table class="report-table">${head}<tbody>
+      ${row('Cash &amp; Bank', bs.cash, cmp && prior.cash)}
+      ${row('Accounts Receivable', bs.accountsReceivable, cmp && prior.accountsReceivable)}
+      ${(bs.vatReceivableAmt>0 || (cmp && prior.vatReceivableAmt>0)) ? row('VAT Receivable', bs.vatReceivableAmt, cmp && prior.vatReceivableAmt) : ''}
+      ${row('Other Current Assets', bs.otherCurrentAssets, cmp && prior.otherCurrentAssets)}
+      ${row('Total Current Assets', bs.currentAssets, cmp && prior.currentAssets, {bold:600})}
+      ${row('Fixed / Non-Current Assets', bs.fixedAssets, cmp && prior.fixedAssets, {pad:true})}
+      ${row('Total Assets', bs.totalAssets, cmp && prior.totalAssets, {bold:700})}
     </tbody></table>
   </div>
   <div class="panel">
     <h3 style="margin-top:0;">Liabilities</h3>
-    <table class="report-table"><tbody>
-      ${bs.vatPayableAmt>0?`<tr><td>VAT Payable</td><td style="text-align:right;">${fmt(bs.vatPayableAmt)}</td></tr>`:''}
-      <tr><td>Other Current Liabilities</td><td style="text-align:right;">${fmt(bs.currentLiabOther)}</td></tr>
-      <tr style="font-weight:600;border-top:1px solid var(--border);"><td>Total Current Liabilities</td><td style="text-align:right;">${fmt(bs.currentLiabilities)}</td></tr>
-      <tr><td style="padding-top:10px;">Non-Current Liabilities</td><td style="text-align:right;padding-top:10px;">${fmt(bs.nonCurrentLiab)}</td></tr>
-      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Total Liabilities</td><td style="text-align:right;">${fmt(bs.totalLiabilities)}</td></tr>
+    <table class="report-table">${head}<tbody>
+      ${(bs.vatPayableAmt>0 || (cmp && prior.vatPayableAmt>0)) ? row('VAT Payable', bs.vatPayableAmt, cmp && prior.vatPayableAmt) : ''}
+      ${row('Other Current Liabilities', bs.currentLiabOther, cmp && prior.currentLiabOther)}
+      ${row('Total Current Liabilities', bs.currentLiabilities, cmp && prior.currentLiabilities, {bold:600})}
+      ${row('Non-Current Liabilities', bs.nonCurrentLiab, cmp && prior.nonCurrentLiab, {pad:true})}
+      ${row('Total Liabilities', bs.totalLiabilities, cmp && prior.totalLiabilities, {bold:700})}
     </tbody></table>
   </div>
   <div class="panel">
     <h3 style="margin-top:0;">Owner's Equity</h3>
-    <table class="report-table"><tbody>
-      ${(bs.equityLines||[]).map(l=>`<tr><td>${l.label}</td><td style="text-align:right;" class="${l.amount<0?'negative':''}">${fmt(l.amount)}</td></tr>`).join('')}
-      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Total Equity</td><td style="text-align:right;" class="${bs.equity<0?'negative':'positive'}">${fmt(bs.equity)}</td></tr>
+    <table class="report-table">${head}<tbody>
+      ${equityLabels.map(label=>row(label, curEquity(label), priorEquity(label))).join('')}
+      ${row('Total Equity', bs.equity, cmp && prior.equity, {bold:700, cls:v=>v<0?'negative':'positive'})}
     </tbody></table>
-    <p style="color:var(--muted);font-size:.8rem;margin-bottom:0;">${bs.balances ? 'Total assets equal total liabilities plus equity.' : '<span class="negative">The equity lines do not add up to assets less liabilities — the ledger has an unbalanced posting; please report this.</span>'} Opening balance equity holds opening bank balances and directly-recorded assets and loans; reclassify it to share capital or retained earnings with a manual journal.</p>
+    <p style="color:var(--muted);font-size:.8rem;margin-bottom:0;">${bs.balances ? 'Total assets equal total liabilities plus equity.' : '<span class="negative">The equity lines do not add up to assets less liabilities — the ledger has an unbalanced posting; please report this.</span>'} Opening balance equity holds opening bank balances and directly-recorded assets and loans; reclassify it to share capital or retained earnings with a manual journal. Once a financial year is closed (Reports → Year-End), its profit moves into Retained Earnings.</p>
   </div>
-  <p style="color:var(--muted);font-size:.8rem;">As at ${bs.asOf}. Fixed assets are shown at net book value (cost less accumulated depreciation) where depreciation has been run under Assets.</p>
+  <p style="color:var(--muted);font-size:.8rem;">As at ${bs.asOf}. Fixed assets are shown at net book value (cost less accumulated depreciation) where depreciation has been run under Assets.${cmp ? ' Variance = this date less the comparative date.' : ''}</p>
   `;
 }
 
@@ -6701,6 +6899,230 @@ function renderRatios(ratios, bs){
   `;
 }
 
+
+// ---- Bank reconciliation ---------------------------------------------------------------------
+// Ledger bank balance vs a bank statement balance. "Matched" means the Bank Feed has tied a
+// statement line to a book record (an entry, or the payment booked when matching an invoice/bill).
+// Bank lines not yet matched are in the bank but not (yet) in the books; ledger bank postings with
+// no bank line are in the books but not yet seen on the statement (deposits in transit, unpresented payments).
+function computeBankRec(asOf, statementBalance){
+  const hasStatement = statementBalance !== null && statementBalance !== undefined && statementBalance !== '' && !isNaN(Number(statementBalance));
+  const matchedRefs = new Set();
+  (state.bankTransactions||[]).forEach(t=>{
+    if(t.status !== 'matched') return;
+    if(t.linked_payment_id) matchedRefs.add(t.linked_payment_id);
+    if(t.matched_entry_id && t.matched_entry_type !== 'invoice' && t.matched_entry_type !== 'supplier_invoice') matchedRefs.add(t.matched_entry_id);
+  });
+  const bankLines = ledgerLines().filter(l=>l.key==='BANK' && l.date <= asOf);
+  const ledgerBalance = round2(bankLines.reduce((s,l)=>s + l.debit - l.credit, 0));
+  const outstanding = bankLines
+    .filter(l=>l.source !== 'Opening Balance' && !(l.ref && matchedRefs.has(l.ref)))
+    .map(l=>({date:l.date, source:l.source, memo:l.memo, amount: round2(l.debit - l.credit)}));
+  const outstandingTotal = round2(outstanding.reduce((s,x)=>s+x.amount, 0));
+  const txs = (state.bankTransactions||[]).filter(t=>t.tx_date <= asOf);
+  const unmatched = txs.filter(t=>t.status==='unmatched').map(t=>({date:t.tx_date, description:t.description, amount: round2(Number(t.amount)||0)}));
+  const ignored = txs.filter(t=>t.status==='ignored').map(t=>({date:t.tx_date, description:t.description, amount: round2(Number(t.amount)||0)}));
+  const unmatchedTotal = round2(unmatched.reduce((s,x)=>s+x.amount, 0));
+  const ignoredTotal = round2(ignored.reduce((s,x)=>s+x.amount, 0));
+  const adjustedBook = round2(ledgerBalance + unmatchedTotal + ignoredTotal);
+  const out = {asOf, ledgerBalance, unmatched, unmatchedTotal, ignored, ignoredTotal, adjustedBook, outstanding, outstandingTotal, hasStatement, hasFeed: txs.length > 0};
+  if(hasStatement){
+    out.statementBalance = round2(Number(statementBalance));
+    out.adjustedBank = round2(out.statementBalance + outstandingTotal);
+    out.difference = round2(out.adjustedBank - adjustedBook);
+    out.reconciled = Math.abs(out.difference) < 0.01;
+  }
+  return out;
+}
+function renderBankRec(rec){
+  const sign = n => n < 0 ? `(${fmt(-n)})` : fmt(n);
+  const list = (rows, cols)=> rows.length ? `<table><thead><tr>${cols.map(c=>`<th${c.right?' style="text-align:right;"':''}>${c.h}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td${c.right?' style="text-align:right;"':''}>${c.f(r)}</td>`).join('')}</tr>`).join('')}</tbody></table>` : `<div class="empty">None.</div>`;
+  return `
+  <div class="panel">
+    <div class="row" style="align-items:flex-end;">
+      <div class="field" style="max-width:260px;"><label>Bank statement closing balance as at ${rec.asOf} (R)</label><input type="number" step="0.01" id="bankrec-statement" value="${rec.hasStatement ? rec.statementBalance : ''}" placeholder="Enter from your statement"></div>
+    </div>
+    <table class="report-table"><tbody>
+      <tr style="font-weight:600;"><td colspan="2">Per the books</td></tr>
+      <tr><td>Balance per ledger — Bank &amp; Cash</td><td style="text-align:right;">${sign(rec.ledgerBalance)}</td></tr>
+      <tr><td>Add: bank lines not yet matched in the Bank Feed (${rec.unmatched.length})</td><td style="text-align:right;">${sign(rec.unmatchedTotal)}</td></tr>
+      ${rec.ignored.length ? `<tr><td>Add: bank lines marked "ignored" (${rec.ignored.length})</td><td style="text-align:right;">${sign(rec.ignoredTotal)}</td></tr>` : ''}
+      <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Adjusted book balance</td><td style="text-align:right;">${sign(rec.adjustedBook)}</td></tr>
+      <tr style="font-weight:600;"><td colspan="2" style="padding-top:14px;">Per the bank</td></tr>
+      ${rec.hasStatement ? `
+      <tr><td>Balance per bank statement</td><td style="text-align:right;">${sign(rec.statementBalance)}</td></tr>
+      <tr><td>Add: book postings not yet on the statement — deposits in transit less unpresented payments (${rec.outstanding.length})</td><td style="text-align:right;">${sign(rec.outstandingTotal)}</td></tr>
+      <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Adjusted bank balance</td><td style="text-align:right;">${sign(rec.adjustedBank)}</td></tr>
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Difference</td><td style="text-align:right;" class="${rec.reconciled?'positive':'negative'}">${sign(rec.difference)}</td></tr>` : `<tr><td colspan="2" style="color:var(--muted);">Enter your statement balance above to complete the reconciliation.</td></tr>`}
+    </tbody></table>
+    ${rec.hasStatement ? (rec.reconciled ? `<p class="positive" style="font-weight:600;margin-bottom:0;">Reconciled — the books and the bank statement agree.</p>` : `<p class="negative" style="font-weight:600;margin-bottom:0;">Not reconciled — a difference of ${fmt(Math.abs(rec.difference))} remains. Usually a statement line that hasn't been imported to the Bank Feed, or a posting dated on the other side of ${rec.asOf}.</p>`) : ''}
+    ${rec.hasFeed ? '' : `<p style="color:var(--muted);font-size:.82rem;margin-bottom:0;">No bank statement lines have been imported yet (Bank Feed), so every bank posting in the books is shown as not yet on the statement.</p>`}
+  </div>
+  <div class="panel"><h3 style="margin-top:0;">Bank lines not yet matched to the books</h3>
+    ${list(rec.unmatched, [{h:'Date', f:r=>r.date},{h:'Description', f:r=>r.description||'—'},{h:'Amount', right:true, f:r=>sign(r.amount)}])}
+  </div>
+  <div class="panel"><h3 style="margin-top:0;">Book postings not matched to a bank line</h3>
+    ${list(rec.outstanding, [{h:'Date', f:r=>r.date},{h:'Source', f:r=>r.source},{h:'Description', f:r=>r.memo||'—'},{h:'Effect on bank', right:true, f:r=>sign(r.amount)}])}
+  </div>
+  <p style="color:var(--muted);font-size:.8rem;">Match statement lines to books in Bank Feed; matched items drop off both lists. Opening balances are treated as agreed with the statement. Not tax advice.</p>
+  `;
+}
+
+// ---- VAT 201 reconciliation ------------------------------------------------------------------
+// The VAT201 figures (from Revenue/Expense entries, as on the VAT tab) set against the movement on
+// the ledger's VAT Control account for the same dates. The ledger also reflects credit notes and any
+// manual journals to VAT, so those show up as explicit reconciling lines instead of silent differences.
+function computeVatRec(start, end){
+  const v = vatForPeriod(start, end);
+  const all = ledgerLines().filter(l=>l.key==='VAT');
+  const inP = all.filter(l=>l.date >= start && l.date <= end);
+  const cr = srcs => round2(inP.filter(l=>srcs.includes(l.source)).reduce((s,l)=>s + l.credit - l.debit, 0));   // payable-positive
+  const outputSales = cr(['Revenue','Invoice']);
+  const inputPurchases = round2(-cr(['Expense','Supplier Invoice']));
+  const creditNotes = cr(['Credit Note']);                    // negative: reduces output tax
+  const supplierCreditNotes = cr(['Supplier Credit Note']);   // positive: reduces input tax
+  const journals = cr(['Manual Journal','Year-End Close']);
+  const ledgerMovement = round2(inP.reduce((s,l)=>s + l.credit - l.debit, 0));
+  const other = round2(ledgerMovement - (outputSales - inputPurchases + creditNotes + supplierCreditNotes + journals));
+  const closing = round2(all.filter(l=>l.date <= end).reduce((s,l)=>s + l.credit - l.debit, 0));
+  const opening = round2(all.filter(l=>l.date < start).reduce((s,l)=>s + l.credit - l.debit, 0));
+  return {
+    start, end,
+    per201: {output: v.vatCollected, input: v.vatPaid, net: v.vatPayable},
+    roundingOutput: round2(outputSales - v.vatCollected), roundingInput: round2(-(inputPurchases - v.vatPaid)),
+    outputSales, inputPurchases, creditNotes, supplierCreditNotes, journals, other,
+    ledgerMovement, opening, closing,
+    vatRegistered: weAreVatRegistered(),
+  };
+}
+function renderVatRec(r){
+  const s = n => n < 0 ? `(${fmt(-n)})` : fmt(n);
+  const line = (label, amt, note)=>`<tr><td>${label}${note ? `<div style="font-size:.74rem;color:var(--muted);">${note}</div>` : ''}</td><td style="text-align:right;">${s(amt)}</td></tr>`;
+  const rounding = round2(r.roundingOutput + r.roundingInput);
+  return `
+  <div class="panel">
+    ${r.vatRegistered ? '' : `<p style="color:var(--muted);font-size:.82rem;margin-top:0;">The company isn't registered for VAT, so VAT201 figures are normally nil; any VAT shown comes from entries still marked VAT-applicable.</p>`}
+    <table class="report-table"><tbody>
+      <tr style="font-weight:600;"><td colspan="2">VAT201 as calculated from Revenue &amp; Expense entries (${r.start} to ${r.end})</td></tr>
+      ${line('Output tax (VAT on sales)', r.per201.output)}
+      ${line('Less: input tax (VAT on purchases and expenses)', -r.per201.input)}
+      <tr style="font-weight:700;border-top:1px solid var(--border);"><td>VAT payable / (refundable) per VAT201 basis</td><td style="text-align:right;">${s(r.per201.net)}</td></tr>
+      <tr style="font-weight:600;"><td colspan="2" style="padding-top:14px;">Reconciling items to the ledger</td></tr>
+      ${line('Rounding (ledger rounds each posting to the cent)', rounding)}
+      ${line('Customer credit notes issued', r.creditNotes, 'Reduce output tax — not picked up by the entries-based VAT201 figure')}
+      ${line('Supplier credit notes received', r.supplierCreditNotes, 'Reduce input tax')}
+      ${line('Manual journals to VAT Control', r.journals)}
+      ${Math.abs(r.other) >= 0.005 ? line('Other postings', r.other) : ''}
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Movement on VAT Control account per ledger</td><td style="text-align:right;">${s(r.ledgerMovement)}</td></tr>
+      <tr style="font-weight:600;"><td colspan="2" style="padding-top:14px;">VAT Control balance (payable positive)</td></tr>
+      ${line('Opening — brought forward', r.opening)}
+      ${line('Movement in the period', r.ledgerMovement)}
+      <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Closing — as at ${r.end}</td><td style="text-align:right;">${s(r.closing)}</td></tr>
+    </tbody></table>
+    <p style="color:var(--muted);font-size:.82rem;margin-bottom:0;">${Math.abs(r.creditNotes + r.supplierCreditNotes) >= 0.005 ? 'Credit notes in this period mean the ledger figure, not the entries-based VAT201 figure, is the amount that reflects what you should declare. ' : ''}Payments to or refunds from SARS aren't tracked automatically: record them with a manual journal (debit VAT Control, credit Bank &amp; Cash, for a payment) so the closing balance clears. Review against your VAT201 return before filing — not tax advice.</p>
+  </div>`;
+}
+
+// ---- Year-end close --------------------------------------------------------------------------
+// Closing a financial year posts a journal dated the year-end that zeroes every revenue and expense
+// account and moves the net profit into Retained Earnings, then locks the period. Reports for that
+// year still show its P&L (closing lines are ignored in P&L views), and later Balance Sheets carry
+// the profit in Retained Earnings. Reopening deletes the closing journal.
+function yearEndJournals(){ return (state.manualJournals||[]).filter(j=>j.kind === 'year_end_close'); }
+function financialYearClosedJournal(fyEnd){ return yearEndJournals().find(j=>j.fy_end === fyEnd) || null; }
+function buildClosingLines(fyEnd){
+  const t = ledgerTotals(ledgerLines(), null, fyEnd);
+  const lines = [];
+  let netTotal = 0;   // debit-positive across all P&L accounts (a loss is positive)
+  chartAccountList().filter(a=>a.key && (a.type==='revenue' || a.type==='expense')).forEach(a=>{
+    const r = t[a.key]; if(!r) return;
+    const net = round2(r.debit - r.credit);
+    if(Math.abs(net) < 0.005) return;
+    netTotal = round2(netTotal + net);
+    lines.push(net > 0 ? {key:a.key, side:'credit', amount:net} : {key:a.key, side:'debit', amount:-net});
+  });
+  if(Math.abs(netTotal) >= 0.005) lines.push(netTotal > 0 ? {key:'RE', side:'debit', amount:netTotal} : {key:'RE', side:'credit', amount:-netTotal});
+  return {lines, netProfit: round2(-netTotal)};
+}
+function financialYearsList(){
+  const out = [];
+  for(let off = 0; off >= -3; off--){ out.push(Object.assign({offset: off}, companyFinancialYearBounds(off))); }
+  return out;
+}
+function renderYearEnd(){
+  const admin = isAdmin();
+  const today = todayIso();
+  const fys = financialYearsList();
+  const closedEnds = yearEndJournals().map(j=>j.fy_end).sort();
+  const latestClosed = closedEnds.length ? closedEnds[closedEnds.length-1] : null;
+  return `
+  <div class="panel">
+    <table><thead><tr><th>Financial year</th><th style="text-align:right;">Net profit</th><th>Status</th>${admin?'<th></th>':''}</tr></thead><tbody>
+      ${fys.map(fy=>{
+        const pl = computePL(fy.start, fy.end);
+        const closed = !!financialYearClosedJournal(fy.end);
+        const complete = fy.end <= today;
+        const action = !admin ? '' : closed
+          ? (fy.end === latestClosed ? `<td><button type="button" class="btn small secondary" data-reopen-fy="${fy.end}">Reopen year</button></td>` : `<td style="color:var(--muted);font-size:.78rem;">Reopen later years first</td>`)
+          : (complete ? `<td><button type="button" class="btn small" data-close-fy="${fy.end}">Close year</button></td>` : `<td style="color:var(--muted);font-size:.78rem;">Year not finished yet</td>`);
+        return `<tr><td>${fy.start} to ${fy.end}</td><td style="text-align:right;" class="${pl.netProfit<0?'negative':''}">${fmt(pl.netProfit)}</td><td>${closed ? '<span class="status-pill status-approved">closed</span>' : (complete ? 'open' : 'in progress')}</td>${action}</tr>`;
+      }).join('')}
+    </tbody></table>
+    ${state.company && state.company.locked_through_date ? `<p style="font-size:.82rem;color:var(--muted);">Period lock: locked through ${state.company.locked_through_date}.</p>` : ''}
+    <p style="color:var(--muted);font-size:.82rem;margin-bottom:0;">Closing a year posts a journal on its last day that clears every revenue and expense account into Retained Earnings and locks the books through that date (anything dated on or before it can't be edited). Reopening removes the journal and moves the lock back. Do the year-end adjusting journals first — a closed year's figures are what carries forward. ${admin ? '' : 'Only Owner/Management can close or reopen a year.'}</p>
+  </div>`;
+}
+async function closeFinancialYear(fyEnd){
+  if(!isAdmin()){ toast('Only Owner/Management can close a year.'); return; }
+  const fy = financialYearsList().find(f=>f.end === fyEnd);
+  if(!fy) return;
+  if(fy.end > todayIso()){ toast('That financial year has not finished yet.'); return; }
+  if(financialYearClosedJournal(fy.end)){ toast('That year is already closed.'); return; }
+  const closing = buildClosingLines(fy.end);
+  if(!confirm(`Close the financial year ${fy.start} to ${fy.end}?\n\nNet profit to move into Retained Earnings: ${fmt(closing.netProfit)}.\nThe books will be locked through ${fy.end}.`)) return;
+  const nowIso = new Date().toISOString();
+  const {data: journal, error} = await sb.from('cc_manual_journals').insert({
+    company_id: state.company.id, journal_date: fy.end, description: `Year-end close — financial year ended ${fy.end}`,
+    created_by: state.user.id, approval_status: 'approved', approved_by: state.user.id, approved_at: nowIso, kind: 'year_end_close', fy_end: fy.end
+  }).select().single();
+  if(error){ toast(error.message); return; }
+  if(closing.lines.length){
+    const accounts = chartAccountList();
+    const rows = closing.lines.map(l=>{
+      const acc = accounts.find(a=>a.key === l.key);
+      return {journal_id: journal.id, company_id: state.company.id, category:'ledger', side: l.side, amount: l.amount, signed_amount: 0,
+        memo: 'Year-end close', account_key: l.key, account_id: acc && !acc.system ? acc.id : null};
+    });
+    const {error: lineErr} = await sb.from('cc_manual_journal_lines').insert(rows);
+    if(lineErr){ toast(lineErr.message); await sb.from('cc_manual_journals').delete().eq('id', journal.id); return; }
+  }
+  const currentLock = state.company.locked_through_date;
+  const newLock = currentLock && currentLock > fy.end ? currentLock : fy.end;
+  const {error: lockErr} = await sb.from('cc_companies').update({locked_through_date: newLock}).eq('id', state.company.id);
+  if(lockErr){ toast(lockErr.message); }
+  else state.company.locked_through_date = newLock;
+  await logActivity('create', 'manual_journal', journal.id, `Year-end close for ${fy.end} — profit ${fmt(closing.netProfit)} moved to Retained Earnings`);
+  await refreshAll(); render(); toast('Financial year closed.');
+}
+async function reopenFinancialYear(fyEnd){
+  if(!isAdmin()){ toast('Only Owner/Management can reopen a year.'); return; }
+  const journal = financialYearClosedJournal(fyEnd);
+  if(!journal) return;
+  const later = yearEndJournals().some(j=>j.fy_end > fyEnd);
+  if(later){ toast('Reopen the later closed years first.'); return; }
+  if(!confirm(`Reopen the financial year ended ${fyEnd}? The closing journal is deleted and the lock moves back.`)) return;
+  await sb.from('cc_manual_journal_lines').delete().eq('journal_id', journal.id);
+  const {error} = await sb.from('cc_manual_journals').delete().eq('id', journal.id);
+  if(error){ toast(error.message); return; }
+  const remaining = yearEndJournals().filter(j=>j.id !== journal.id).map(j=>j.fy_end).sort();
+  if(state.company.locked_through_date === fyEnd){
+    const newLock = remaining.length ? remaining[remaining.length-1] : null;
+    const {error: lockErr} = await sb.from('cc_companies').update({locked_through_date: newLock}).eq('id', state.company.id);
+    if(!lockErr) state.company.locked_through_date = newLock;
+  }
+  await logActivity('delete', 'manual_journal', journal.id, `Year-end close for ${fyEnd} reversed (year reopened)`);
+  await refreshAll(); render(); toast('Financial year reopened.');
+}
 
 function renderCompanyTax(){
   const fy = companyFinancialYearBounds(state.companyTaxFYOffset || 0);
@@ -6765,6 +7187,14 @@ function attachReportsHandlers(){
     });
   }
   document.getElementById('gl-account-select')?.addEventListener('change', (e)=>{ state.glAccount = e.target.value; render(); });
+  document.getElementById('reports-compare')?.addEventListener('change', (e)=>{ state.reportsCompare = e.target.value; render(); });
+  document.getElementById('bankrec-statement')?.addEventListener('change', (e)=>{
+    const v = e.target.value.trim();
+    state.bankRecStatement = v === '' ? null : (parseFloat(v) || 0);
+    render();
+  });
+  document.querySelectorAll('[data-close-fy]').forEach(btn=>{ btn.addEventListener('click', ()=>closeFinancialYear(btn.dataset.closeFy)); });
+  document.querySelectorAll('[data-reopen-fy]').forEach(btn=>{ btn.addEventListener('click', ()=>reopenFinancialYear(btn.dataset.reopenFy)); });
   document.querySelectorAll('[data-report-tab]').forEach(btn=>{
     btn.addEventListener('click', ()=>{ state.reportsTab = btn.dataset.reportTab; render(); });
   });
@@ -7135,6 +7565,7 @@ const SETTINGS_DIFF_FIELDS = [
   {key:'vat_registered', label:'Registered for VAT', bool:true},
   {key:'vat_number', label:'VAT number'},
   {key:'tracks_inventory', label:'Carries stock/inventory', bool:true},
+  {key:'maker_checker', label:'Maker-checker (second-person approval)', bool:true},
   {key:'registration_number', label:'Registration number'},
   {key:'coida_registration_number', label:'COIDA registration number'},
   {key:'financial_year_end_month', label:'Financial year-end month'},
@@ -7191,6 +7622,8 @@ function renderSettingsCompanyDetails(){
         <div class="field" id="company-vat-number-field" style="${weAreVatRegistered()?'':'display:none;'}"><label>VAT number</label><input type="text" id="company-vat-number" value="${state.company.vat_number || ''}"></div>
         <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-tracks-inventory" style="width:auto;" ${tracksInventory()?'checked':''}> This business carries stock/inventory</label>
         <p style="font-size:.72rem;color:var(--muted);margin:-8px 0 0;">Uncheck this if you're a pure service provider with nothing to stock — it hides the Stock tab and the stock-item column on Invoice/Supplier Invoice line items app-wide.</p>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-maker-checker" style="width:auto;" ${makerCheckerOn()?'checked':''}> Require a second person to approve journals and payments (maker-checker)</label>
+        <p style="font-size:.72rem;color:var(--muted);margin:-8px 0 0;">When on, manual journals and manually-entered customer, supplier and loan payments are saved as pending and only count once a different Owner/Management user (or approver-enabled staff member) approves them. You need at least two people who can approve for this to work. Payments matched from the Bank Feed aren't affected.</p>
         <div class="field"><label>Company registration number (CIPC)</label><input type="text" id="company-registration-number" placeholder="e.g. 2019/123456/07" value="${state.company.registration_number || ''}"></div>
         <div class="field"><label>COIDA registration number (Compensation Fund)</label><input type="text" id="company-coida-registration-number" value="${state.company.coida_registration_number || ''}"></div>
         <div class="field"><label>Financial year-end</label><select id="company-financial-year-end-month"><option value="1" ${state.company.financial_year_end_month==1?'selected':''}>January</option><option value="2" ${state.company.financial_year_end_month==2?'selected':''}>February</option><option value="3" ${state.company.financial_year_end_month==3?'selected':''}>March</option><option value="4" ${state.company.financial_year_end_month==4?'selected':''}>April</option><option value="5" ${state.company.financial_year_end_month==5?'selected':''}>May</option><option value="6" ${state.company.financial_year_end_month==6?'selected':''}>June</option><option value="7" ${state.company.financial_year_end_month==7?'selected':''}>July</option><option value="8" ${state.company.financial_year_end_month==8?'selected':''}>August</option><option value="9" ${state.company.financial_year_end_month==9?'selected':''}>September</option><option value="10" ${state.company.financial_year_end_month==10?'selected':''}>October</option><option value="11" ${state.company.financial_year_end_month==11?'selected':''}>November</option><option value="12" ${state.company.financial_year_end_month==12?'selected':''}>December</option></select></div>
@@ -7291,6 +7724,7 @@ function attachSettingsHandlers(){
     const vat_number = vat_registered ? (document.getElementById('company-vat-number').value.trim() || null) : null;
     const registration_number = document.getElementById('company-registration-number').value.trim() || null;
     const tracks_inventory = document.getElementById('company-tracks-inventory').checked;
+    const maker_checker = document.getElementById('company-maker-checker').checked;
     const paye_registered = document.getElementById('company-paye-registered').checked;
     const sdl_registered = document.getElementById('company-sdl-registered').checked;
     const uif_registered = document.getElementById('company-uif-registered').checked;
@@ -7310,10 +7744,10 @@ function attachSettingsHandlers(){
       paye_reference_number, sdl_reference_number, uif_reference_number,
       contact_first_name, contact_surname, contact_email, contact_phone,
       coida_registration_number, financial_year_end_month, official_interest_rate_pct,
-      tracks_inventory
+      tracks_inventory, maker_checker
     }).eq('id', state.company.id);
     if(error){ toast(error.message); return; }
-    Object.assign(state.company, { name, trading_as, address, vat_registered, vat_number, registration_number, paye_registered, sdl_registered, uif_registered, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone, coida_registration_number, financial_year_end_month, official_interest_rate_pct, tracks_inventory });
+    Object.assign(state.company, { name, trading_as, address, vat_registered, vat_number, registration_number, paye_registered, sdl_registered, uif_registered, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone, coida_registration_number, financial_year_end_month, official_interest_rate_pct, tracks_inventory, maker_checker });
     const diffSummary = summarizeSettingsDiff(before, state.company);
     if(diffSummary) await logActivity('update', 'company', state.company.id, diffSummary);
     document.getElementById('sidebar-company-name').textContent = state.company.name + (isAdmin() ? '' : ' (' + roleLabel(state.membership).toLowerCase() + ')');
