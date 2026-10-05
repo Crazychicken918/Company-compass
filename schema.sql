@@ -1387,3 +1387,10 @@ create policy "members select chart accounts" on cc_chart_accounts for select us
 create policy "admin insert chart accounts" on cc_chart_accounts for insert with check (cc_is_admin(company_id));
 create policy "admin update chart accounts" on cc_chart_accounts for update using (cc_is_admin(company_id));
 create policy "admin delete chart accounts" on cc_chart_accounts for delete using (cc_is_admin(company_id));
+
+-- Wave 41: manual journals can post to any chart account (incl. custom accounts)
+alter table public.cc_manual_journal_lines add column if not exists account_key text;
+alter table public.cc_manual_journal_lines add column if not exists account_id uuid references public.cc_chart_accounts(id) on delete set null;
+alter table public.cc_manual_journal_lines drop constraint if exists cc_manual_journal_lines_category_check;
+alter table public.cc_manual_journal_lines add constraint cc_manual_journal_lines_category_check check (category in ('revenue','expense','asset','liability','ledger'));
+alter table public.cc_chart_accounts add column if not exists is_current boolean not null default true;
