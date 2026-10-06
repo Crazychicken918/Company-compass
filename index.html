@@ -2077,8 +2077,9 @@ function attachDashboardHandlers(){
   attachApprovalHandlers();
   document.getElementById('dashboard-bankfeed-btn')?.addEventListener('click', ()=>goToView('bankfeed'));
   const months = last6MonthsRange();
-  const revenueData = months.map(m=>state.entries.filter(e=>e.type==='revenue' && e.entry_date>=m.start && e.entry_date<=m.end).reduce((s,e)=>s+Number(e.amount),0));
-  const expenseData = months.map(m=>state.entries.filter(e=>e.type==='expense' && e.entry_date>=m.start && e.entry_date<=m.end).reduce((s,e)=>s+Number(e.amount),0));
+  const monthPL = withLedgerMemo(()=>months.map(m=>computePL(m.start, m.end)));
+  const revenueData = monthPL.map(pl=>pl.revenue);
+  const expenseData = monthPL.map(pl=>round2(pl.cos + pl.totalOpex));
   makeChart('dashboard-trend-chart', {
     type: 'bar',
     data: {
@@ -2111,20 +2112,22 @@ function entrySourceLabel(e){
   if(tags.includes('manual-journal')) return 'Manual Journal';
   return 'Added manually';
 }
+// Dashboard figures come straight from the ledger (net of VAT, accrual basis): the same numbers as the
+// Profit & Loss and Balance Sheet, so the dashboard can never disagree with the reports.
 function totalsFor(){
-  const revenue = state.entries.filter(e=>e.type==='revenue' && !isNonCashEntry(e)).reduce((s,e)=>s+Number(e.amount),0);
-  const expenses = state.entries.filter(e=>e.type==='expense' && !isNonCashEntry(e)).reduce((s,e)=>s+Number(e.amount),0);
-  const startingBalance = state.accounts.reduce((s,a)=>s+Number(a.starting_balance||0),0);
-  const payrollPaid = state.payrollPayments.filter(p=>p.paid).reduce((s,p)=>s+Number(p.net),0);
-  const invoicePaymentsIn = (state.invoicePayments||[]).reduce((s,p)=>s+Number(p.amount),0);
-  const supplierPaymentsOut = (state.supplierInvoicePayments||[]).reduce((s,p)=>s+Number(p.amount),0);
-  // Cash comes from the ledger's Bank & Cash account, so manual journals, credit notes etc. are included.
-  const bankT = ledgerTotals(ledgerLines(), null, null).BANK;
-  const predictedBalance = bankT ? round2(bankT.debit - bankT.credit) : 0;
-  const totalAssets = state.assets.reduce((s,a)=>s+Number(a.value),0);
-  const totalLiabilities = state.liabilities.reduce((s,l)=>s+liabilityBalanceAsOf(l),0);
-  const netWorth = totalAssets + predictedBalance - totalLiabilities;
-  return {revenue, expenses, predictedBalance, totalAssets, totalLiabilities, netWorth, payrollPaid};
+  return withLedgerMemo(()=>{
+    const pl = computePL(LEDGER_EPOCH, '9999-12-31');
+    const bs = computeBS('9999-12-31');
+    const revenue = pl.revenue;
+    const expenses = round2(pl.cos + pl.totalOpex);
+    const predictedBalance = bs.cash;
+    return {revenue, expenses, predictedBalance, totalAssets: bs.totalAssets, totalLiabilities: bs.totalLiabilities, netWorth: bs.equity, payrollPaid: pl.payrollCost};
+  });
+}
+// VAT position straight from the ledger's VAT Control account (includes credit notes and journals).
+function vatFromLedger(){
+  const t = ledgerTotals(ledgerLines(), null, null).VAT || {debit:0, credit:0};
+  return {vatCollected: round2(t.credit), vatPaid: round2(t.debit), vatPayable: round2(t.credit - t.debit)};
 }
 
 function vatFor(asOf){
@@ -2166,7 +2169,7 @@ function vatForPeriod(from, to){
 /* ========================= DASHBOARD ========================= */
 function renderDashboard(){
   const t = totalsFor();
-  const v = vatFor();
+  const v = vatFromLedger();
   const unmatchedBankTx = state.bankTransactions.filter(x=>x.status==='unmatched');
   const today = todayIso();
   const outstandingInvoices = state.invoices.filter(i=>i.status==='sent'||i.status==='overdue');
@@ -2181,10 +2184,10 @@ function renderDashboard(){
     ${renderApprovalsPanel()}
     ${dueSoonLiabilities.length ? `<div class="alert-banner due">⏰ ${dueSoonLiabilities.length} supplier/liability payment${dueSoonLiabilities.length>1?'s are':' is'} due within 7 days: ${dueSoonLiabilities.map(l=>`${l.description} (due ${l.due_date})`).join(', ')}</div>` : ''}
     <div class="grid">
-      <div class="card" style="--accent-c:var(--c-dashboard);"><h3>Predicted Balance</h3><div class="value ${t.predictedBalance<0?'negative':'positive'}">${fmt(t.predictedBalance)}</div><div class="sub">Starting balance + revenue − expenses − payroll</div></div>
-      <div class="card" style="--accent-c:var(--c-revenue);"><h3>Revenue vs Expenses</h3><div class="value">${fmt(t.revenue - t.expenses)}</div><div class="sub">${fmt(t.revenue)} revenue, ${fmt(t.expenses)} expenses</div></div>
-      <div class="card" style="--accent-c:var(--c-assets);"><h3>Net Worth</h3><div class="value ${t.netWorth<0?'negative':'positive'}">${fmt(t.netWorth)}</div><div class="sub">Assets + balance − liabilities</div></div>
-      <div class="card" style="--accent-c:var(--c-vat);"><h3>VAT Payable (current)</h3><div class="value">${fmt(v.vatPayable)}</div><div class="sub">Collected ${fmt(v.vatCollected)} − paid ${fmt(v.vatPaid)}</div></div>
+      <div class="card" style="--accent-c:var(--c-dashboard);"><h3>Predicted Balance</h3><div class="value ${t.predictedBalance<0?'negative':'positive'}">${fmt(t.predictedBalance)}</div><div class="sub">Bank &amp; Cash per the ledger</div></div>
+      <div class="card" style="--accent-c:var(--c-revenue);"><h3>Revenue vs Expenses</h3><div class="value">${fmt(t.revenue - t.expenses)}</div><div class="sub">${fmt(t.revenue)} revenue, ${fmt(t.expenses)} expenses (excl. VAT)</div></div>
+      <div class="card" style="--accent-c:var(--c-assets);"><h3>Net Worth</h3><div class="value ${t.netWorth<0?'negative':'positive'}">${fmt(t.netWorth)}</div><div class="sub">Total assets − total liabilities (Balance Sheet)</div></div>
+      <div class="card" style="--accent-c:var(--c-vat);"><h3>VAT Payable (current)</h3><div class="value">${fmt(v.vatPayable)}</div><div class="sub">Output ${fmt(v.vatCollected)} − input ${fmt(v.vatPaid)} (VAT Control)</div></div>
       <div class="card" style="--accent-c:#0FB981;"><h3>Bank Feed</h3><div class="value ${unmatchedBankTx.length?'negative':'positive'}">${unmatchedBankTx.length}</div><div class="sub">Unmatched transaction${unmatchedBankTx.length===1?'':'s'}</div><button type="button" class="btn small secondary" id="dashboard-bankfeed-btn" style="margin-top:8px;">Go to Bank Feed →</button></div>
     </div>
     <div class="chart-wrap">
@@ -2737,6 +2740,8 @@ const DEFAULT_CHART = [
   {key:'FA_DEP', code:'1510', name:'Fixed Assets — Accumulated Depreciation', type:'asset'},
   {key:'AP', code:'2000', name:'Accounts Payable', type:'liability'},
   {key:'OCL', code:'2100', name:'Other Current Liabilities', type:'liability'},
+  {key:'SARS', code:'2310', name:'SARS Payable — PAYE, UIF & SDL', type:'liability'},
+  {key:'PAYDED', code:'2320', name:'Payroll Deductions Payable (pension, medical, other)', type:'liability'},
   {key:'NCL', code:'2200', name:'Non-Current Liabilities (Loans)', type:'liability'},
   {key:'VAT', code:'2300', name:'VAT Control', type:'liability'},
   {key:'OBE', code:'3000', name:'Opening Balance Equity', type:'equity'},
@@ -2772,6 +2777,13 @@ function ledgerSplitVat(amount, vatApplicable){
   return {gross:a, net: round2(a - vat), vat};
 }
 function ledgerStockLike(a){ return /stock|inventory/i.test((a && a.category) || ''); }
+
+// SDL is accrued per payslip (1% of basic + travel allowance) once the business is over the R500k
+// threshold — the same rule the Monthly EMP201 Tracking panel uses, so the two always agree.
+function payrollSdlApplicable(){ return !!computeStatutorySummary().sdl.applicable; }
+function payslipSdl(p, applicable){
+  return applicable ? round2(((Number(p.basic_salary)||0) + (Number(p.travel_allowance)||0)) * SDL_RATE) : 0;
+}
 
 // Returns an array of balanced journals: {date, source, memo, seq, lines:[{key, debit, credit}]}.
 function buildLedger(){
@@ -2817,9 +2829,20 @@ function buildLedger(){
     } else {
       if(tags.includes('depreciation')){
         post(e.entry_date, 'Depreciation', e.description, [['DEPR', gross],['FA_DEP', -gross]]);
+      } else if(tags.includes('cost-of-sales') && tags.includes('stock')){
+        // Automatic cost of sales when stock is sold: relieves the inventory asset (no cash moves).
+        post(e.entry_date, 'Cost of Sales', e.description, [['COS', net],['VAT', vat],['INV', -gross]]);
       } else {
         const key = tags.includes('liability-payment') ? 'INT' : (e.expense_category === 'cost_of_sales' ? 'COS' : 'OPEX');
-        if(e.source_supplier_invoice_id) post(e.entry_date, 'Supplier Invoice', e.description, [[key, net],['VAT', vat],['AP', -gross]]);
+        if(e.source_supplier_invoice_id){
+          // Lines linked to a stock item go to the inventory asset, not to expense — the cost reaches
+          // the P&L only when the stock is sold (Cost of Sales above), so it is never expensed twice.
+          const billItems = (state.supplierInvoiceItems||{})[e.source_supplier_invoice_id] || [];
+          const billTotal = docTotal(billItems);
+          const stockGross = billItems.filter(it=>it.stock_item_id).reduce((a,it)=>a+(Number(it.quantity)||0)*(Number(it.unit_price)||0), 0);
+          const stockNet = (billTotal > 0 && stockGross > 0) ? round2(net * Math.min(1, stockGross / billTotal)) : 0;
+          post(e.entry_date, 'Supplier Invoice', e.description, [['INV', stockNet],[key, net - stockNet],['VAT', vat],['AP', -gross]]);
+        }
         else post(e.entry_date, 'Expense', e.description, [[key, net],['VAT', vat],['BANK', -gross]], e.id);
       }
     }
@@ -2847,10 +2870,28 @@ function buildLedger(){
     post(cn.issue_date, 'Supplier Credit Note', `Supplier credit note ${cn.credit_note_number}`, [['AP', gross],['OPEX', -net],['VAT', -vat]]);
   });
 
-  // Payroll actually paid (net pay — same basis the P&L and Balance Sheet already use).
-  (state.payrollPayments||[]).filter(p=>p.paid).forEach(p=>{
-    const net = Number(p.net)||0;
-    post(p.pay_date, 'Payroll', 'Payroll paid', [['PAYROLL', net],['BANK', -net]]);
+  // Payroll actually paid. The full cost is expensed (gross pay + employer UIF + SDL); net pay leaves
+  // the bank; PAYE, UIF (both halves) and SDL are held as a SARS liability until the EMP201 is paid;
+  // pension, medical and other deductions are held for the funds they are owed to.
+  // Older payslips saved without a gross/PAYE breakdown fall back to net pay only.
+  const payrollRows = (state.payrollPayments||[]).filter(p=>p.paid);
+  const sdlApplicable = payrollRows.length ? payrollSdlApplicable() : false;
+  payrollRows.forEach(p=>{
+    const net = round2(Number(p.net)||0);
+    const gross = Math.max(net, round2(Number(p.gross)||0));
+    const paye = round2(Number(p.paye)||0), uifEe = round2(Number(p.uif_employee)||0), uifEr = round2(Number(p.uif_employer)||0);
+    const sdl = payslipSdl(p, sdlApplicable);
+    const withheld = round2(gross - net - paye - uifEe);   // retirement, medical aid and other deductions
+    const emp = (state.employees||[]).find(x=>x.id===p.employee_id);
+    post(p.pay_date, 'Payroll', `Payroll paid${emp ? ' — '+emp.name : ''}`,
+      [['PAYROLL', gross + uifEr + sdl],['BANK', -net],['SARS', -(paye + uifEe + uifEr + sdl)],['PAYDED', -withheld]]);
+  });
+  // EMP201 submitted and paid to SARS: clears the SARS liability from the bank.
+  (state.emp201Submissions||[]).filter(r=>r.submitted).forEach(r=>{
+    const amt = round2((Number(r.paye)||0) + (Number(r.uif_employee)||0) + (Number(r.uif_employer)||0) + (Number(r.sdl)||0));
+    const ym = String(r.period_month||'');
+    const fallback = /^\d{4}-\d{2}/.test(ym) ? new Date(Date.UTC(Number(ym.slice(0,4)), Number(ym.slice(5,7)), 0)).toISOString().slice(0,10) : LEDGER_EPOCH;
+    post(r.submitted_date || fallback, 'EMP201 Payment', `EMP201 paid to SARS — ${ym}`, [['SARS', amt],['BANK', -amt]]);
   });
 
   // Assets and liabilities recorded directly: the other side goes to Opening Balance Equity.
@@ -2878,6 +2919,15 @@ function buildLedger(){
     if(l) principalSoFar[l.id] = (principalSoFar[l.id]||0) + principal;
     post(p.payment_date, 'Loan Repayment', `Principal repaid${l ? ' — '+l.description : ''}`, [[l && l.is_current ? 'OCL' : 'NCL', principal],['BANK', -principal]]);
   });
+
+  // Stock on hand that no purchase bill or recorded asset accounts for (opening stock, or goods bought
+  // without a bill) is brought in against Opening Balance Equity so Inventory ties to the stock list.
+  if(tracksInventory() && (state.stockItems||[]).length){
+    const stockValue = round2((state.stockItems||[]).reduce((a,x)=>a+(Number(x.qty_on_hand)||0)*(Number(x.unit_cost)||0), 0));
+    const invNow = round2(journals.reduce((a,j)=>a+j.lines.filter(l=>l.key==='INV').reduce((b,l)=>b+l.debit-l.credit, 0), 0));
+    const residual = round2(stockValue - invNow);
+    if(residual > 0.004) post(LEDGER_EPOCH, 'Opening Balance', 'Stock on hand brought forward (not backed by a purchase bill)', [['INV', residual],['OBE', -residual]]);
+  }
 
   // Manual journals, exactly as entered (debit/credit per line).
   (state.manualJournals||[]).forEach(j=>{
@@ -2978,7 +3028,7 @@ function computeLedgerVsBS(end){
   const bal = k => { const r = t[k]; return r ? r.debit - r.credit : 0; };
   const vatNet = bal('VAT');
   const assetKeys = ['BANK','AR','INV','OCA','FA_COST','FA_DEP'];
-  const liabKeys = ['AP','OCL','NCL'];
+  const liabKeys = ['AP','OCL','SARS','PAYDED','NCL'];
   const ledgerAssets = assetKeys.reduce((s,k)=>s+bal(k),0) + Math.max(0, vatNet);
   const ledgerLiabs = liabKeys.reduce((s,k)=>s-bal(k),0) + Math.max(0, -vatNet);
   const bs = computeBS(end);
@@ -5488,16 +5538,22 @@ function renderEasyFileReadiness(readiness){
 // actual amounts, not projections, since EMP201 liability is reported on what was actually paid.
 function monthlyPayrollActuals(){
   const byMonth = {};
+  const sdlOn = payrollSdlApplicable();
   state.payrollPayments.filter(p=>p.paid).forEach(p=>{
     const ym = (p.pay_date||'').slice(0,7);
     if(!ym) return;
-    if(!byMonth[ym]) byMonth[ym] = {ym, paye:0, uifEmployee:0, uifEmployer:0, leviablePayroll:0};
+    if(!byMonth[ym]) byMonth[ym] = {ym, paye:0, uifEmployee:0, uifEmployer:0, leviablePayroll:0, sdl:0};
     byMonth[ym].paye += Number(p.paye) || 0;
     byMonth[ym].uifEmployee += Number(p.uif_employee) || 0;
     byMonth[ym].uifEmployer += Number(p.uif_employer) || 0;
     byMonth[ym].leviablePayroll += (Number(p.basic_salary) || 0) + (Number(p.travel_allowance) || 0);
+    byMonth[ym].sdl = round2(byMonth[ym].sdl + payslipSdl(p, sdlOn));
   });
   return Object.values(byMonth).sort((a,b)=> b.ym.localeCompare(a.ym));
+}
+function sarsOwedPerLedger(){
+  const t = ledgerTotals(ledgerLines(), null, null).SARS;
+  return t ? round2(t.credit - t.debit) : 0;
 }
 function emp201Row(ym){ return state.emp201Submissions.find(r=>r.period_month===ym); }
 function renderEmp201Panel(){
@@ -5506,10 +5562,11 @@ function renderEmp201Panel(){
   return `
   <div class="panel" style="border-top:3px solid var(--c-payroll);">
     <h3 style="margin-top:0;">Monthly EMP201 Tracking</h3>
-    <p style="color:var(--muted);font-size:.85rem;margin:0 0 10px;">Actual PAYE, UIF and SDL due per month, from saved payslips — mark each month off once its EMP201 has been submitted and paid. EMP201 is due by the 7th of the following month.</p>
+    <p style="color:var(--muted);font-size:.85rem;margin:0 0 10px;">Actual PAYE, UIF and SDL due per month, from saved payslips — mark each month off once its EMP201 has been submitted and paid — that records the payment from your bank and clears what you owe SARS in the ledger. EMP201 is due by the 7th of the following month.</p>
+    <p style="font-size:.85rem;margin:0 0 10px;"><strong>Owed to SARS per the ledger:</strong> ${fmt(sarsOwedPerLedger())}</p>
     ${months.length ? `<table><thead><tr><th>Month</th><th>PAYE</th><th>UIF (both halves)</th><th>SDL</th><th>Total Due</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
       ${months.map(m=>{
-        const sdl = stat.sdl.applicable ? round2(m.leviablePayroll * SDL_RATE) : 0;
+        const sdl = m.sdl;
         const total = round2(m.paye + m.uifEmployee + m.uifEmployer + sdl);
         const row = emp201Row(m.ym);
         const submitted = !!(row && row.submitted);
@@ -5517,7 +5574,7 @@ function renderEmp201Panel(){
           <td>${monthLabel(m.ym)}</td><td>${fmt(m.paye)}</td><td>${fmt(m.uifEmployee + m.uifEmployer)}</td><td>${fmt(sdl)}</td>
           <td style="font-weight:600;">${fmt(total)}</td>
           <td>${submitted ? `<span class="tag-pill">Submitted${row&&row.submitted_date?' — '+row.submitted_date:''}</span>` : '<span class="tag-pill" style="opacity:.6;">Pending</span>'}</td>
-          ${isAdmin() ? `<td><label style="display:flex;align-items:center;gap:6px;font-size:.82rem;white-space:nowrap;"><input type="checkbox" class="emp201-mark-submitted" data-month="${m.ym}" data-paye="${m.paye}" data-uif-employee="${m.uifEmployee}" data-uif-employer="${m.uifEmployer}" data-sdl="${sdl}" ${submitted?'checked':''} style="width:auto;"> Mark submitted</label></td>` : ''}
+          ${isAdmin() ? `<td><label style="display:flex;align-items:center;gap:6px;font-size:.82rem;white-space:nowrap;"><input type="checkbox" class="emp201-mark-submitted" data-month="${m.ym}" data-paye="${m.paye}" data-uif-employee="${m.uifEmployee}" data-uif-employer="${m.uifEmployer}" data-sdl="${sdl}" ${submitted?'checked':''} style="width:auto;"> Mark submitted &amp; paid</label></td>` : ''}
         </tr>`;
       }).join('')}
     </tbody></table>` : `<div class="empty">No payslips saved yet — save a payslip below to start tracking EMP201 liability by month.</div>`}
@@ -6275,7 +6332,7 @@ function computeBS(asOf){
   const totalAssets = currentAssets + fixedAssets;
 
   const accountsPayableFromBills = -bal('AP');
-  const currentLiabOther = -bal('OCL') + accountsPayableFromBills + customCurLiab;
+  const currentLiabOther = -bal('OCL') - bal('SARS') - bal('PAYDED') + accountsPayableFromBills + customCurLiab;
   const nonCurrentLiab = -bal('NCL') + customNonCurLiab;
   const currentLiabilities = currentLiabOther + vatPayableAmt;
   const totalLiabilities = currentLiabilities + nonCurrentLiab;
@@ -6326,56 +6383,61 @@ function computeCashFlow(start, end){
   return withLedgerMemo(()=>computeCashFlowImpl(start, end));
 }
 function computeCashFlowImpl(start, end){
+  // Direct method straight from the ledger's Bank & Cash postings, classified by where each came from,
+  // so the statement always agrees with the Balance Sheet cash figure. Recording an asset or a loan
+  // posts against Opening Balance Equity (no cash moves), so those appear as memo lines, not cash.
   const inRange = (d) => d && d >= start && d <= end;
+  const entryById = {};
+  (state.entries||[]).forEach(e=>{ entryById[e.id] = e; });
+  const bankLines = ledgerLines().filter(l=>l.key==='BANK' && l.date>=start && l.date<=end && l.source!=='Opening Balance');
+  const sum = {cashFromRevenue:0, invoicePaymentsIn:0, cosOut:0, opexOut:0, supplierPaymentsOut:0, payrollOut:0, sarsOut:0, principal:0, other:0};
+  bankLines.forEach(l=>{
+    const net = l.debit - l.credit;
+    switch(l.source){
+      case 'Revenue': sum.cashFromRevenue += net; break;
+      case 'Invoice Payment': sum.invoicePaymentsIn += net; break;
+      case 'Expense': {
+        const e = entryById[l.ref];
+        if(e && e.expense_category === 'cost_of_sales') sum.cosOut -= net; else sum.opexOut -= net;
+        break;
+      }
+      case 'Supplier Payment': sum.supplierPaymentsOut -= net; break;
+      case 'Payroll': sum.payrollOut -= net; break;
+      case 'EMP201 Payment': sum.sarsOut -= net; break;
+      case 'Loan Repayment': sum.principal -= net; break;
+      default: sum.other += net;
+    }
+  });
+  Object.keys(sum).forEach(k=>{ sum[k] = round2(sum[k]); });
+  const cashFromRevenueTotal = round2(sum.cashFromRevenue + sum.invoicePaymentsIn);
+  const netOperating = round2(cashFromRevenueTotal - sum.cosOut - sum.opexOut - sum.supplierPaymentsOut - sum.payrollOut - sum.sarsOut);
 
-  // Operating activities — cash-basis revenue and expenses recorded in the period,
-  // plus payroll actually paid in the period. Depreciation (a book expense) and
-  // invoice-linked accrual entries (recognized at invoice time, not when cash moves)
-  // are excluded here even though they correctly affect Net Profit on the P&L —
-  // actual cash received/paid against invoices comes from the payment-allocation
-  // tables instead, added back in below.
-  const cashFromRevenue = state.entries.filter(e=>e.type==='revenue' && inRange(e.entry_date) && !isNonCashEntry(e)).reduce((s,e)=>s+Number(e.amount),0);
+  // Memo lines: book entries that are not cash in this period.
   const isDepreciation = e => (e.tags||[]).includes('depreciation');
-  const expenseRows = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date) && !isNonCashEntry(e));
-  const cosOut = expenseRows.filter(e=>e.expense_category==='cost_of_sales').reduce((s,e)=>s+Number(e.amount),0);
-  const opexOut = expenseRows.filter(e=>e.expense_category!=='cost_of_sales').reduce((s,e)=>s+Number(e.amount),0);
-  const payrollOut = state.payrollPayments.filter(p=>p.paid && inRange(p.pay_date)).reduce((s,p)=>s+Number(p.net),0);
   const depreciationExcluded = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date) && isDepreciation(e)).reduce((s,e)=>s+Number(e.amount),0);
   const invoiceAccrualExcluded = state.entries.filter(e=>e.type==='revenue' && inRange(e.entry_date) && e.source_invoice_id).reduce((s,e)=>s+Number(e.amount),0);
   const supplierInvoiceAccrualExcluded = state.entries.filter(e=>e.type==='expense' && inRange(e.entry_date) && e.source_supplier_invoice_id).reduce((s,e)=>s+Number(e.amount),0);
 
-  // Actual cash received against customer invoices / paid against supplier invoices
-  // during the period — this is the real cash counterpart to the accrual entries above.
-  const invoicePaymentsIn = (state.invoicePayments||[]).filter(p=>inRange(p.payment_date)).reduce((s,p)=>s+Number(p.amount),0);
-  const supplierPaymentsOut = (state.supplierInvoicePayments||[]).filter(p=>inRange(p.payment_date)).reduce((s,p)=>s+Number(p.amount),0);
-  const cashFromRevenueTotal = cashFromRevenue + invoicePaymentsIn;
+  const assetPurchases = 0;     // recorded assets are booked against Opening Balance Equity, not bank
+  const netInvesting = 0;
+  const liabilityPrincipalRepaid = sum.principal;
+  const liabilityDraws = 0;
+  const netFinancing = round2(-liabilityPrincipalRepaid);
+  const assetsRecordedNonCash = round2(state.assets.filter(a=>inRange(a.purchase_date)).reduce((s,a)=>s+Number(a.value),0));
+  const liabilitiesRecordedNonCash = round2(state.liabilities.filter(l=>inRange(l.start_date)).reduce((s,l)=>s+Number(l.amount),0));
 
-  const netOperating = cashFromRevenueTotal - cosOut - opexOut - supplierPaymentsOut - payrollOut;
-
-  // Investing activities — assets purchased (cash out) during the period. Only assets
-  // with a purchase date recorded are included; older assets without one are excluded.
-  const assetPurchases = state.assets.filter(a=>inRange(a.purchase_date)).reduce((s,a)=>s+Number(a.value),0);
-  const netInvesting = -assetPurchases;
-
-  // Financing activities — new liabilities drawn down (cash in) during the period,
-  // based on each liability's start date.
-  const liabilityDraws = state.liabilities.filter(l=>inRange(l.start_date)).reduce((s,l)=>s+Number(l.amount),0);
-  const liabilityPrincipalRepaid = totalPrincipalPaid(start, end);
-  const netFinancing = liabilityDraws - liabilityPrincipalRepaid;
-
-  // Cash moved by manual journals (e.g. a journal debiting Bank & Cash) isn't part of any category above.
-  const otherCashMovements = round2(ledgerLines()
-    .filter(l=>l.source==='Manual Journal' && l.key==='BANK' && l.date>=start && l.date<=end)
-    .reduce((s,l)=>s + l.debit - l.credit, 0));
-  const netChange = netOperating + netInvesting + netFinancing + otherCashMovements;
+  const otherCashMovements = sum.other;     // manual journals and anything else posted to Bank & Cash
+  const netChange = round2(netOperating + netInvesting + netFinancing + otherCashMovements);
   const openingCash = computeBS(dayBeforeIso(start)).cash;
   const closingCashActual = computeBS(end).cash;
-  const closingCashDerived = openingCash + netChange;
+  const closingCashDerived = round2(openingCash + netChange);
 
   return {
-    start, end, cashFromRevenue: cashFromRevenueTotal, invoicePaymentsIn, cosOut, opexOut, supplierPaymentsOut, payrollOut, netOperating,
+    start, end, cashFromRevenue: cashFromRevenueTotal, invoicePaymentsIn: sum.invoicePaymentsIn, cosOut: sum.cosOut, opexOut: sum.opexOut,
+    supplierPaymentsOut: sum.supplierPaymentsOut, payrollOut: sum.payrollOut, sarsOut: sum.sarsOut, netOperating,
     depreciationExcluded, invoiceAccrualExcluded, supplierInvoiceAccrualExcluded,
     assetPurchases, netInvesting, liabilityDraws, liabilityPrincipalRepaid, netFinancing, otherCashMovements,
+    assetsRecordedNonCash, liabilitiesRecordedNonCash,
     netChange, openingCash, closingCashDerived, closingCashActual,
     reconciles: Math.abs(closingCashDerived - closingCashActual) < 0.01
   };
@@ -6390,18 +6452,21 @@ function renderCF(cf){
       <tr><td>Cash paid — cost of sales</td><td style="text-align:right;">(${fmt(cf.cosOut)})</td></tr>
       <tr><td>Cash paid — operating expenses</td><td style="text-align:right;">(${fmt(cf.opexOut)})</td></tr>
       ${cf.supplierPaymentsOut ? `<tr><td>Cash paid — supplier invoice payments</td><td style="text-align:right;">(${fmt(cf.supplierPaymentsOut)})</td></tr>` : ''}
-      <tr><td>Cash paid — payroll</td><td style="text-align:right;">(${fmt(cf.payrollOut)})</td></tr>
+      <tr><td>Cash paid — payroll (net pay)</td><td style="text-align:right;">(${fmt(cf.payrollOut)})</td></tr>
+      ${cf.sarsOut ? `<tr><td>Cash paid — SARS (PAYE, UIF &amp; SDL, EMP201)</td><td style="text-align:right;">(${fmt(cf.sarsOut)})</td></tr>` : ''}
       <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Net cash from operating activities</td><td style="text-align:right;" class="${cf.netOperating<0?'negative':'positive'}">${fmt(cf.netOperating)}</td></tr>
       ${cf.depreciationExcluded ? `<tr><td style="color:var(--muted);font-size:.8rem;">Depreciation charged this period (non-cash, excluded above)</td><td style="text-align:right;color:var(--muted);font-size:.8rem;">${fmt(cf.depreciationExcluded)}</td></tr>` : ''}
       ${cf.invoiceAccrualExcluded ? `<tr><td style="color:var(--muted);font-size:.8rem;">Revenue recognized on customer invoices this period (accrual, excluded above)</td><td style="text-align:right;color:var(--muted);font-size:.8rem;">${fmt(cf.invoiceAccrualExcluded)}</td></tr>` : ''}
       ${cf.supplierInvoiceAccrualExcluded ? `<tr><td style="color:var(--muted);font-size:.8rem;">Expense recognized on supplier invoices this period (accrual, excluded above)</td><td style="text-align:right;color:var(--muted);font-size:.8rem;">${fmt(cf.supplierInvoiceAccrualExcluded)}</td></tr>` : ''}
 
       <tr style="font-weight:600;"><td colspan="2" style="padding-top:16px;">Investing Activities</td></tr>
-      <tr><td>Purchase of fixed assets</td><td style="text-align:right;">${cf.assetPurchases?`(${fmt(cf.assetPurchases)})`:fmt(0)}</td></tr>
+      <tr><td>Purchase of fixed assets (paid from Bank &amp; Cash)</td><td style="text-align:right;">${cf.assetPurchases?`(${fmt(cf.assetPurchases)})`:fmt(0)}</td></tr>
+      ${cf.assetsRecordedNonCash ? `<tr><td style="color:var(--muted);font-size:.8rem;">Assets recorded this period (booked against opening balance equity — not a cash movement)</td><td style="text-align:right;color:var(--muted);font-size:.8rem;">${fmt(cf.assetsRecordedNonCash)}</td></tr>` : ''}
       <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Net cash from investing activities</td><td style="text-align:right;" class="${cf.netInvesting<0?'negative':'positive'}">${fmt(cf.netInvesting)}</td></tr>
 
       <tr style="font-weight:600;"><td colspan="2" style="padding-top:16px;">Financing Activities</td></tr>
-      <tr><td>New loans / liabilities drawn</td><td style="text-align:right;">${fmt(cf.liabilityDraws)}</td></tr>
+      <tr><td>New loans / liabilities drawn (received into Bank &amp; Cash)</td><td style="text-align:right;">${fmt(cf.liabilityDraws)}</td></tr>
+      ${cf.liabilitiesRecordedNonCash ? `<tr><td style="color:var(--muted);font-size:.8rem;">Loans / liabilities recorded this period (booked against opening balance equity — not a cash movement)</td><td style="text-align:right;color:var(--muted);font-size:.8rem;">${fmt(cf.liabilitiesRecordedNonCash)}</td></tr>` : ''}
       ${cf.liabilityPrincipalRepaid ? `<tr><td>Loan principal repaid</td><td style="text-align:right;">(${fmt(cf.liabilityPrincipalRepaid)})</td></tr>` : ''}
       <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Net cash from financing activities</td><td style="text-align:right;" class="${cf.netFinancing<0?'negative':'positive'}">${fmt(cf.netFinancing)}</td></tr>
 
@@ -6412,7 +6477,7 @@ function renderCF(cf){
     </tbody></table>
   </div>
   ${cf.reconciles ? '' : `<div class="alert-banner due">Note: this statement's derived closing cash (${fmt(cf.closingCashDerived)}) doesn't quite match the balance sheet's cash figure (${fmt(cf.closingCashActual)}) as of ${cf.end} — usually because some entries or asset/liability dates fall outside how this method attributes cash. Treat the balance sheet as the source of truth for the cash balance.</div>`}
-  <p style="color:var(--muted);font-size:.8rem;">Direct method — cash actually received and paid during ${cf.start} to ${cf.end}, drawn from Revenue/Expense entries, invoice &amp; supplier-invoice payments, paid payroll, asset purchase dates, and liability start dates.</p>
+  <p style="color:var(--muted);font-size:.8rem;">Direct method — every figure is a Bank &amp; Cash posting in the general ledger between ${cf.start} and ${cf.end}, so it always agrees with the Balance Sheet cash figure.</p>
   `;
 }
 function computeAssetRegister(start, end){
@@ -6548,9 +6613,10 @@ function computeBudgetVsActual(start, end){
   const inRange = e => e.entry_date >= start && e.entry_date <= end;
   const months = monthsInPeriod(start, end);
   return state.budgets.map(b=>{
-    const actual = state.entries
-      .filter(e=>e.type===b.type && inRange(e) && (e.tags||[]).includes(b.tag))
-      .reduce((s,e)=>s+Number(e.amount),0);
+    // Same basis as the ledger P&L: net of VAT, journal-created entries excluded.
+    const actual = round2(state.entries
+      .filter(e=>e.type===b.type && inRange(e) && (e.tags||[]).includes(b.tag) && !(e.tags||[]).includes('manual-journal'))
+      .reduce((s,e)=>s+ledgerSplitVat(e.amount, e.vat_applicable).net,0));
     const budgeted = Number(b.monthly_amount) * months;
     const pct = budgeted ? actual/budgeted : null;
     return {id:b.id, tag:b.tag, type:b.type, monthlyAmount:Number(b.monthly_amount), budgeted, actual, pct, months};
@@ -6587,7 +6653,7 @@ function renderBudget(rows, start, end){
       </div>`;
     }).join('') : `<div class="empty">No budget lines yet. ${canEdit?'Add one above.':'Ask management to set one up.'}</div>`}
   </div>
-  <p style="color:var(--muted);font-size:.8rem;">Budgeted amounts are each line's monthly figure × ${monthsInPeriod(start,end)} month(s) in the selected period. Actuals are Revenue/Expense entries in that period tagged with the matching tag.</p>
+  <p style="color:var(--muted);font-size:.8rem;">Budgeted amounts are each line's monthly figure × ${monthsInPeriod(start,end)} month(s) in the selected period. Actuals are Revenue/Expense entries in that period tagged with the matching tag, net of VAT (the same basis as the Profit &amp; Loss).</p>
   `;
 }
 function renderFinancials(){
