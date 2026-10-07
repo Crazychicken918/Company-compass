@@ -357,8 +357,10 @@ const RETIREMENT_DEDUCTION_RATE = 0.275;  // 27.5% of remuneration/taxable incom
 const RETIREMENT_DEDUCTION_ANNUAL_CAP = 430000; // per 2026 Budget, effective 1 March 2026
 // Foreign-currency invoicing/credit notes: line items are entered in the selected currency;
 // the exchange rate converts the document total to ZAR for revenue recognition, VAT, and every
-// other report, which all stay Rand-only. Payments received are always recorded in ZAR.
-const CURRENCIES = ['ZAR','USD','GBP','EUR'];
+// other report, which all stay Rand-only. Payments record the ZAR actually banked plus the foreign
+// amount they settle; the difference to the document rate is a realised FX gain/loss (Wave 46), and
+// open foreign balances are revalued at the closing rates kept in cc_fx_rates (unrealised, auto-reversing).
+const CURRENCIES = ['ZAR','USD','GBP','EUR','AUD','CAD','CHF','CNY','JPY'];
 const TRAVEL_ALLOWANCE_TAXABLE_PORTION = 0.8; // SARS default inclusion rate (no employer business-use certificate)
 // If the employer is satisfied, from logbook evidence, that at least 80% of a vehicle's use is for
 // business, only 20% of the travel allowance need be withheld on instead of the 80% default
@@ -821,6 +823,9 @@ let state = {
   stockItems: [],   // cc_stock_items
   provisionalTax: [],     // cc_provisional_tax rows (company income tax, 2 periods/year)
   emp201Submissions: [],  // cc_emp201_submissions rows (monthly PAYE/UIF/SDL tracking)
+  fxRates: [],            // cc_fx_rates rows (closing rates per date/currency, 1 unit -> ZAR)
+  taxAdjustments: [],     // cc_tax_adjustments rows (company tax computation add-backs / deductions / assessed loss)
+  afsFYOffset: 0,         // 0 = current financial year, for the Annual Financial Statements tab
   vatPayments: [],        // cc_vat_payments rows (payments to / refunds from SARS; refunds stored negative)
   invoiceWriteoffs: [],   // cc_invoice_writeoffs rows (bad debts written off)
   coidaReturns: [],       // cc_coida_returns rows (annual Return of Earnings tracking)
@@ -1211,7 +1216,7 @@ async function refreshAll(){
   state.leaveEntries = leaveEntriesRes.data || [];
   state.taskNotes = taskNotesRes.data || [];
   state.attachments = attachmentsRes.data || [];
-  const [auditLogRes, bankTxRes, stockRes, quotesRes, provTaxRes, emp201Res, coidaRes, liabilityPaymentsRes, vatPaymentsRes, writeoffsRes] = await Promise.all([
+  const [auditLogRes, bankTxRes, stockRes, quotesRes, provTaxRes, emp201Res, coidaRes, liabilityPaymentsRes, vatPaymentsRes, writeoffsRes, taxAdjRes, fxRatesRes] = await Promise.all([
     sb.from('cc_audit_log').select('*').eq('company_id', cid).order('created_at', {ascending:false}).limit(300),
     sb.from('cc_bank_transactions').select('*').eq('company_id', cid).order('tx_date', {ascending:false}),
     sb.from('cc_stock_items').select('*').eq('company_id', cid).order('name', {ascending:true}),
@@ -1221,8 +1226,12 @@ async function refreshAll(){
     sb.from('cc_coida_returns').select('*').eq('company_id', cid),
     sb.from('cc_liability_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false}),
     sb.from('cc_vat_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false}),
-    sb.from('cc_invoice_writeoffs').select('*').eq('company_id', cid).order('write_off_date', {ascending:false})
+    sb.from('cc_invoice_writeoffs').select('*').eq('company_id', cid).order('write_off_date', {ascending:false}),
+    sb.from('cc_tax_adjustments').select('*').eq('company_id', cid).order('created_at', {ascending:true}),
+    sb.from('cc_fx_rates').select('*').eq('company_id', cid).order('rate_date', {ascending:false})
   ]);
+  state.taxAdjustments = taxAdjRes.data || [];
+  state.fxRates = fxRatesRes.data || [];
   state.vatPayments = vatPaymentsRes.data || [];
   state.invoiceWriteoffs = writeoffsRes.data || [];
   state.auditLog = auditLogRes.data || [];
@@ -1584,6 +1593,31 @@ function isDuplicateBankRow(row){
 // Invoice (money in) or Supplier Invoice (money out) whose remaining balance matches the bank
 // line, issued within the same 10-day window. Matching one of the latter also books a payment —
 // see matchBankTransaction().
+// Foreign-currency invoices/bills in the bank feed: the bank line is in Rand but the document is in
+// USD/EUR/…, so the Rand amount rarely equals the document's Rand balance (the rate has moved).
+// Foreign documents are suggested when the bank amount is within 25% of the balance, and matching one
+// asks how much of the foreign amount the line settles so the FX gain/loss is recorded properly.
+function foreignOpenFor(kind, doc){
+  const rate = fxDocRate(doc);
+  if(kind === 'invoice'){
+    const settled = (state.invoicePayments||[]).filter(p=>p.invoice_id===doc.id).reduce((a,p)=>a+settledForeign(p, doc), 0);
+    return Math.max(0, round2(docTotal((state.invoiceItems||{})[doc.id]) - settled - invoiceWrittenOff(doc.id) / rate));
+  }
+  const settled = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===doc.id).reduce((a,p)=>a+settledForeign(p, doc), 0);
+  return Math.max(0, round2(docTotal((state.supplierInvoiceItems||{})[doc.id]) - settled));
+}
+function bankAmountMatchesDoc(doc, balance, absAmt){
+  if(isForeignDoc(doc)) return balance > 0 && absAmt >= balance * 0.75 && absAmt <= balance * 1.25;
+  return Math.abs(balance - absAmt) <= 0.01;
+}
+// Best guess of the foreign amount a Rand bank line settles: the whole open balance when the Rand value
+// is close to it, otherwise the Rand amount at the latest known rate (capped at the open balance).
+function guessForeignSettled(doc, openForeign, zarAmount, date){
+  const known = fxRateOn(doc.currency, date);
+  const rate = known ? known.rate : fxDocRate(doc);
+  if(openForeign > 0 && Math.abs(zarAmount - openForeign * rate) <= zarAmount * 0.15) return round2(openForeign);
+  return round2(Math.min(openForeign || Infinity, zarAmount / rate));
+}
 function suggestedMatchesFor(bankTx){
   const absAmt = Math.abs(Number(bankTx.amount));
   const isIn = Number(bankTx.amount) >= 0;
@@ -1602,11 +1636,11 @@ function suggestedMatchesFor(bankTx){
   }).map(e=>({type: e.type, id: e.id, date: e.entry_date, description: e.description, amount: Number(e.amount)}));
   const docMatches = isIn
     ? outstandingInvoices()
-        .filter(x=>Math.abs(x.balance - absAmt) <= 0.01 && !isEntryAlreadyMatched(x.inv.id, 'invoice') && withinWindow(x.inv.issue_date))
-        .map(x=>({type:'invoice', id:x.inv.id, date:x.inv.issue_date, description:`Invoice ${x.inv.invoice_number} — ${clientName(x.inv.client_id)}`, amount:x.balance}))
+        .filter(x=>bankAmountMatchesDoc(x.inv, x.balance, absAmt) && !isEntryAlreadyMatched(x.inv.id, 'invoice') && withinWindow(x.inv.issue_date))
+        .map(x=>({type:'invoice', id:x.inv.id, date:x.inv.issue_date, description:`Invoice ${x.inv.invoice_number} — ${clientName(x.inv.client_id)}${isForeignDoc(x.inv)?' ('+x.inv.currency+')':''}`, amount:x.balance}))
     : outstandingSupplierInvoices()
-        .filter(x=>Math.abs(x.balance - absAmt) <= 0.01 && !isEntryAlreadyMatched(x.bill.id, 'supplier_invoice') && withinWindow(x.bill.issue_date))
-        .map(x=>({type:'supplier_invoice', id:x.bill.id, date:x.bill.issue_date, description:`Bill ${x.bill.bill_number} — ${supplierName(x.bill.supplier_id)}`, amount:x.balance}));
+        .filter(x=>bankAmountMatchesDoc(x.bill, x.balance, absAmt) && !isEntryAlreadyMatched(x.bill.id, 'supplier_invoice') && withinWindow(x.bill.issue_date))
+        .map(x=>({type:'supplier_invoice', id:x.bill.id, date:x.bill.issue_date, description:`Bill ${x.bill.bill_number} — ${supplierName(x.bill.supplier_id)}${isForeignDoc(x.bill)?' ('+x.bill.currency+')':''}`, amount:x.balance}));
   return [...entryMatches, ...docMatches].slice(0,5);
 }
 function isEntryAlreadyMatched(entryId, type){
@@ -1620,16 +1654,26 @@ async function matchBankTransaction(txId, entryType, entryId){
   let linkedPaymentId = null;
   if(tx && (entryType === 'invoice' || entryType === 'supplier_invoice')){
     const amount = Math.abs(Number(tx.amount));
+    const doc = entryType === 'invoice' ? state.invoices.find(i=>i.id===entryId) : state.supplierInvoices.find(b=>b.id===entryId);
+    let foreignAmount = null;
+    if(doc && isForeignDoc(doc)){
+      const open = foreignOpenFor(entryType, doc);
+      const guess = guessForeignSettled(doc, open, amount, tx.tx_date);
+      const answer = prompt(`${entryType==='invoice'?'Invoice':'Bill'} ${entryType==='invoice'?doc.invoice_number:doc.bill_number} is in ${doc.currency} (booked at ${fxDocRate(doc)}, ${fmtCurrency(open, doc.currency)} still open).\nHow many ${doc.currency} does this ${fmt(amount)} bank line settle?`, String(guess));
+      if(answer === null) return;
+      foreignAmount = parseFloat(String(answer).replace(/\s/g,'').replace(',', '.'));
+      if(!(foreignAmount > 0)){ toast(`Enter the ${doc.currency} amount this line settles.`); return; }
+    }
     if(entryType === 'invoice'){
       const {data: pay, error: payErr} = await sb.from('cc_invoice_payments').insert({
-        invoice_id: entryId, company_id: state.company.id, payment_date: tx.tx_date, amount,
+        invoice_id: entryId, company_id: state.company.id, payment_date: tx.tx_date, amount, foreign_amount: foreignAmount,
         notes: 'From bank reconciliation', created_by: state.user.id
       }).select().single();
       if(payErr){ toast(payErr.message); return; }
       linkedPaymentId = pay && pay.id;
     } else {
       const {data: pay, error: payErr} = await sb.from('cc_supplier_invoice_payments').insert({
-        supplier_invoice_id: entryId, company_id: state.company.id, payment_date: tx.tx_date, amount,
+        supplier_invoice_id: entryId, company_id: state.company.id, payment_date: tx.tx_date, amount, foreign_amount: foreignAmount,
         notes: 'From bank reconciliation', created_by: state.user.id
       }).select().single();
       if(payErr){ toast(payErr.message); return; }
@@ -1700,16 +1744,16 @@ function renderFindMatchResults(tx){
   const candidates = isIn
     ? outstandingInvoices()
         .filter(x=>!isEntryAlreadyMatched(x.inv.id, 'invoice'))
-        .map(x=>({type:'invoice', id:x.inv.id, date:x.inv.issue_date, label:`Invoice ${x.inv.invoice_number} — ${clientName(x.inv.client_id)}`, balance:x.balance}))
+        .map(x=>({type:'invoice', id:x.inv.id, date:x.inv.issue_date, label:`Invoice ${x.inv.invoice_number} — ${clientName(x.inv.client_id)}`, balance:x.balance, foreign: isForeignDoc(x.inv) ? fmtCurrency(foreignOpenFor('invoice', x.inv), x.inv.currency) : ''}))
     : outstandingSupplierInvoices()
         .filter(x=>!isEntryAlreadyMatched(x.bill.id, 'supplier_invoice'))
-        .map(x=>({type:'supplier_invoice', id:x.bill.id, date:x.bill.issue_date, label:`Bill ${x.bill.bill_number} — ${supplierName(x.bill.supplier_id)}`, balance:x.balance}));
+        .map(x=>({type:'supplier_invoice', id:x.bill.id, date:x.bill.issue_date, label:`Bill ${x.bill.bill_number} — ${supplierName(x.bill.supplier_id)}`, balance:x.balance, foreign: isForeignDoc(x.bill) ? fmtCurrency(foreignOpenFor('bill', x.bill), x.bill.currency) : ''}));
   const filtered = query ? candidates.filter(c=>c.label.toLowerCase().includes(query)) : candidates;
   if(!filtered.length){
     return `<div class="empty">No outstanding ${isIn?'invoices':'bills'}${query?' match that search':''}.</div>`;
   }
   return `<table><thead><tr><th>${isIn?'Invoice':'Bill'}</th><th>Date</th><th>Balance</th><th></th></tr></thead><tbody>
-    ${filtered.map(c=>`<tr><td>${c.label}</td><td>${c.date}</td><td>${fmt(c.balance)}</td><td><button type="button" class="btn small" data-find-match-ok="${tx.id}" data-find-match-type="${c.type}" data-find-match-id="${c.id}">OK</button></td></tr>`).join('')}
+    ${filtered.map(c=>`<tr><td>${c.label}</td><td>${c.date}</td><td>${fmt(c.balance)}${c.foreign ? `<div style="font-size:.75rem;color:var(--muted);">${c.foreign} open</div>` : ''}</td><td><button type="button" class="btn small" data-find-match-ok="${tx.id}" data-find-match-type="${c.type}" data-find-match-id="${c.id}">OK</button></td></tr>`).join('')}
   </tbody></table>`;
 }
 function renderBankFeed(){
@@ -2082,6 +2126,7 @@ function render(){
 function attachDashboardHandlers(){
   attachApprovalHandlers();
   document.getElementById('dashboard-bankfeed-btn')?.addEventListener('click', ()=>goToView('bankfeed'));
+  document.getElementById('dashboard-health-btn')?.addEventListener('click', ()=>{ state.reportsTab = 'health'; goToView('reports'); });
   const months = last6MonthsRange();
   const monthPL = withLedgerMemo(()=>months.map(m=>computePL(m.start, m.end)));
   const revenueData = monthPL.map(pl=>pl.revenue);
@@ -2173,6 +2218,12 @@ function vatForPeriod(from, to){
 }
 
 /* ========================= DASHBOARD ========================= */
+function renderHealthBanner(){
+  if(!isAdmin()) return '';
+  let hc; try{ hc = computeHealthCheck(); }catch(e){ return ''; }
+  if(!hc.summary.fail) return '';
+  return `<div class="alert-banner overdue">⚠ Health check: ${hc.summary.fail} problem${hc.summary.fail>1?'s':''} found in the books (${hc.checks.filter(c=>c.status==='fail').map(c=>c.label).join('; ')}). <button type="button" class="btn small secondary" id="dashboard-health-btn">Review</button></div>`;
+}
 function renderDashboard(){
   const t = totalsFor();
   const v = vatFromLedger();
@@ -2188,6 +2239,7 @@ function renderDashboard(){
     ${overdueInvoices.length ? `<div class="alert-banner overdue">⚠ ${overdueInvoices.length} client invoice${overdueInvoices.length>1?'s are':' is'} past due: ${overdueInvoices.map(i=>`${i.invoice_number} (${clientName(i.client_id)}, due ${i.due_date})`).join(', ')}</div>` : ''}
     ${overdueLiabilities.length ? `<div class="alert-banner overdue">⚠ ${overdueLiabilities.length} supplier/liability payment${overdueLiabilities.length>1?'s are':' is'} past due: ${overdueLiabilities.map(l=>`${l.description} (due ${l.due_date})`).join(', ')}</div>` : ''}
     ${renderApprovalsPanel()}
+    ${renderHealthBanner()}
     ${dueSoonLiabilities.length ? `<div class="alert-banner due">⏰ ${dueSoonLiabilities.length} supplier/liability payment${dueSoonLiabilities.length>1?'s are':' is'} due within 7 days: ${dueSoonLiabilities.map(l=>`${l.description} (due ${l.due_date})`).join(', ')}</div>` : ''}
     <div class="grid">
       <div class="card" style="--accent-c:var(--c-dashboard);"><h3>Predicted Balance</h3><div class="value ${t.predictedBalance<0?'negative':'positive'}">${fmt(t.predictedBalance)}</div><div class="sub">Bank &amp; Cash per the ledger</div></div>
@@ -2821,6 +2873,7 @@ const DEFAULT_CHART = [
   {key:'SARS', code:'2310', name:'SARS Payable — PAYE, UIF & SDL', type:'liability'},
   {key:'PAYDED', code:'2320', name:'Payroll Deductions Payable (pension, medical, other)', type:'liability'},
   {key:'NCL', code:'2200', name:'Non-Current Liabilities (Loans)', type:'liability'},
+  {key:'TAXPAY', code:'2330', name:'Income Tax Payable / (Prepaid)', type:'liability'},
   {key:'VAT', code:'2300', name:'VAT Control', type:'liability'},
   {key:'OBE', code:'3000', name:'Opening Balance Equity', type:'equity'},
   {key:'CAPITAL', code:'3100', name:"Share Capital / Owner's Capital", type:'equity'},
@@ -2834,6 +2887,8 @@ const DEFAULT_CHART = [
   {key:'INT', code:'6300', name:'Interest Expense', type:'expense'},
   {key:'BADDEBT', code:'6400', name:'Bad Debts Written Off', type:'expense'},
   {key:'DISP', code:'6500', name:'Loss / (Profit) on Disposal of Assets', type:'expense'},
+  {key:'FX', code:'6600', name:'Foreign Exchange (Gains) / Losses', type:'expense'},
+  {key:'TAXEXP', code:'7000', name:'Income Tax Expense', type:'expense'},
 ];
 const CHART_TYPE_LABELS = {asset:'Assets', liability:'Liabilities', equity:'Equity', revenue:'Revenue', expense:'Expenses'};
 
@@ -2873,6 +2928,45 @@ function payslipSdl(p, applicable){
 }
 
 // Returns an array of balanced journals: {date, source, memo, seq, lines:[{key, debit, credit}]}.
+// Open foreign-currency receivables (AR) and payables (AP) as at `asOf`, in the document currency.
+function fxPositionsAsOf(asOf){
+  const out = [];
+  (state.invoices||[]).filter(i=>isForeignDoc(i) && i.approval_status==='approved' && i.issue_date <= asOf).forEach(i=>{
+    const items = (state.invoiceItems||{})[i.id] || [];
+    const rate = fxDocRate(i);
+    const settled = (state.invoicePayments||[]).filter(p=>p.invoice_id===i.id && p.payment_date <= asOf).reduce((a,p)=>a+settledForeign(p,i),0);
+    const wo = (state.invoiceWriteoffs||[]).filter(w=>w.invoice_id===i.id && w.write_off_date <= asOf).reduce((a,w)=>a+Number(w.amount||0),0) / rate;
+    const open = docTotal(items) - settled - wo;
+    if(open > 0.005) out.push({kind:'AR', doc:i, number:i.invoice_number, party:clientName(i.client_id), currency:i.currency, docRate:rate, open});
+  });
+  (state.supplierInvoices||[]).filter(b=>isForeignDoc(b) && b.approval_status==='approved' && b.issue_date <= asOf).forEach(b=>{
+    const items = (state.supplierInvoiceItems||{})[b.id] || [];
+    const rate = fxDocRate(b);
+    const settled = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===b.id && p.payment_date <= asOf).reduce((a,p)=>a+settledForeign(p,b),0);
+    const open = docTotal(items) - settled;
+    if(open > 0.005) out.push({kind:'AP', doc:b, number:b.bill_number, party:supplierName(b.supplier_id), currency:b.currency, docRate:rate, open});
+  });
+  return out;
+}
+// One revaluation journal per closing-rate date: [{date, memo, lines}] (lines are [key, signed] pairs).
+function fxRevaluationJournals(){
+  const dates = {};
+  (state.fxRates||[]).forEach(r=>{ (dates[r.rate_date] = dates[r.rate_date] || {})[r.currency] = Number(r.rate); });
+  const out = [];
+  Object.keys(dates).sort().forEach(d=>{
+    let ar = 0, ap = 0;
+    fxPositionsAsOf(d).forEach(pos=>{
+      const rate = dates[d][pos.currency];
+      if(!(rate > 0)) return;
+      const adj = pos.open * (rate - pos.docRate);
+      if(pos.kind === 'AR') ar += adj; else ap += adj;
+    });
+    ar = round2(ar); ap = round2(ap);
+    if(Math.abs(ar) < 0.005 && Math.abs(ap) < 0.005) return;
+    out.push({date:d, memo:`Unrealised FX revaluation at ${d}`, lines:[['AR', ar],['AP', -ap],['FX', -ar + ap]]});
+  });
+  return out;
+}
 function buildLedger(){
   const journals = [];
   // post(date, source, memo, [[accountKey, signedAmount], ...]) — positive = debit, negative = credit.
@@ -2938,7 +3032,9 @@ function buildLedger(){
   // Customer invoice payments & credit notes.
   (state.invoicePayments||[]).forEach(p=>{
     const inv = (state.invoices||[]).find(i=>i.id===p.invoice_id);
-    post(p.payment_date, 'Invoice Payment', `Payment received${inv ? ' — '+inv.invoice_number : ''}`, [['BANK', Number(p.amount)||0],['AR', -(Number(p.amount)||0)]], p.id);
+    const amt = Number(p.amount)||0, cleared = paymentCleared(p, inv);
+    // Realised FX: ZAR banked less what the settled foreign amount was booked at (gain = credit).
+    post(p.payment_date, 'Invoice Payment', `Payment received${inv ? ' — '+inv.invoice_number : ''}`, [['BANK', amt],['AR', -cleared],['FX', -(amt - cleared)]], p.id);
   });
   (state.creditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').forEach(cn=>{
     const items = (state.creditNoteItems||{})[cn.id] || [];
@@ -2949,12 +3045,21 @@ function buildLedger(){
   // Supplier invoice payments & supplier credit notes.
   (state.supplierInvoicePayments||[]).forEach(p=>{
     const bill = (state.supplierInvoices||[]).find(b=>b.id===p.supplier_invoice_id);
-    post(p.payment_date, 'Supplier Payment', `Payment made${bill ? ' — '+bill.bill_number : ''}`, [['AP', Number(p.amount)||0],['BANK', -(Number(p.amount)||0)]], p.id);
+    const amt = Number(p.amount)||0, cleared = paymentCleared(p, bill);
+    post(p.payment_date, 'Supplier Payment', `Payment made${bill ? ' — '+bill.bill_number : ''}`, [['AP', cleared],['BANK', -amt],['FX', -(cleared - amt)]], p.id);
   });
   (state.supplierCreditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').forEach(cn=>{
     const items = (state.supplierCreditNoteItems||{})[cn.id] || [];
     const {gross, net, vat} = ledgerSplitVat(docTotal(items), items.some(it=>it.vat_applicable));
     post(cn.issue_date, 'Supplier Credit Note', `Supplier credit note ${cn.credit_note_number}`, [['AP', gross],['OPEX', -net],['VAT', -vat]]);
+  });
+
+  // Unrealised FX: open foreign receivables/payables are revalued at each closing rate on file and the
+  // adjustment is reversed the next day, so it never compounds and settlement is always against the
+  // original document rate (the realised difference is posted above).
+  fxRevaluationJournals().forEach(j=>{
+    post(j.date, 'FX Revaluation', j.memo, j.lines);
+    post(shiftIsoDays(j.date, 1), 'FX Revaluation', 'Reversal — ' + j.memo, j.lines.map(([k,v])=>[k, -v]));
   });
 
   // Payroll actually paid. The full cost is expensed (gross pay + employer UIF + SDL); net pay leaves
@@ -3026,6 +3131,12 @@ function buildLedger(){
     const gross = round2(Number(w.amount)||0);
     const vat = w.vat_adjust ? round2(gross - gross/(1+VAT_RATE)) : 0;
     post(w.write_off_date, 'Bad Debt', `Bad debt written off${inv ? ' — '+inv.invoice_number : ''}`, [['BADDEBT', gross - vat],['VAT', vat],['AR', -gross]], w.id);
+  });
+
+  // Provisional tax (IRP6) payments marked as paid: reduce the bank and build up Income Tax Payable / (Prepaid).
+  (state.provisionalTax||[]).filter(r=>r.paid && Number(r.estimated_tax) > 0).forEach(r=>{
+    post(r.paid_date || r.due_date || LEDGER_EPOCH, 'Provisional Tax Payment', `Provisional tax paid — period ${r.period_number}, financial year ending ${r.tax_year_end_year}`,
+      [['TAXPAY', Number(r.estimated_tax)],['BANK', -Number(r.estimated_tax)]]);
   });
 
   // Payments to SARS (positive) and refunds from SARS (negative) clear the VAT Control account.
@@ -3158,7 +3269,7 @@ function computeLedgerVsBS(end){
   const bal = k => { const r = t[k]; return r ? r.debit - r.credit : 0; };
   const vatNet = bal('VAT');
   const assetKeys = ['BANK','AR','INV','OCA','FA_COST','FA_DEP'];
-  const liabKeys = ['AP','OCL','SARS','PAYDED','NCL'];
+  const liabKeys = ['AP','OCL','SARS','PAYDED','TAXPAY','NCL'];
   const ledgerAssets = assetKeys.reduce((s,k)=>s+bal(k),0) + Math.max(0, vatNet);
   const ledgerLiabs = liabKeys.reduce((s,k)=>s-bal(k),0) + Math.max(0, -vatNet);
   const bs = computeBS(end);
@@ -3611,13 +3722,13 @@ function nextSupplierCreditNoteNumber(){
 // Balance Sheet exclude this entry from cash and use actual
 // cc_supplier_invoice_payments instead (see isNonCashEntry / computeCashFlow / computeBS).
 async function recognizeSupplierInvoiceExpense(bill, items){
-  const total = docTotal(items);
+  const total = docTotalZAR(bill, items);
   if(total <= 0) return;
   const anyVat = (items||[]).some(it=>it.vat_applicable);
   await sb.from('cc_entries').insert({
     company_id: state.company.id,
     type: 'expense',
-    description: `Bill ${bill.bill_number} — ${supplierName(bill.supplier_id)}`,
+    description: `Bill ${bill.bill_number} — ${supplierName(bill.supplier_id)}${isForeignDoc(bill) ? ` (${fmtCurrency(docTotal(items), bill.currency)} @ ${fxDocRate(bill)})` : ''}`,
     amount: total,
     entry_date: bill.issue_date,
     tags: ['supplier_invoice'],
@@ -3628,10 +3739,70 @@ async function recognizeSupplierInvoiceExpense(bill, items){
   });
   await applyStockPurchaseMovements(items);
 }
+// ---- Foreign exchange (Wave 46) ----
+// A foreign document (invoice or bill) carries the rate it was booked at. A payment records the ZAR
+// actually banked (amount) and, for a foreign document, the foreign amount it settles (foreign_amount).
+// What the payment clears in the books is foreign_amount x document rate; the difference to the ZAR
+// banked is the realised FX gain/loss. Payments without a foreign_amount (older rows, bank matches)
+// clear at face value, so nothing changes for them.
+function isForeignDoc(doc){ return !!(doc && doc.currency && doc.currency !== 'ZAR'); }
+function fxDocRate(doc){ return isForeignDoc(doc) ? (Number(doc.exchange_rate)||1) : 1; }
+function hasForeignAmount(p){ return !!p && p.foreign_amount !== null && p.foreign_amount !== undefined && p.foreign_amount !== ''; }
+function settledForeign(p, doc){
+  if(hasForeignAmount(p)) return Number(p.foreign_amount)||0;
+  return (Number(p.amount)||0) / fxDocRate(doc);
+}
+function paymentCleared(p, doc){
+  if(isForeignDoc(doc) && hasForeignAmount(p)) return round2((Number(p.foreign_amount)||0) * fxDocRate(doc));
+  return Number(p.amount)||0;
+}
+function fxRateOn(currency, date){
+  // Latest stored closing rate on or before `date` (or the latest of all when no date given).
+  const rows = (state.fxRates||[]).filter(r=>r.currency===currency && (!date || r.rate_date <= date));
+  if(!rows.length) return null;
+  rows.sort((a,b)=> a.rate_date < b.rate_date ? 1 : a.rate_date > b.rate_date ? -1 : 0);
+  return {rate: Number(rows[0].rate), date: rows[0].rate_date};
+}
+// Free auto-suggest from the European Central Bank reference rates (Frankfurter). Always optional:
+// returns null on any failure so the user simply types the rate in.
+async function fetchFxRate(currency, date){
+  if(!currency || currency === 'ZAR') return 1;
+  try{
+    const url = `https://api.frankfurter.app/${date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : 'latest'}?from=${encodeURIComponent(currency)}&to=ZAR`;
+    const res = await fetch(url);
+    if(!res.ok) return null;
+    const j = await res.json();
+    const r = j && j.rates && Number(j.rates.ZAR);
+    return r > 0 ? r : null;
+  }catch(e){ return null; }
+}
+// Shared by the invoice and bill payment forms: live "FX gain/(loss)" preview and a button that fills
+// the ZAR amount from today's suggested rate.
+function wireFxPaymentPreview(o){
+  const fEl = document.getElementById(o.foreignId), aEl = document.getElementById(o.amountId), nEl = document.getElementById(o.noteId);
+  if(!fEl || !aEl || !nEl) return;
+  const update = ()=>{
+    const f = parseFloat(fEl.value) || 0, a = parseFloat(aEl.value) || 0;
+    if(f <= 0){ nEl.textContent = ''; return; }
+    const cleared = round2(f * o.docRate);
+    const diff = o.kind === 'AR' ? round2(a - cleared) : round2(cleared - a);
+    nEl.textContent = `Booked at ${o.docRate} = ${fmt(cleared)}. ` + (Math.abs(diff) < 0.005 ? 'No FX difference.' : (diff > 0 ? `FX gain of ${fmt(diff)}` : `FX loss of ${fmt(-diff)}`) + ' will be recorded.');
+  };
+  fEl.addEventListener('input', update); aEl.addEventListener('input', update);
+  document.getElementById(o.btnId)?.addEventListener('click', async ()=>{
+    const date = document.getElementById(o.dateId)?.value;
+    const known = fxRateOn(o.currency, date);
+    const r = (await fetchFxRate(o.currency, date)) || (known && known.rate);
+    if(!r){ toast('No rate available — type the ZAR amount in.'); return; }
+    aEl.value = round2((parseFloat(fEl.value)||0) * r).toFixed(2);
+    update();
+  });
+  update();
+}
 function billBalance(bill){
-  const total = docTotal(state.supplierInvoiceItems[bill.id]);
-  const paid = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===bill.id).reduce((s,p)=>s+Number(p.amount),0);
-  return {total, paid, balance: Math.max(0, total - paid)};
+  const total = docTotalZAR(bill, state.supplierInvoiceItems[bill.id]);
+  const paid = round2((state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===bill.id).reduce((s,p)=>s+paymentCleared(p, bill),0));
+  return {total, paid, balance: Math.max(0, round2(total - paid))};
 }
 // Customer-invoice equivalent of billBalance() — in ZAR, via docTotalZAR(), so a foreign-currency
 // invoice's balance is on the same footing as a ZAR bank statement line.
@@ -3640,7 +3811,7 @@ function invoiceWrittenOff(invId){
 }
 function invoiceBalance(inv){
   const total = docTotalZAR(inv, state.invoiceItems[inv.id]);
-  const paid = (state.invoicePayments||[]).filter(p=>p.invoice_id===inv.id).reduce((s,p)=>s+Number(p.amount),0);
+  const paid = round2((state.invoicePayments||[]).filter(p=>p.invoice_id===inv.id).reduce((s,p)=>s+paymentCleared(p, inv),0));
   const writtenOff = invoiceWrittenOff(inv.id);
   return {total, paid, writtenOff, balance: Math.max(0, total - paid - writtenOff)};
 }
@@ -3767,6 +3938,10 @@ function supplierInvoiceModal(){
           <div class="field"><label>Issue date</label><input type="date" id="supplier-invoice-issue-date" required></div>
           <div class="field"><label>Due date</label><input type="date" id="supplier-invoice-due-date"></div>
         </div>
+        <div class="row">
+          <div class="field"><label>Currency</label><select id="supplier-invoice-currency">${CURRENCIES.map(c=>`<option value="${c}">${c}</option>`).join('')}</select></div>
+          <div class="field hidden" id="supplier-invoice-rate-field"><label>Exchange rate (1 unit → ZAR)</label><input type="number" step="0.0001" id="supplier-invoice-exchange-rate" value="1"><button type="button" class="btn secondary small" id="supplier-invoice-suggest-rate" style="margin-top:4px;">Suggest rate</button></div>
+        </div>
         <div class="field"><label>Category</label><select id="supplier-invoice-category">
           <option value="operating">Operating Expense</option>
           <option value="cost_of_sales">Cost of Sales (COS)</option>
@@ -3851,7 +4026,24 @@ function attachSupplierInvoiceHandlers(){
     document.getElementById('supplier-invoice-issue-date').value = new Date().toISOString().slice(0,10);
     document.getElementById('supplier-invoice-items-body').innerHTML = invoiceItemRowWithStock();
     document.getElementById('supplier-invoice-attachment-file').value = '';
+    document.getElementById('supplier-invoice-currency').value = 'ZAR';
+    document.getElementById('supplier-invoice-exchange-rate').value = '1';
+    document.getElementById('supplier-invoice-rate-field').classList.add('hidden');
     invBackdrop.classList.remove('hidden');
+  });
+  document.getElementById('supplier-invoice-currency')?.addEventListener('change', async (e)=>{
+    const cur = e.target.value;
+    document.getElementById('supplier-invoice-rate-field').classList.toggle('hidden', cur==='ZAR');
+    if(cur !== 'ZAR'){
+      const known = fxRateOn(cur, document.getElementById('supplier-invoice-issue-date').value);
+      if(known) document.getElementById('supplier-invoice-exchange-rate').value = known.rate;
+    } else document.getElementById('supplier-invoice-exchange-rate').value = '1';
+  });
+  document.getElementById('supplier-invoice-suggest-rate')?.addEventListener('click', async ()=>{
+    const cur = document.getElementById('supplier-invoice-currency').value;
+    const r = await fetchFxRate(cur, document.getElementById('supplier-invoice-issue-date').value);
+    if(r){ document.getElementById('supplier-invoice-exchange-rate').value = r; toast(`Suggested ${cur} rate: ${r} — check it before saving.`); }
+    else toast('Could not fetch a rate — please type it in.');
   });
   document.getElementById('supplier-invoice-cancel')?.addEventListener('click', ()=>invBackdrop.classList.add('hidden'));
   document.getElementById('supplier-invoice-modal-close')?.addEventListener('click', ()=>invBackdrop.classList.add('hidden'));
@@ -3875,6 +4067,8 @@ function attachSupplierInvoiceHandlers(){
       issue_date: supplierInvoiceIssueDate,
       due_date: document.getElementById('supplier-invoice-due-date').value || null,
       expense_category: document.getElementById('supplier-invoice-category').value,
+      currency: document.getElementById('supplier-invoice-currency').value || 'ZAR',
+      exchange_rate: document.getElementById('supplier-invoice-currency').value === 'ZAR' ? 1 : (parseFloat(document.getElementById('supplier-invoice-exchange-rate').value) || 1),
       notes: document.getElementById('supplier-invoice-notes').value.trim() || null,
       created_by: state.user.id,
       approval_status: approvalStatus
@@ -3998,8 +4192,13 @@ async function openSupplierInvoiceView(billId){
   const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
   const vatTotal = items.reduce((s,it)=> s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
   const total = items.reduce((s,it)=>s+it.quantity*it.unit_price,0);
-  const totalPaid = payments.reduce((s,p)=>s+Number(p.amount),0);
-  const balance = Math.max(0, total - totalPaid);
+  const isForeign = isForeignDoc(bill);
+  const docRate = fxDocRate(bill);
+  const zarTotal = isForeign ? round2(total * docRate) : total;
+  const totalPaid = round2(payments.reduce((s,p)=>s+paymentCleared(p, bill),0));
+  const balance = Math.max(0, round2(zarTotal - totalPaid));
+  const foreignOpen = isForeign ? Math.max(0, total - payments.reduce((s,p)=>s+settledForeign(p, bill),0)) : 0;
+  const cf = v => fmtCurrency(v, bill.currency);
   const canRecordPayment = hasModule('supplier_invoices') && bill.approval_status === 'approved';
   const backdrop = document.getElementById('supplier-invoice-view-backdrop');
   document.getElementById('supplier-invoice-view-content').innerHTML = `
@@ -4008,29 +4207,34 @@ async function openSupplierInvoiceView(billId){
     <p><strong>Supplier:</strong> ${supplier ? supplier.name : '—'}${supplier && supplier.email ? ' ('+supplier.email+')' : ''}</p>
     <p style="font-size:.85rem;color:var(--muted);">Issued ${bill.issue_date}${bill.due_date?' · Due '+bill.due_date:''} · ${bill.expense_category==='cost_of_sales'?'Cost of Sales':'Operating'}</p>
     <table><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr></thead><tbody>
-      ${items.map(it=>`<tr><td>${it.description}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
+      ${items.map(it=>`<tr><td>${it.description}</td><td>${it.quantity}</td><td>${cf(it.unit_price)}</td><td>${cf(it.quantity*it.unit_price)}</td></tr>`).join('')}
     </tbody></table>
     <div style="text-align:right;margin-top:10px;font-size:.9rem;">
-      <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
-      <div>VAT (15%): ${fmt(vatTotal)}</div>
-      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmt(total)}</div>
+      <div>Subtotal (excl. VAT): ${cf(subtotal)}</div>
+      <div>VAT (15%): ${cf(vatTotal)}</div>
+      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${cf(total)}${isForeign ? ` (≈ ${fmt(zarTotal)} @ ${docRate})` : ''}</div>
       ${totalPaid ? `<div style="color:var(--accent2);">Paid: ${fmt(totalPaid)}</div><div style="font-weight:700;">Balance due: ${fmt(balance)}</div>` : ''}
     </div>
     ${bill.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${bill.notes}</p>` : ''}
     ${bill.approval_status === 'rejected' && bill.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${bill.rejection_note}</p>` : ''}
     ${bill.approval_status === 'approved' ? `
     <div class="panel" style="margin-top:14px;">
-      <h3 style="margin-top:0;">Payments made</h3>
+      <h3 style="margin-top:0;">Payments made${isForeign ? ' (in ZAR)' : ''}</h3>
       ${payments.length ? `<table class="payment-list"><thead><tr><th>Date</th><th>Amount</th><th>Notes</th>${canRecordPayment?'<th></th>':''}</tr></thead><tbody>
-        ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.amount)}</td><td>${p.notes||'—'}</td>${canRecordPayment?`<td><button class="btn small danger" data-del-supplier-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
+        ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.amount)}${isForeign && hasForeignAmount(p) ? `<div style="font-size:.75rem;color:var(--muted);">settles ${cf(p.foreign_amount)} · FX ${fmt(round2(paymentCleared(p, bill) - Number(p.amount)))}</div>` : ''}</td><td>${p.notes||'—'}</td>${canRecordPayment?`<td><button class="btn small danger" data-del-supplier-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
       ${awaitingPayments.length ? `<p style="font-size:.8rem;color:var(--muted);margin:8px 0 2px;">Not yet counted:</p>${awaitingPayments.map(p=>`<div style="font-size:.82rem;">${p.payment_date} — ${fmt(p.amount)} ${approvalPill(p)}${p.approval_status==='rejected' && p.rejection_note ? ' — '+p.rejection_note : ''}${canRecordPayment?` <button class="btn small danger" data-del-supplier-payment="${p.id}">Delete</button>`:''}</div>`).join('')}` : ''}
       ${canRecordPayment ? `<button type="button" class="btn secondary small" id="add-supplier-payment-btn" style="margin-top:10px;">+ Record Payment</button>
       <form id="supplier-payment-form" class="hidden" style="margin-top:10px;">
         <div class="row">
           <div class="field"><label>Date</label><input type="date" id="supplier-payment-date" required></div>
-          <div class="field"><label>Amount (R)</label><input type="number" step="0.01" id="supplier-payment-amount" value="${balance.toFixed(2)}" required></div>
+          <div class="field"><label>Amount paid (R)</label><input type="number" step="0.01" id="supplier-payment-amount" value="${balance.toFixed(2)}" required></div>
         </div>
+        ${isForeign ? `<div class="row">
+          <div class="field"><label>Settles (${bill.currency})</label><input type="number" step="0.01" id="supplier-payment-foreign" value="${foreignOpen.toFixed(2)}" required></div>
+          <div class="field"><label>&nbsp;</label><button type="button" class="btn secondary small" id="supplier-payment-suggest">Pay at today's rate</button></div>
+        </div>
+        <div id="supplier-payment-fx-note" style="font-size:.82rem;color:var(--muted);margin-bottom:8px;"></div>` : ''}
         <div class="field"><label>Notes (optional)</label><input type="text" id="supplier-payment-notes"></div>
         <div class="modal-actions"><button type="submit" class="btn small">Save Payment</button></div>
       </form>` : ''}
@@ -4049,15 +4253,21 @@ async function openSupplierInvoiceView(billId){
     document.getElementById('supplier-payment-date').value = new Date().toISOString().slice(0,10);
     document.getElementById('supplier-payment-form').classList.remove('hidden');
   });
+  if(isForeign) wireFxPaymentPreview({kind:'AP', currency: bill.currency, docRate, foreignId:'supplier-payment-foreign', amountId:'supplier-payment-amount', noteId:'supplier-payment-fx-note', btnId:'supplier-payment-suggest', dateId:'supplier-payment-date'});
   document.getElementById('supplier-payment-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
     const amount = parseFloat(document.getElementById('supplier-payment-amount').value) || 0;
     if(amount <= 0){ toast('Enter a payment amount.'); return; }
+    const foreignAmount = isForeign ? (parseFloat(document.getElementById('supplier-payment-foreign').value) || 0) : null;
+    if(isForeign && foreignAmount <= 0){ toast(`Enter the ${bill.currency} amount this payment settles.`); return; }
+    const payDate = document.getElementById('supplier-payment-date').value;
+    if(isPeriodLocked(payDate)){ toast(periodLockMessage()); return; }
     const {error} = await sb.from('cc_supplier_invoice_payments').insert({
       supplier_invoice_id: bill.id,
       company_id: state.company.id,
-      payment_date: document.getElementById('supplier-payment-date').value,
+      payment_date: payDate,
       amount,
+      foreign_amount: foreignAmount,
       notes: document.getElementById('supplier-payment-notes').value.trim() || null,
       created_by: state.user.id,
       approval_status: approvalStatusForNew()
@@ -4411,7 +4621,7 @@ function openClientStatementView(clientId, fromDate, toDate){
   const clientInvoiceIds = new Set(state.invoices.filter(i=>i.client_id===clientId).map(i=>i.id));
   state.invoicePayments.filter(p=>clientInvoiceIds.has(p.invoice_id) && inRange(p.payment_date)).forEach(p=>{
     const inv = state.invoices.find(i=>i.id===p.invoice_id);
-    lines.push({date:p.payment_date, label:`Payment received (${inv?inv.invoice_number:'—'})`, amount: -Number(p.amount)});
+    lines.push({date:p.payment_date, label:`Payment received (${inv?inv.invoice_number:'—'})`, amount: -paymentCleared(p, inv)});
   });
   (state.invoiceWriteoffs||[]).filter(w=>clientInvoiceIds.has(w.invoice_id) && inRange(w.write_off_date)).forEach(w=>{
     const inv = state.invoices.find(i=>i.id===w.invoice_id);
@@ -4623,7 +4833,7 @@ function invoiceModal(){
         </div>
         <div class="row">
           <div class="field"><label>Currency</label><select id="invoice-currency">${CURRENCIES.map(c=>`<option value="${c}">${c}</option>`).join('')}</select></div>
-          <div class="field hidden" id="invoice-exchange-rate-field"><label>Exchange rate (1 unit → ZAR)</label><input type="number" step="0.0001" id="invoice-exchange-rate" value="1"></div>
+          <div class="field hidden" id="invoice-exchange-rate-field"><label>Exchange rate (1 unit → ZAR)</label><input type="number" step="0.0001" id="invoice-exchange-rate" value="1"><button type="button" class="btn secondary small" id="invoice-suggest-rate" style="margin-top:4px;">Suggest rate</button></div>
         </div>
         <div class="field"><label><input type="checkbox" id="invoice-recurring" style="width:auto;"> Recurring invoice</label></div>
         <div class="row hidden" id="invoice-recurrence-fields">
@@ -4722,6 +4932,16 @@ function attachInvoiceHandlers(){
   });
   document.getElementById('invoice-currency')?.addEventListener('change', (e)=>{
     document.getElementById('invoice-exchange-rate-field').classList.toggle('hidden', e.target.value==='ZAR');
+    if(e.target.value !== 'ZAR'){
+      const known = fxRateOn(e.target.value, document.getElementById('invoice-issue-date').value);
+      if(known) document.getElementById('invoice-exchange-rate').value = known.rate;
+    }
+  });
+  document.getElementById('invoice-suggest-rate')?.addEventListener('click', async ()=>{
+    const cur = document.getElementById('invoice-currency').value;
+    const r = await fetchFxRate(cur, document.getElementById('invoice-issue-date').value);
+    if(r){ document.getElementById('invoice-exchange-rate').value = r; toast(`Suggested ${cur} rate: ${r} — check it before saving.`); }
+    else toast('Could not fetch a rate — please type it in.');
   });
   document.getElementById('invoice-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('invoice-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
@@ -4818,6 +5038,31 @@ function attachInvoiceHandlers(){
   });
 }
 
+function escHtml(v){ return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+// Self-contained HTML invoice used as the email body (inline styles only — mail clients strip the rest).
+function invoiceEmailHtml(inv, items, client, message, t){
+  const cur = inv.currency;
+  const rows = (items||[]).map(it=>`<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;">${escHtml(it.description)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${escHtml(it.quantity)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtCurrency(it.unit_price, cur)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtCurrency(it.quantity*it.unit_price, cur)}</td></tr>`).join('');
+  const co = state.company;
+  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;color:#222;">
+  <div style="white-space:pre-line;margin-bottom:18px;">${escHtml(message)}</div>
+  <div style="border:1px solid #ddd;border-radius:8px;padding:18px;">
+    <div style="font-size:20px;font-weight:700;">${escHtml(co.name)}</div>
+    ${weAreVatRegistered() && co.vat_number ? `<div style="color:#666;font-size:13px;">VAT ${escHtml(co.vat_number)}</div>` : ''}
+    ${co.address ? `<div style="color:#666;font-size:13px;white-space:pre-line;">${escHtml(co.address)}</div>` : ''}
+    <h2 style="margin:16px 0 4px;">Invoice ${escHtml(inv.invoice_number)}</h2>
+    <div style="font-size:13px;color:#666;">Issued ${escHtml(inv.issue_date)}${inv.due_date ? ' · Due ' + escHtml(inv.due_date) : ''}</div>
+    <div style="margin:10px 0;"><strong>Bill to:</strong> ${escHtml(client ? client.name : '')}</div>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;"><thead><tr style="background:#f5f5f5;"><th style="padding:6px 8px;text-align:left;">Description</th><th style="padding:6px 8px;text-align:right;">Qty</th><th style="padding:6px 8px;text-align:right;">Unit price</th><th style="padding:6px 8px;text-align:right;">Amount</th></tr></thead><tbody>${rows}</tbody></table>
+    <div style="text-align:right;margin-top:12px;font-size:14px;">
+      <div>Subtotal (excl. VAT): ${fmtCurrency(t.subtotal, cur)}</div>
+      ${weAreVatRegistered() ? `<div>VAT (15%): ${fmtCurrency(t.vatTotal, cur)}</div>` : ''}
+      <div style="font-size:17px;font-weight:700;margin-top:4px;">Total due: ${fmtCurrency(t.total, cur)}</div>
+      ${t.isForeign ? `<div style="color:#666;font-size:12px;">Invoice currency ${escHtml(cur)} (booked at ${escHtml(inv.exchange_rate)} = ${fmt(t.zarTotal)})</div>` : ''}
+    </div>
+    ${inv.notes ? `<div style="margin-top:14px;font-size:13px;color:#555;white-space:pre-line;">${escHtml(inv.notes)}</div>` : ''}
+  </div></div>`;
+}
 async function openInvoiceView(invoiceId){
   const inv = state.invoices.find(i=>i.id===invoiceId);
   const {data: items} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', invoiceId);
@@ -4831,10 +5076,12 @@ async function openInvoiceView(invoiceId){
   const total = items.reduce((s,it)=>s+it.quantity*it.unit_price,0);
   const isForeign = inv.currency && inv.currency !== 'ZAR';
   const zarTotal = isForeign ? round2(total * (Number(inv.exchange_rate)||1)) : total;
-  const totalPaid = payments.reduce((s,p)=>s+Number(p.amount),0);
+  const totalPaid = round2(payments.reduce((s,p)=>s+paymentCleared(p, inv),0));
+  const docRate = fxDocRate(inv);
   const writeoffs = (state.invoiceWriteoffs||[]).filter(w=>w.invoice_id===inv.id);
   const writtenOff = round2(writeoffs.reduce((s,w)=>s+Number(w.amount||0),0));
-  const balance = Math.max(0, zarTotal - totalPaid - writtenOff);
+  const balance = Math.max(0, round2(zarTotal - totalPaid - writtenOff));
+  const foreignOpen = isForeign ? Math.max(0, total - payments.reduce((s,p)=>s+settledForeign(p, inv),0) - writtenOff / docRate) : 0;
   const canWriteOff = hasModule('invoices') && inv.approval_status === 'approved';
   const canRecordPayment = hasModule('invoices') && inv.approval_status === 'approved';
   const mailtoSubject = encodeURIComponent(`Invoice ${inv.invoice_number} from ${state.company.name}`);
@@ -4863,7 +5110,7 @@ async function openInvoiceView(invoiceId){
     <div class="panel" style="margin-top:14px;">
       <h3 style="margin-top:0;">Payments received${isForeign ? ' (in ZAR)' : ''}</h3>
       ${payments.length ? `<table class="payment-list"><thead><tr><th>Date</th><th>Amount</th><th>Notes</th>${canRecordPayment?'<th></th>':''}</tr></thead><tbody>
-        ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.amount)}</td><td>${p.notes||'—'}</td>${canRecordPayment?`<td><button class="btn small danger" data-del-invoice-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
+        ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.amount)}${isForeign && hasForeignAmount(p) ? `<div style="font-size:.75rem;color:var(--muted);">settles ${fmtCurrency(p.foreign_amount, inv.currency)} · FX ${fmt(round2(Number(p.amount) - paymentCleared(p, inv)))}</div>` : ''}</td><td>${p.notes||'—'}</td>${canRecordPayment?`<td><button class="btn small danger" data-del-invoice-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
       ${awaitingPayments.length ? `<p style="font-size:.8rem;color:var(--muted);margin:8px 0 2px;">Not yet counted:</p>${awaitingPayments.map(p=>`<div style="font-size:.82rem;">${p.payment_date} — ${fmt(p.amount)} ${approvalPill(p)}${p.approval_status==='rejected' && p.rejection_note ? ' — '+p.rejection_note : ''}${canRecordPayment?` <button class="btn small danger" data-del-invoice-payment="${p.id}">Delete</button>`:''}</div>`).join('')}` : ''}
       ${writeoffs.length ? `<p style="font-size:.82rem;margin:10px 0 2px;">Bad debt write-offs:</p>${writeoffs.map(w=>`<div style="font-size:.82rem;">${w.write_off_date} — ${fmt(w.amount)}${w.vat_adjust?' (VAT reclaimed)':''}${w.notes?' — '+w.notes:''}${canWriteOff?` <button class="btn small danger" data-del-writeoff="${w.id}">Reverse write-off</button>`:''}</div>`).join('')}` : ''}
@@ -4881,8 +5128,13 @@ async function openInvoiceView(invoiceId){
       <form id="invoice-payment-form" class="hidden" style="margin-top:10px;">
         <div class="row">
           <div class="field"><label>Date</label><input type="date" id="invoice-payment-date" required></div>
-          <div class="field"><label>Amount (R)</label><input type="number" step="0.01" id="invoice-payment-amount" value="${balance.toFixed(2)}" required></div>
+          <div class="field"><label>Amount received (R)</label><input type="number" step="0.01" id="invoice-payment-amount" value="${balance.toFixed(2)}" required></div>
         </div>
+        ${isForeign ? `<div class="row">
+          <div class="field"><label>Settles (${inv.currency})</label><input type="number" step="0.01" id="invoice-payment-foreign" value="${foreignOpen.toFixed(2)}" required></div>
+          <div class="field"><label>&nbsp;</label><button type="button" class="btn secondary small" id="invoice-payment-suggest">Receive at today's rate</button></div>
+        </div>
+        <div id="invoice-payment-fx-note" style="font-size:.82rem;color:var(--muted);margin-bottom:8px;"></div>` : ''}
         <div class="field"><label>Notes (optional)</label><input type="text" id="invoice-payment-notes"></div>
         <div class="modal-actions"><button type="submit" class="btn small">Save Payment</button></div>
       </form>` : ''}
@@ -4903,8 +5155,17 @@ async function openInvoiceView(invoiceId){
     </div>` : ''}
     <div class="modal-actions">
       <button class="btn secondary" onclick="window.print()">Print / Save PDF</button>
-      <a class="btn secondary" href="mailto:${client&&client.email?client.email:''}?subject=${mailtoSubject}&body=${mailtoBody}">✉ Send (email)</a>
+      <a class="btn secondary" href="mailto:${client&&client.email?client.email:''}?subject=${mailtoSubject}&body=${mailtoBody}">✉ Open in my email app</a>
+      ${(hasModule('invoices') && inv.approval_status==='approved') ? `<button type="button" class="btn" id="email-invoice-btn">✉ Email invoice</button>` : ''}
     </div>
+    ${inv.emailed_at ? `<p style="font-size:.8rem;color:var(--muted);text-align:right;">Last emailed to ${inv.emailed_to||'client'} on ${String(inv.emailed_at).slice(0,10)}.</p>` : ''}
+    <form id="email-invoice-form" class="panel hidden" style="margin-top:10px;">
+      <h3 style="margin-top:0;">Email this invoice</h3>
+      <div class="field"><label>To</label><input type="email" id="email-invoice-to" value="${client&&client.email?client.email:''}" required></div>
+      <div class="field"><label>Subject</label><input type="text" id="email-invoice-subject" value="Invoice ${inv.invoice_number} from ${state.company.name.replace(/"/g,'&quot;')}" required></div>
+      <div class="field"><label>Message</label><textarea id="email-invoice-message" rows="4">Hi ${client?client.name:''},\n\nPlease find invoice ${inv.invoice_number} for ${fmtCurrency(total, inv.currency)} below${inv.due_date?(', due '+inv.due_date):''}.\n\nThank you,\n${state.company.name}</textarea></div>
+      <div class="modal-actions"><button type="button" class="btn secondary small" id="email-invoice-cancel">Cancel</button><button type="submit" class="btn small" id="email-invoice-send">Send email</button></div>
+    </form>
   `;
   backdrop.classList.remove('hidden');
   document.getElementById('invoice-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
@@ -4916,6 +5177,34 @@ async function openInvoiceView(invoiceId){
       await refreshAll(); render();
       toast('Invoice updated.');
     });
+  });
+  document.getElementById('email-invoice-btn')?.addEventListener('click', ()=>document.getElementById('email-invoice-form').classList.remove('hidden'));
+  document.getElementById('email-invoice-cancel')?.addEventListener('click', ()=>document.getElementById('email-invoice-form').classList.add('hidden'));
+  document.getElementById('email-invoice-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const to = document.getElementById('email-invoice-to').value.trim();
+    const subject = document.getElementById('email-invoice-subject').value.trim();
+    const message = document.getElementById('email-invoice-message').value;
+    if(!to){ toast('Enter a recipient.'); return; }
+    const btn = document.getElementById('email-invoice-send');
+    btn.disabled = true; btn.textContent = 'Sending…';
+    const html = invoiceEmailHtml(inv, items, client, message, {total, subtotal, vatTotal, zarTotal, isForeign});
+    let failure = null;
+    try{
+      const {data, error} = await sb.functions.invoke('send-invoice-email', {body:{company_id: state.company.id, to, subject, html, reply_to: state.company.email || null, from_name: state.company.name}});
+      if(error) failure = error.message || 'Could not send';
+      else if(data && data.error) failure = data.error === 'email_not_configured' ? 'Email sending is not set up yet (the Resend API key has not been added to Supabase).' : data.error;
+    }catch(err){ failure = err.message || 'Could not send'; }
+    if(failure){
+      btn.disabled = false; btn.textContent = 'Send email';
+      toast(failure + ' You can use "Open in my email app" instead.');
+      return;
+    }
+    const patch = {emailed_at: new Date().toISOString(), emailed_to: to};
+    if(inv.status === 'draft') patch.status = 'sent';
+    await sb.from('cc_invoices').update(patch).eq('id', inv.id);
+    await logActivity('email', 'invoice', inv.id, `${inv.invoice_number} emailed to ${to}`);
+    await refreshAll(); render(); openInvoiceView(inv.id); toast('Invoice emailed to ' + to + '.');
   });
   document.getElementById('add-invoice-payment-btn')?.addEventListener('click', ()=>{
     document.getElementById('invoice-payment-date').value = new Date().toISOString().slice(0,10);
@@ -4951,15 +5240,21 @@ async function openInvoiceView(invoiceId){
       await refreshAll(); render(); openInvoiceView(inv.id);
     });
   });
+  if(isForeign) wireFxPaymentPreview({kind:'AR', currency: inv.currency, docRate, foreignId:'invoice-payment-foreign', amountId:'invoice-payment-amount', noteId:'invoice-payment-fx-note', btnId:'invoice-payment-suggest', dateId:'invoice-payment-date'});
   document.getElementById('invoice-payment-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
     const amount = parseFloat(document.getElementById('invoice-payment-amount').value) || 0;
     if(amount <= 0){ toast('Enter a payment amount.'); return; }
+    const foreignAmount = isForeign ? (parseFloat(document.getElementById('invoice-payment-foreign').value) || 0) : null;
+    if(isForeign && foreignAmount <= 0){ toast(`Enter the ${inv.currency} amount this payment settles.`); return; }
+    const payDate = document.getElementById('invoice-payment-date').value;
+    if(isPeriodLocked(payDate)){ toast(periodLockMessage()); return; }
     const {error} = await sb.from('cc_invoice_payments').insert({
       invoice_id: inv.id,
       company_id: state.company.id,
-      payment_date: document.getElementById('invoice-payment-date').value,
+      payment_date: payDate,
       amount,
+      foreign_amount: foreignAmount,
       notes: document.getElementById('invoice-payment-notes').value.trim() || null,
       created_by: state.user.id,
       approval_status: approvalStatusForNew()
@@ -6456,6 +6751,7 @@ function computeProvisionalTax(fy){
   const isFYComplete = today >= fy.end;
   const toDate = isFYComplete ? fy.end : (today < fy.start ? fy.start : today);
   const pl = computePL(fy.start, toDate);
+  pl.netProfit = pl.profitBeforeTax;     // the estimate is of tax on profit BEFORE tax
   const daysElapsed = Math.max(1, Math.round((new Date(toDate) - new Date(fy.start)) / 86400000) + 1);
   const daysInFY = Math.max(1, Math.round((new Date(fy.end) - new Date(fy.start)) / 86400000) + 1);
   const estimatedAnnualProfit = isFYComplete ? pl.netProfit : pl.netProfit * (daysInFY / daysElapsed);
@@ -6478,7 +6774,7 @@ function computeProvisionalTax(fy){
 // custom expense account) falls under Operating Expenses, as before.
 function computePL(start, end){
   const t = ledgerTotals(ledgerLines(), start, end, l=>l.source==='Year-End Close');
-  let revenue = 0, cos = 0, opex = 0, payrollCost = 0;
+  let revenue = 0, cos = 0, opex = 0, payrollCost = 0, incomeTax = 0;
   chartAccountList().filter(a=>a.key).forEach(a=>{
     const r = t[a.key]; if(!r) return;
     const net = r.debit - r.credit;
@@ -6486,15 +6782,17 @@ function computePL(start, end){
     else if(a.type === 'expense'){
       if(a.key === 'COS') cos += net;
       else if(a.key === 'PAYROLL') payrollCost += net;
+      else if(a.key === 'TAXEXP') incomeTax += net;
       else opex += net;
     }
   });
-  revenue = round2(revenue); cos = round2(cos); opex = round2(opex); payrollCost = round2(payrollCost);
+  revenue = round2(revenue); cos = round2(cos); opex = round2(opex); payrollCost = round2(payrollCost); incomeTax = round2(incomeTax);
   const grossProfit = round2(revenue - cos);
   const totalOpex = round2(opex + payrollCost);
-  const netProfit = round2(grossProfit - totalOpex);
+  const profitBeforeTax = round2(grossProfit - totalOpex);
+  const netProfit = round2(profitBeforeTax - incomeTax);
   return {
-    start, end, revenue, cos, opex, payrollCost, totalOpex, grossProfit, netProfit,
+    start, end, revenue, cos, opex, payrollCost, totalOpex, grossProfit, profitBeforeTax, incomeTax, netProfit,
     grossMargin: revenue ? grossProfit/revenue : null,
     netMargin: revenue ? netProfit/revenue : null
   };
@@ -6531,7 +6829,7 @@ function computeBS(asOf){
   const totalAssets = currentAssets + fixedAssets;
 
   const accountsPayableFromBills = -bal('AP');
-  const currentLiabOther = -bal('OCL') - bal('SARS') - bal('PAYDED') + accountsPayableFromBills + customCurLiab;
+  const currentLiabOther = -bal('OCL') - bal('SARS') - bal('PAYDED') - bal('TAXPAY') + accountsPayableFromBills + customCurLiab;
   const nonCurrentLiab = -bal('NCL') + customNonCurLiab;
   const currentLiabilities = currentLiabOther + vatPayableAmt;
   const totalLiabilities = currentLiabilities + nonCurrentLiab;
@@ -6741,9 +7039,7 @@ function computeAPAging(){
   const billRows = (state.supplierInvoices||[])
     .filter(b=>b.approval_status==='approved' && b.due_date)
     .map(b=>{
-      const total = docTotal(state.supplierInvoiceItems[b.id]);
-      const paid = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===b.id).reduce((s,p)=>s+Number(p.amount),0);
-      const balance = Math.max(0, total - paid);
+      const balance = billBalance(b).balance;
       const daysOverdue = daysBetween(b.due_date, today);
       return {id:'bill-'+b.id, description: `${supplierName(b.supplier_id)} — ${b.bill_number}`, due_date:b.due_date, daysOverdue, bucket: agingBucketLabel(daysOverdue), amount: balance};
     })
@@ -6921,6 +7217,9 @@ function renderReportsInner(){
       <button class="btn ${state.reportsTab==='bankrec'?'':'secondary'} small" data-report-tab="bankrec">Bank Reconciliation</button>
       <button class="btn ${state.reportsTab==='vatrec'?'':'secondary'} small" data-report-tab="vatrec">VAT 201 Reconciliation</button>
       <button class="btn ${state.reportsTab==='yearend'?'':'secondary'} small" data-report-tab="yearend">Year-End</button>
+      <button class="btn ${state.reportsTab==='afs'?'':'secondary'} small" data-report-tab="afs">Annual Financial Statements</button>
+      <button class="btn ${state.reportsTab==='fx'?'':'secondary'} small" data-report-tab="fx">Foreign Exchange</button>
+      <button class="btn ${state.reportsTab==='health'?'':'secondary'} small" data-report-tab="health">Health Check</button>
     </div>
     <p class="section-caption">${({
       monthly: "A full month's pack in one place — P&amp;L, balance sheet, fixed assets, and outstanding balances.",
@@ -6938,6 +7237,9 @@ function renderReportsInner(){
       bankrec: "Does the bank balance in your books agree with the bank statement? Lists what's on one side but not the other.",
       vatrec: "Ties the VAT you'd declare on the VAT201 to the VAT Control account in the ledger, line by line.",
       yearend: "Close a financial year: profit moves into Retained Earnings and the period is locked.",
+      health: "Cross-checks the books against themselves — journals, sub-ledgers, foreign exchange, tax and bank reconciliation — and flags anything to fix before month-end.",
+      fx: "Closing exchange rates, open foreign-currency balances revalued at those rates (unrealised), and realised gains and losses on settlement.",
+      afs: "A printable set of annual financial statements — financial position, comprehensive income, changes in equity, cash flows and notes — with the prior year alongside.",
     })[state.reportsTab] || "Revenue minus expenses for the period — how much the business made."}</p>
     ${state.reportsTab==='monthly' ? `
     <div class="panel period-bar">
@@ -6945,7 +7247,7 @@ function renderReportsInner(){
       <button class="btn small secondary" id="monthly-accounts-this-month">This Month</button>
       <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">${monthLabel(state.monthlyAccountsMonth)}</div>
     </div>
-    ` : state.reportsTab==='companytax' ? '' : `
+    ` : (state.reportsTab==='companytax' || state.reportsTab==='afs' || state.reportsTab==='health') ? '' : `
     <div class="panel period-bar">
       ${['month','quarter','year','all'].map(m=>`<button class="btn ${state.reportsPeriod.mode===m?'':'secondary'} small" data-period-mode="${m}">${periodModeLabel(m)}</button>`).join('')}
       <button class="btn ${state.reportsPeriod.mode==='custom'?'':'secondary'} small" data-period-mode="custom">Custom</button>
@@ -6963,7 +7265,7 @@ function renderReportsInner(){
       <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">P&amp;L: ${period.start} to ${period.end}<br>Balance sheet as of ${period.end}</div>
     </div>
     `}
-    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs, bsPrior) : state.reportsTab==='tb' ? renderTB(computeLedgerTB(period.start, period.end)) : state.reportsTab==='gl' ? renderGeneralLedger(period.start, period.end) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : state.reportsTab==='companytax' ? renderCompanyTax() : state.reportsTab==='bankrec' ? renderBankRec(computeBankRec(period.end, state.bankRecStatement)) : state.reportsTab==='vatrec' ? renderVatRec(computeVatRec(period.start, period.end)) : state.reportsTab==='yearend' ? renderYearEnd() : renderPL(pl, plPrior)}
+    ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs, bsPrior) : state.reportsTab==='tb' ? renderTB(computeLedgerTB(period.start, period.end)) : state.reportsTab==='gl' ? renderGeneralLedger(period.start, period.end) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : state.reportsTab==='companytax' ? renderCompanyTax() : state.reportsTab==='bankrec' ? renderBankRec(computeBankRec(period.end, state.bankRecStatement)) : state.reportsTab==='vatrec' ? renderVatRec(computeVatRec(period.start, period.end)) : state.reportsTab==='yearend' ? renderYearEnd() : state.reportsTab==='afs' ? renderAFS() : state.reportsTab==='fx' ? renderFX(period.start, period.end) : state.reportsTab==='health' ? renderHealthCheck() : renderPL(pl, plPrior)}
   `;
 }
 
@@ -7056,6 +7358,7 @@ function renderPL(pl, prior){
       ${margin('Gross Margin', pl.grossMargin, cmp && prior.grossMargin)}
       ${row('Operating Expenses', pl.opex, cmp && prior.opex, {neg:true, pad:true})}
       ${row('Payroll &amp; Staff Costs', pl.payrollCost, cmp && prior.payrollCost, {neg:true})}
+      ${(pl.incomeTax || (cmp && prior.incomeTax)) ? row('Profit before tax', pl.profitBeforeTax, cmp && prior.profitBeforeTax, {bold:true}) + row('Income tax', pl.incomeTax, cmp && prior.incomeTax, {neg:true}) : ''}
       ${row('Net Profit', pl.netProfit, cmp && prior.netProfit, {bold:true, cls:v=>v<0?'negative':'positive'})}
       ${margin('Net Margin', pl.netMargin, cmp && prior.netMargin)}
     </tbody></table>
@@ -7349,6 +7652,8 @@ async function closeFinancialYear(fyEnd){
   if(fy.end > todayIso()){ toast('That financial year has not finished yet.'); return; }
   if(financialYearClosedJournal(fy.end)){ toast('That year is already closed.'); return; }
   const closing = buildClosingLines(fy.end);
+  const taxCheck = computeTaxComputation(fy);
+  if(taxCheck.tax > 0 && !taxCheck.journal && !confirm(`No income tax provision (${fmt(taxCheck.tax)}) has been posted for this year. Closing now locks the year, so the provision can't be added afterwards.\n\nClose anyway?`)) return;
   if(!confirm(`Close the financial year ${fy.start} to ${fy.end}?\n\nNet profit to move into Retained Earnings: ${fmt(closing.netProfit)}.\nThe books will be locked through ${fy.end}.`)) return;
   const nowIso = new Date().toISOString();
   const {data: journal, error} = await sb.from('cc_manual_journals').insert({
@@ -7394,6 +7699,451 @@ async function reopenFinancialYear(fyEnd){
   await refreshAll(); render(); toast('Financial year reopened.');
 }
 
+
+// ---- Company income tax computation ----------------------------------------------------------
+// Accounting profit before tax -> taxable income -> tax at the flat company rate. Automatic items come
+// from the ledger (depreciation, profit/loss on disposal); anything else (non-deductible expenses,
+// capital allowances, assessed loss brought forward) is entered per financial year.
+function taxProvisionJournal(fyEnd){ return (state.manualJournals||[]).find(j=>j.kind==='tax_provision' && j.fy_end===fyEnd) || null; }
+function computeTaxComputation(fy){
+  const t = ledgerTotals(ledgerLines(), fy.start, fy.end, l=>l.source==='Year-End Close');
+  const pl = computePL(fy.start, fy.end);
+  const net = k => t[k] ? round2(t[k].debit - t[k].credit) : 0;
+  const depreciation = net('DEPR');
+  const disposal = net('DISP');                       // + loss on disposal, - profit on disposal
+  const adjs = (state.taxAdjustments||[]).filter(a=>a.fy_end===fy.end);
+  const addbacks = adjs.filter(a=>a.kind==='addback').map(a=>({id:a.id, label:a.label, amount: round2(Number(a.amount)||0), manual:true}));
+  const deductions = adjs.filter(a=>a.kind==='deduction').map(a=>({id:a.id, label:a.label, amount: round2(Number(a.amount)||0), manual:true}));
+  const lossBF = round2(adjs.filter(a=>a.kind==='assessed_loss').reduce((s,a)=>s+(Number(a.amount)||0), 0));
+  const autoAdd = [], autoDed = [];
+  if(depreciation > 0) autoAdd.push({label:'Accounting depreciation', amount: depreciation});
+  if(disposal > 0) autoAdd.push({label:'Loss on disposal of assets (accounting)', amount: disposal});
+  if(disposal < 0) autoDed.push({label:'Profit on disposal of assets (accounting)', amount: -disposal});
+  const totalAdd = round2([...autoAdd, ...addbacks].reduce((s,x)=>s+x.amount, 0));
+  const totalDed = round2([...autoDed, ...deductions].reduce((s,x)=>s+x.amount, 0));
+  const profitBeforeTax = pl.profitBeforeTax;
+  const incomeBeforeLoss = round2(profitBeforeTax + totalAdd - totalDed);
+  // Assessed-loss set-off is limited to R1m plus 80% of taxable income above R1m (section 20).
+  const limit = incomeBeforeLoss > 0 ? round2(Math.min(incomeBeforeLoss, 1000000 + 0.8 * Math.max(0, incomeBeforeLoss - 1000000))) : 0;
+  const lossUsed = round2(Math.min(lossBF, limit));
+  const newLoss = incomeBeforeLoss < 0 ? -incomeBeforeLoss : 0;
+  const lossCF = round2(lossBF - lossUsed + newLoss);
+  const taxableIncome = round2(Math.max(0, incomeBeforeLoss - lossUsed));
+  const tax = round2(taxableIncome * COMPANY_TAX_RATE);
+  const provisionalPaid = round2((state.provisionalTax||[]).filter(r=>r.tax_year_end_year===fy.endYear && r.paid).reduce((s,r)=>s+(Number(r.estimated_tax)||0), 0));
+  const journal = taxProvisionJournal(fy.end);
+  const provisionPosted = journal ? round2(((state.manualJournalLines||{})[journal.id]||[]).filter(l=>l.account_key==='TAXEXP' && l.side==='debit').reduce((s,l)=>s+Number(l.amount), 0)) : 0;
+  return {fy, profitBeforeTax, autoAdd, addbacks, autoDed, deductions, totalAdd, totalDed, incomeBeforeLoss, lossBF, lossUsed, lossCF, taxableIncome, tax,
+    provisionalPaid, payable: round2(tax - provisionalPaid), journal, provisionPosted, rate: COMPANY_TAX_RATE};
+}
+function renderTaxComputation(fy){
+  const c = computeTaxComputation(fy);
+  const admin = isAdmin();
+  const s = n => n < 0 ? `(${fmt(-n)})` : fmt(n);
+  const line = (label, amt, extra)=>`<tr><td>${label}</td><td style="text-align:right;">${s(amt)}</td>${admin ? `<td style="width:70px;text-align:right;">${extra||''}</td>` : ''}</tr>`;
+  const delBtn = id => `<button class="btn small danger" data-del-tax-adj="${id}">✕</button>`;
+  return `
+  <div class="panel" style="border-top:3px solid var(--c-reports);">
+    <h3 style="margin-top:0;">Income tax computation — year ended ${fy.end}</h3>
+    <table class="report-table"><tbody>
+      <tr style="font-weight:600;"><td>Accounting profit before tax</td><td style="text-align:right;" class="${c.profitBeforeTax<0?'negative':''}">${s(c.profitBeforeTax)}</td>${admin?'<td></td>':''}</tr>
+      <tr style="font-weight:600;"><td colspan="${admin?3:2}" style="padding-top:12px;">Add back — not deductible / accounted for separately</td></tr>
+      ${c.autoAdd.map(x=>line(x.label, x.amount)).join('')}
+      ${c.addbacks.map(x=>line(x.label, x.amount, delBtn(x.id))).join('')}
+      ${(!c.autoAdd.length && !c.addbacks.length) ? `<tr><td colspan="${admin?3:2}" style="color:var(--muted);font-size:.82rem;">None.</td></tr>` : ''}
+      <tr style="font-weight:600;"><td colspan="${admin?3:2}" style="padding-top:12px;">Less — allowances and exempt amounts</td></tr>
+      ${c.autoDed.map(x=>line(x.label, -x.amount)).join('')}
+      ${c.deductions.map(x=>line(x.label, -x.amount, delBtn(x.id))).join('')}
+      ${(!c.autoDed.length && !c.deductions.length) ? `<tr><td colspan="${admin?3:2}" style="color:var(--muted);font-size:.82rem;">None — add wear-and-tear / capital allowances below.</td></tr>` : ''}
+      <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Taxable income before assessed loss</td><td style="text-align:right;">${s(c.incomeBeforeLoss)}</td>${admin?'<td></td>':''}</tr>
+      ${c.lossBF ? line('Assessed loss brought forward', -c.lossBF) : ''}
+      ${c.lossBF ? line('Assessed loss set off (limited to R1m + 80% of the excess)', -c.lossUsed) : ''}
+      <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Taxable income</td><td style="text-align:right;">${s(c.taxableIncome)}</td>${admin?'<td></td>':''}</tr>
+      ${line(`Income tax at ${(c.rate*100).toFixed(0)}%`, c.tax)}
+      ${line('Less: provisional tax paid (marked paid below)', -c.provisionalPaid)}
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>${c.payable>=0 ? 'Tax payable on assessment' : 'Refund due on assessment'}</td><td style="text-align:right;">${s(Math.abs(c.payable))}</td>${admin?'<td></td>':''}</tr>
+      ${c.lossCF > 0 ? `<tr><td style="color:var(--muted);font-size:.82rem;">Assessed loss carried forward (enter it as next year's "assessed loss brought forward")</td><td style="text-align:right;color:var(--muted);font-size:.82rem;">${fmt(c.lossCF)}</td>${admin?'<td></td>':''}</tr>` : ''}
+    </tbody></table>
+    ${admin ? `
+    <form id="tax-adj-form" class="row" style="align-items:flex-end;margin-top:12px;">
+      <div class="field"><label>Adjustment</label><select id="tax-adj-kind">
+        <option value="addback">Add back (e.g. entertainment, fines, private expenses)</option>
+        <option value="deduction">Deduction (e.g. wear-and-tear / capital allowance)</option>
+        <option value="assessed_loss">Assessed loss brought forward</option>
+      </select></div>
+      <div class="field" style="flex:1;"><label>Description</label><input type="text" id="tax-adj-label" required placeholder="e.g. Wear-and-tear allowance (s11(e))"></div>
+      <div class="field"><label>Amount (R)</label><input type="number" step="0.01" min="0.01" id="tax-adj-amount" required></div>
+      <input type="hidden" id="tax-adj-fy" value="${fy.end}">
+      <button class="btn small" type="submit">Add</button>
+    </form>
+    <div style="margin-top:12px;">
+      ${c.journal ? `<span class="tag-pill">Provision of ${fmt(c.provisionPosted)} posted ${c.journal.journal_date}</span> <button type="button" class="btn small secondary" id="tax-remove-provision" data-fy-end="${fy.end}">Remove provision</button>`
+        : `<button type="button" class="btn small" id="tax-post-provision" data-fy-end="${fy.end}" ${c.tax>0?'':'disabled'}>Post income tax provision (${fmt(c.tax)})</button>`}
+      <span style="font-size:.78rem;color:var(--muted);">Posts Dr Income Tax Expense / Cr Income Tax Payable on ${fy.end}, so the P&amp;L, Balance Sheet and annual statements carry the tax. Do this before closing the year.</span>
+    </div>` : ''}
+    <p style="color:var(--muted);font-size:.78rem;margin-bottom:0;">A working computation at the flat company rate — it does not model Small Business Corporation tables, turnover tax, section 12 allowances, recoupments or other special provisions. Not tax advice; your accountant must confirm the return (ITR14).</p>
+  </div>`;
+}
+async function postTaxProvision(fyEnd){
+  if(!isAdmin()){ toast('Only Owner/Management can post this.'); return; }
+  const fy = financialYearsList().find(f=>f.end===fyEnd) || Object.assign({offset:null}, companyFinancialYearBounds(state.companyTaxFYOffset||0));
+  const c = computeTaxComputation(fy);
+  if(c.tax <= 0){ toast('There is no tax to provide for.'); return; }
+  if(taxProvisionJournal(fy.end)){ toast('A provision is already posted for this year.'); return; }
+  if(isPeriodLocked(fy.end)){ toast(periodLockMessage()); return; }
+  if(!confirm(`Post an income tax provision of ${fmt(c.tax)} dated ${fy.end}?`)) return;
+  const nowIso = new Date().toISOString();
+  const {data: journal, error} = await sb.from('cc_manual_journals').insert({
+    company_id: state.company.id, journal_date: fy.end, description: `Income tax provision — financial year ended ${fy.end}`,
+    created_by: state.user.id, approval_status: 'approved', approved_by: state.user.id, approved_at: nowIso, kind: 'tax_provision', fy_end: fy.end
+  }).select().single();
+  if(error){ toast(error.message); return; }
+  const rows = [
+    {journal_id: journal.id, company_id: state.company.id, category:'ledger', side:'debit', amount: c.tax, signed_amount: 0, memo:'Income tax expense', account_key:'TAXEXP', account_id:null},
+    {journal_id: journal.id, company_id: state.company.id, category:'ledger', side:'credit', amount: c.tax, signed_amount: 0, memo:'Income tax payable', account_key:'TAXPAY', account_id:null},
+  ];
+  const {error: lineErr} = await sb.from('cc_manual_journal_lines').insert(rows);
+  if(lineErr){ toast(lineErr.message); await sb.from('cc_manual_journals').delete().eq('id', journal.id); return; }
+  await logActivity('create', 'manual_journal', journal.id, `Income tax provision ${fmt(c.tax)} for year ended ${fy.end}`);
+  await refreshAll(); render(); toast('Tax provision posted.');
+}
+async function removeTaxProvision(fyEnd){
+  if(!isAdmin()) return;
+  const journal = taxProvisionJournal(fyEnd); if(!journal) return;
+  if(isPeriodLocked(journal.journal_date)){ toast(periodLockMessage()); return; }
+  if(!confirm('Remove this income tax provision?')) return;
+  await sb.from('cc_manual_journal_lines').delete().eq('journal_id', journal.id);
+  await sb.from('cc_manual_journals').delete().eq('id', journal.id);
+  await logActivity('delete', 'manual_journal', journal.id, `Income tax provision for ${fyEnd} removed`);
+  await refreshAll(); render(); toast('Provision removed.');
+}
+
+// ---- Annual Financial Statements ---------------------------------------------------------------
+function expenseLineItems(start, end){
+  const t = ledgerTotals(ledgerLines(), start, end, l=>l.source==='Year-End Close');
+  const out = {};
+  chartAccountList().filter(a=>a.key && a.type==='expense' && a.key!=='COS' && a.key!=='TAXEXP').forEach(a=>{
+    const r = t[a.key]; if(!r) return;
+    const v = round2(r.debit - r.credit);
+    if(Math.abs(v) >= 0.005) out[a.key] = {name:a.name, amount:v};
+  });
+  return out;
+}
+// ---- Ledger health check (Wave 47) ----
+// Cross-checks the books against themselves and flags anything that needs attention before month-end.
+// status: 'ok' | 'warn' (worth a look) | 'fail' (the books disagree with themselves).
+function computeHealthCheck(){ return withLedgerMemo(()=>computeHealthCheckImpl()); }
+function computeHealthCheckImpl(){
+  const checks = [];
+  const add = (id, group, label, status, detail, go)=>checks.push({id, group, label, status, detail, go: go || null});
+  const today = todayIso();
+  const lines = ledgerLines();
+  const tol = 0.05;
+  const money = v => (v < 0 ? '-' : '') + fmt(Math.abs(v));
+
+  // --- Ledger integrity ---
+  const journals = buildLedger();
+  const bad = journals.filter(j=>Math.abs(j.lines.reduce((a,l)=>a + l.debit - l.credit, 0)) >= 0.005);
+  add('journals', 'Ledger integrity', 'Every journal balances (debits = credits)', bad.length ? 'fail' : 'ok',
+    bad.length ? `${bad.length} journal${bad.length>1?'s are':' is'} out of balance, e.g. "${bad[0].memo || bad[0].source}" on ${bad[0].date}.` : `${journals.length} journals checked.`, {view:'reports', tab:'gl'});
+  const bs = computeBS(today);
+  add('bs', 'Ledger integrity', 'Balance Sheet balances', bs.balances ? 'ok' : 'fail',
+    bs.balances ? 'Assets equal liabilities plus equity.' : 'Assets do not equal liabilities plus equity — a posting is missing a side.', {view:'reports', tab:'bs'});
+  const lvb = computeLedgerVsBS(today);
+  const lvbBad = lvb.items.filter(i=>Math.abs(i.diff) >= 0.01);
+  add('ledgervsbs', 'Ledger integrity', 'Ledger agrees with the Balance Sheet', lvbBad.length ? 'fail' : 'ok',
+    lvbBad.length ? lvbBad.map(i=>`${i.label}: ledger ${money(i.ledger)} vs sheet ${money(i.balanceSheet)}`).join('; ') : 'Cash, receivables, assets and liabilities tie out.', {view:'reports', tab:'tb'});
+
+  // --- Sub-ledgers vs control accounts ---
+  const arLedger = round2(lines.filter(l=>l.key==='AR' && l.source!=='FX Revaluation').reduce((a,l)=>a + l.debit - l.credit, 0));
+  const approvedInvoices = (state.invoices||[]).filter(i=>i.approval_status==='approved');
+  const arExpected = round2(
+    approvedInvoices.reduce((a,i)=>{
+      const total = docTotalZAR(i, (state.invoiceItems||{})[i.id]);
+      const paid = (state.invoicePayments||[]).filter(p=>p.invoice_id===i.id).reduce((x,p)=>x + paymentCleared(p, i), 0);
+      return a + total - paid - invoiceWrittenOff(i.id);
+    }, 0)
+    - (state.creditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').reduce((a,cn)=>a + docTotalZAR(cn, (state.creditNoteItems||{})[cn.id]), 0));
+  const arDiff = round2(arLedger - arExpected);
+  add('ar', 'Sub-ledgers', 'Receivables ledger agrees to the invoices', Math.abs(arDiff) < tol ? 'ok' : 'fail',
+    Math.abs(arDiff) < tol ? `Both show ${money(arLedger)}.` : `Ledger ${money(arLedger)} vs invoices ${money(arExpected)} (difference ${money(arDiff)}). Usually an invoice edited after approval, or a manual journal to Accounts Receivable.`, {view:'reports', tab:'debtors'});
+  const apLedger = round2(-lines.filter(l=>l.key==='AP' && l.source!=='FX Revaluation').reduce((a,l)=>a + l.debit - l.credit, 0));
+  const apExpected = round2(
+    (state.supplierInvoices||[]).filter(b=>b.approval_status==='approved').reduce((a,b)=>{
+      const total = docTotalZAR(b, (state.supplierInvoiceItems||{})[b.id]);
+      const paid = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===b.id).reduce((x,p)=>x + paymentCleared(p, b), 0);
+      return a + total - paid;
+    }, 0)
+    - (state.supplierCreditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').reduce((a,cn)=>a + docTotal((state.supplierCreditNoteItems||{})[cn.id]), 0));
+  const apDiff = round2(apLedger - apExpected);
+  add('ap', 'Sub-ledgers', 'Payables ledger agrees to the bills', Math.abs(apDiff) < tol ? 'ok' : 'fail',
+    Math.abs(apDiff) < tol ? `Both show ${money(apLedger)}.` : `Ledger ${money(apLedger)} vs bills ${money(apExpected)} (difference ${money(apDiff)}). Usually a bill edited after approval, or a manual journal to Accounts Payable.`, {view:'reports', tab:'creditors'});
+  const entryInvIds = new Set((state.entries||[]).map(e=>e.source_invoice_id).filter(Boolean));
+  const unposted = approvedInvoices.filter(i=>docTotal((state.invoiceItems||{})[i.id]) > 0 && !entryInvIds.has(i.id));
+  add('inv-posted', 'Sub-ledgers', 'Every approved invoice is in the ledger', unposted.length ? 'fail' : 'ok',
+    unposted.length ? `${unposted.length} approved invoice${unposted.length>1?'s have':' has'} no revenue entry: ${unposted.slice(0,5).map(i=>i.invoice_number).join(', ')}.` : 'All approved invoices have posted revenue.', {view:'invoices'});
+  const entryBillIds = new Set((state.entries||[]).map(e=>e.source_supplier_invoice_id).filter(Boolean));
+  const unpostedBills = (state.supplierInvoices||[]).filter(b=>b.approval_status==='approved' && docTotal((state.supplierInvoiceItems||{})[b.id]) > 0 && !entryBillIds.has(b.id));
+  add('bill-posted', 'Sub-ledgers', 'Every approved bill is in the ledger', unpostedBills.length ? 'fail' : 'ok',
+    unpostedBills.length ? `${unpostedBills.length} approved bill${unpostedBills.length>1?'s have':' has'} no expense entry: ${unpostedBills.slice(0,5).map(b=>b.bill_number).join(', ')}.` : 'All approved bills have a posted expense.', {view:'supplierinvoices'});
+  const dupes = {};
+  (state.invoices||[]).forEach(i=>{ const k = 'INV ' + (i.invoice_number||'').trim().toLowerCase(); dupes[k] = (dupes[k]||0) + 1; });
+  (state.supplierInvoices||[]).forEach(b=>{ const k = 'BILL ' + (b.supplier_id||'') + ' ' + (b.bill_number||'').trim().toLowerCase(); dupes[k] = (dupes[k]||0) + 1; });
+  const dupList = Object.keys(dupes).filter(k=>dupes[k] > 1);
+  add('dupes', 'Sub-ledgers', 'No duplicate invoice or bill numbers', dupList.length ? 'warn' : 'ok',
+    dupList.length ? `Duplicate numbers: ${dupList.slice(0,5).map(k=>k.replace(/^(INV|BILL) (\S+ )?/, '')).join(', ')}.` : 'Numbers are unique.');
+
+  // --- Foreign exchange ---
+  const positions = fxPositionsAsOf(today);
+  const stale = [...new Set(positions.map(p=>p.currency))].filter(cur=>{
+    const r = fxRateOn(cur, today);
+    return !r || daysBetween(r.date, today) > 45;
+  });
+  add('fx-rates', 'Foreign exchange', 'Open foreign balances have a recent closing rate', stale.length ? 'warn' : 'ok',
+    positions.length ? (stale.length ? `No closing rate in the last 45 days for ${stale.join(', ')} — unrealised gains/losses are not being recognised.` : 'Closing rates are up to date.') : 'No open foreign-currency invoices or bills.', {view:'reports', tab:'fx'});
+  const noForeign = [
+    ...(state.invoicePayments||[]).filter(p=>{ const d = (state.invoices||[]).find(i=>i.id===p.invoice_id); return isForeignDoc(d) && !hasForeignAmount(p); }),
+    ...(state.supplierInvoicePayments||[]).filter(p=>{ const d = (state.supplierInvoices||[]).find(b=>b.id===p.supplier_invoice_id); return isForeignDoc(d) && !hasForeignAmount(p); }),
+  ];
+  add('fx-payments', 'Foreign exchange', 'Foreign-currency payments record the foreign amount', noForeign.length ? 'warn' : 'ok',
+    noForeign.length ? `${noForeign.length} payment${noForeign.length>1?'s':''} on foreign documents ${noForeign.length>1?'were':'was'} recorded in Rand only, so no FX gain/loss was calculated. Re-capture ${noForeign.length>1?'them':'it'} with the foreign amount.` : 'All foreign payments carry a foreign amount.');
+
+  // --- Tax and year-end ---
+  const lastFy = companyFinancialYearBounds(-1);
+  const lastPl = computePL(lastFy.start, lastFy.end);
+  const provisioned = !!taxProvisionJournal(lastFy.end) || lastPl.incomeTax > 0.005;
+  add('tax-provision', 'Tax & year-end', `Income tax recognised for the year ended ${lastFy.end}`, (lastPl.profitBeforeTax > 0.005 && !provisioned) ? 'warn' : 'ok',
+    (lastPl.profitBeforeTax > 0.005 && !provisioned) ? `Profit before tax was ${money(lastPl.profitBeforeTax)} but no tax expense or provision journal exists for that year.` : (lastPl.profitBeforeTax > 0.005 ? 'Tax is recognised.' : 'No taxable profit in that year.'), {view:'reports', tab:'companytax'});
+
+  // --- Operations ---
+  const staleTx = (state.bankTransactions||[]).filter(t=>t.status==='unmatched' && t.tx_date && daysBetween(t.tx_date, today) > 30);
+  add('bank-old', 'Operations', 'Bank lines are being reconciled', staleTx.length ? 'warn' : 'ok',
+    staleTx.length ? `${staleTx.length} bank line${staleTx.length>1?'s are':' is'} still unmatched after 30 days.` : 'No stale unmatched bank lines.', {view:'bankfeed'});
+  const pending = (state.pendingItems||[]).length;
+  add('pending', 'Operations', 'Nothing waiting for approval', pending ? 'warn' : 'ok',
+    pending ? `${pending} item${pending>1?'s are':' is'} waiting for approval and not yet in the books.` : 'No items waiting.', {view:'dashboard'});
+  const bank = round2(lines.filter(l=>l.key==='BANK').reduce((a,l)=>a + l.debit - l.credit, 0));
+  add('bank-neg', 'Operations', 'Bank balance is not negative', bank < -0.005 ? 'warn' : 'ok',
+    bank < -0.005 ? `Bank is overdrawn by ${money(-bank)} per the books — check for missing deposits.` : `Bank per books: ${money(bank)}.`);
+  const negStock = (state.stockItems||[]).filter(x=>Number(x.qty_on_hand) < 0);
+  add('stock-neg', 'Operations', 'No negative stock quantities', negStock.length ? 'warn' : 'ok',
+    negStock.length ? `${negStock.length} stock item${negStock.length>1?'s have':' has'} negative quantity: ${negStock.slice(0,5).map(x=>x.name).join(', ')}.` : 'Stock quantities are positive.');
+  const old90 = approvedInvoices.filter(i=>i.due_date && daysBetween(i.due_date, today) > 90 && invoiceBalance(i).balance > 0.005);
+  add('overdue90', 'Operations', 'No invoices more than 90 days overdue', old90.length ? 'warn' : 'ok',
+    old90.length ? `${old90.length} invoice${old90.length>1?'s are':' is'} over 90 days past due (${money(round2(old90.reduce((a,i)=>a + invoiceBalance(i).balance, 0)))}) — chase or write off.` : 'Nothing seriously overdue.', {view:'reports', tab:'debtors'});
+
+  const summary = {ok: checks.filter(c=>c.status==='ok').length, warn: checks.filter(c=>c.status==='warn').length, fail: checks.filter(c=>c.status==='fail').length};
+  return {checks, summary};
+}
+function renderHealthCheck(){
+  const hc = computeHealthCheck();
+  const pill = st => st==='ok' ? '<span class="status-pill status-paid">OK</span>' : st==='warn' ? '<span class="status-pill status-pending">Check</span>' : '<span class="status-pill status-overdue">Problem</span>';
+  const groups = [...new Set(hc.checks.map(c=>c.group))];
+  return `
+  <div class="grid">
+    <div class="card" style="--accent-c:var(--c-reports);"><h3>Problems</h3><div class="value ${hc.summary.fail?'negative':''}">${hc.summary.fail}</div><div class="sub">The books disagree with themselves</div></div>
+    <div class="card" style="--accent-c:var(--c-reports);"><h3>To check</h3><div class="value">${hc.summary.warn}</div><div class="sub">Worth a look before month-end</div></div>
+    <div class="card" style="--accent-c:var(--c-reports);"><h3>Passing</h3><div class="value">${hc.summary.ok}</div><div class="sub">of ${hc.checks.length} checks</div></div>
+  </div>
+  ${groups.map(g=>`
+  <div class="panel">
+    <h3 style="margin-top:0;">${g}</h3>
+    <table><thead><tr><th style="width:90px;">Status</th><th>Check</th><th>Detail</th><th></th></tr></thead><tbody>
+      ${hc.checks.filter(c=>c.group===g).map(c=>`<tr><td>${pill(c.status)}</td><td>${c.label}</td><td style="font-size:.85rem;color:var(--muted);">${c.detail}</td><td>${c.go && c.status!=='ok' ? `<button class="btn small secondary" data-health-go="${c.go.view}" data-health-tab="${c.go.tab||''}">Open</button>` : ''}</td></tr>`).join('')}
+    </tbody></table>
+  </div>`).join('')}`;
+}
+function computeFX(start, end){
+  const lines = ledgerLines().filter(l=>l.key==='FX' && l.date >= start && l.date <= end);
+  const sum = src => round2(lines.filter(l=>src(l.source)).reduce((a,l)=>a + l.credit - l.debit, 0));   // gain positive
+  const realised = sum(x=>x==='Invoice Payment' || x==='Supplier Payment');
+  const unrealised = sum(x=>x==='FX Revaluation');
+  const open = fxPositionsAsOf(end).map(pos=>{
+    const r = fxRateOn(pos.currency, end);
+    const adj = r ? round2(pos.open * (r.rate - pos.docRate) * (pos.kind==='AR' ? 1 : -1)) : null;   // gain positive
+    return {...pos, rate: r ? r.rate : null, rateDate: r ? r.date : null, gain: adj, zarAtDoc: round2(pos.open * pos.docRate)};
+  });
+  return {lines, realised, unrealised, open, total: round2(realised + unrealised)};
+}
+function renderFX(start, end){
+  const fx = computeFX(start, end);
+  const canEdit = isAdmin();
+  const rates = [...(state.fxRates||[])].sort((a,b)=> a.rate_date < b.rate_date ? 1 : a.rate_date > b.rate_date ? -1 : (a.currency < b.currency ? -1 : 1));
+  const gl = v => `<span class="${v<0?'negative':''}">${v<0 ? '(' + fmt(-v) + ')' : fmt(v)}</span>`;
+  return `
+  <div class="grid">
+    <div class="card" style="--accent-c:var(--c-reports);"><h3>Realised FX</h3><div class="value ${fx.realised<0?'negative':''}">${fx.realised<0?'-':''}${fmt(Math.abs(fx.realised))}</div><div class="sub">On settled invoices &amp; bills in the period</div></div>
+    <div class="card" style="--accent-c:var(--c-reports);"><h3>Unrealised FX</h3><div class="value ${fx.unrealised<0?'negative':''}">${fx.unrealised<0?'-':''}${fmt(Math.abs(fx.unrealised))}</div><div class="sub">Revaluations in the period, including the reversal of last period's</div></div>
+    <div class="card" style="--accent-c:var(--c-reports);"><h3>Net FX gain / (loss)</h3><div class="value ${fx.total<0?'negative':''}">${fx.total<0?'-':''}${fmt(Math.abs(fx.total))}</div><div class="sub">Shown in the Profit &amp; Loss</div></div>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">Closing exchange rates</h3>
+    <p style="font-size:.85rem;color:var(--muted);">Add a rate at each month-end and year-end for every foreign currency you hold balances in. Open foreign invoices and bills are revalued at that date and the revaluation reverses the next day. Rates are 1 unit of the currency in Rand.</p>
+    ${canEdit ? `<form id="fx-rate-form" class="row" style="align-items:flex-end;gap:8px;flex-wrap:wrap;">
+      <div class="field"><label>Date</label><input type="date" id="fx-rate-date" required value="${end}"></div>
+      <div class="field"><label>Currency</label><select id="fx-rate-currency">${CURRENCIES.filter(c=>c!=='ZAR').map(c=>`<option value="${c}">${c}</option>`).join('')}</select></div>
+      <div class="field"><label>Rate (→ ZAR)</label><input type="number" step="0.0001" min="0.0001" id="fx-rate-value" required></div>
+      <div class="field"><button type="button" class="btn secondary small" id="fx-rate-suggest">Suggest</button> <button type="submit" class="btn small">Save rate</button></div>
+    </form>` : ''}
+    ${rates.length ? `<table><thead><tr><th>Date</th><th>Currency</th><th style="text-align:right;">Rate</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+      ${rates.map(r=>`<tr><td>${r.rate_date}</td><td>${r.currency}</td><td style="text-align:right;">${Number(r.rate)}</td>${canEdit?`<td><button class="btn small danger" data-del-fx-rate="${r.id}">Delete</button></td>`:''}</tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No rates saved yet.</div>`}
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">Open foreign balances at ${end}</h3>
+    ${fx.open.length ? `<table><thead><tr><th>Document</th><th>Party</th><th style="text-align:right;">Open (currency)</th><th style="text-align:right;">Booked rate</th><th style="text-align:right;">Closing rate</th><th style="text-align:right;">Unrealised gain / (loss)</th></tr></thead><tbody>
+      ${fx.open.map(o=>`<tr><td>${o.kind==='AR'?'Invoice':'Bill'} ${o.number}</td><td>${o.party}</td><td style="text-align:right;">${fmtCurrency(o.open, o.currency)}</td><td style="text-align:right;">${o.docRate}</td><td style="text-align:right;">${o.rate ? o.rate + ' <span style="color:var(--muted);font-size:.75rem;">(' + o.rateDate + ')</span>' : '<span style="color:var(--muted);">no rate</span>'}</td><td style="text-align:right;">${o.gain===null ? '—' : gl(o.gain)}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No open foreign-currency invoices or bills.</div>`}
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">FX postings in the period</h3>
+    ${fx.lines.length ? `<table><thead><tr><th>Date</th><th>Source</th><th>Description</th><th style="text-align:right;">Gain / (loss)</th></tr></thead><tbody>
+      ${fx.lines.map(l=>`<tr><td>${l.date}</td><td>${l.source}</td><td>${l.memo}</td><td style="text-align:right;">${gl(round2(l.credit - l.debit))}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No foreign exchange gains or losses in this period.</div>`}
+  </div>`;
+}
+function renderAFS(){
+  const off = state.afsFYOffset || 0;
+  const fy = companyFinancialYearBounds(off), pfy = companyFinancialYearBounds(off - 1);
+  const plC = computePL(fy.start, fy.end), plP = computePL(pfy.start, pfy.end);
+  const bsC = computeBS(fy.end), bsP = computeBS(pfy.end);
+  const cfC = computeCashFlow(fy.start, fy.end), cfP = computeCashFlow(pfy.start, pfy.end);
+  const taxC = computeTaxComputation(fy);
+  const regC = computeAssetRegister(fy.start, fy.end).totals, regP = computeAssetRegister(pfy.start, pfy.end).totals;
+  const exC = expenseLineItems(fy.start, fy.end), exP = expenseLineItems(pfy.start, pfy.end);
+  const sg = n => n < 0 ? `(${fmt(-n)})` : fmt(n);
+  const row = (label, c, p, o)=>{
+    o = o || {};
+    const st = o.bold ? 'font-weight:700;border-top:1px solid var(--border);' : '';
+    const ind = o.indent ? 'padding-left:22px;' : '';
+    return `<tr style="${st}"><td style="${ind}${o.pad?'padding-top:12px;':''}">${label}</td><td style="text-align:right;${o.pad?'padding-top:12px;':''}">${o.head?'':sg(c)}</td><td style="text-align:right;${o.pad?'padding-top:12px;':''}">${o.head?'':sg(p)}</td></tr>`;
+  };
+  const head = (label)=>`<tr style="font-weight:600;"><td colspan="3" style="padding-top:14px;">${label}</td></tr>`;
+  const cols = `<thead><tr><th></th><th style="text-align:right;">${fy.end}</th><th style="text-align:right;">${pfy.end}</th></tr></thead>`;
+  const co = state.company || {};
+  // Statement of financial position pieces
+  const recC = bsC.accountsReceivable + (bsC.otherCurrentAssets - bsC.inventoryValue), recP = bsP.accountsReceivable + (bsP.otherCurrentAssets - bsP.inventoryValue);
+  const othLiabC = bsC.currentLiabOther - bsC.accountsPayableFromBills, othLiabP = bsP.currentLiabOther - bsP.accountsPayableFromBills;
+  const eqLabels = [...new Set([...(bsC.equityLines||[]).map(l=>l.label), ...(bsP.equityLines||[]).map(l=>l.label)])].filter(l=>!/^Profit/.test(l));
+  const eqAmt = (bs, label)=>{ const l = (bs.equityLines||[]).find(x=>x.label===label); return l ? l.amount : 0; };
+  // Statement of changes in equity
+  const openEq = bsP.equity, closeEq = bsC.equity;
+  const otherEq = round2(closeEq - openEq - plC.netProfit);
+  const openEqP = computeBS(dayBeforeIso(pfy.start)).equity;
+  const otherEqP = round2(bsP.equity - openEqP - plP.netProfit);
+  // Cash flow
+  const paidOut = c => round2(c.cosOut + c.opexOut + c.supplierPaymentsOut + c.payrollOut + c.sarsOut);
+  const exKeys = [...new Set([...Object.keys(exC), ...Object.keys(exP)])];
+  return `
+  <div class="panel period-bar">
+    <button class="btn small secondary" id="afs-prev-fy">&lsaquo; Previous year</button>
+    <div style="align-self:center;font-weight:600;">Financial year: ${fy.start} to ${fy.end}</div>
+    <button class="btn small secondary" id="afs-next-fy">Next year &rsaquo;</button>
+    <button class="btn small secondary" id="afs-this-fy" style="margin-left:auto;">Current year</button>
+  </div>
+  <div class="panel" style="text-align:center;padding:36px 20px;">
+    <h2 style="margin:0;">${co.name||'Company'}</h2>
+    ${co.registration_number ? `<p style="margin:4px 0;color:var(--muted);">Registration number ${co.registration_number}</p>` : ''}
+    <h3 style="margin:18px 0 4px;">Annual Financial Statements</h3>
+    <p style="margin:0;">for the year ended ${fy.end}</p>
+    <p style="margin:14px 0 0;font-size:.82rem;color:var(--muted);">Prepared by management from the company's accounting records. These statements have not been audited or independently reviewed.${fy.end > todayIso() ? ' This year is still in progress, so the figures are year-to-date.' : ''}</p>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">Statement of Financial Position</h3>
+    <p style="font-size:.78rem;color:var(--muted);margin-top:-6px;">as at ${fy.end} (comparative ${pfy.end})</p>
+    <table class="report-table">${cols}<tbody>
+      ${head('ASSETS')}
+      ${head('Non-current assets')}
+      ${row('Property, plant and equipment (note 2)', bsC.fixedAssets, bsP.fixedAssets, {indent:true})}
+      ${head('Current assets')}
+      ${row('Inventory', bsC.inventoryValue, bsP.inventoryValue, {indent:true})}
+      ${row('Trade and other receivables', recC, recP, {indent:true})}
+      ${(bsC.vatReceivableAmt || bsP.vatReceivableAmt) ? row('VAT receivable', bsC.vatReceivableAmt, bsP.vatReceivableAmt, {indent:true}) : ''}
+      ${row('Cash and cash equivalents', bsC.cash, bsP.cash, {indent:true})}
+      ${row('Total assets', bsC.totalAssets, bsP.totalAssets, {bold:true})}
+      ${head('EQUITY AND LIABILITIES')}
+      ${head('Equity')}
+      ${eqLabels.map(l=>row(l, eqAmt(bsC,l), eqAmt(bsP,l), {indent:true})).join('')}
+      ${row('Profit / (loss) for the period carried in equity', eqAmt(bsC,'Profit / (loss) to date'), eqAmt(bsP,'Profit / (loss) to date'), {indent:true})}
+      ${row('Total equity', bsC.equity, bsP.equity, {bold:true})}
+      ${head('Non-current liabilities')}
+      ${row('Loans and borrowings', bsC.nonCurrentLiab, bsP.nonCurrentLiab, {indent:true})}
+      ${head('Current liabilities')}
+      ${row('Trade payables', bsC.accountsPayableFromBills, bsP.accountsPayableFromBills, {indent:true})}
+      ${row('VAT payable', bsC.vatPayableAmt, bsP.vatPayableAmt, {indent:true})}
+      ${row('Other payables, SARS and income tax', othLiabC, othLiabP, {indent:true})}
+      ${row('Total liabilities', bsC.totalLiabilities, bsP.totalLiabilities, {bold:true})}
+      ${row('Total equity and liabilities', bsC.equity + bsC.totalLiabilities, bsP.equity + bsP.totalLiabilities, {bold:true})}
+    </tbody></table>
+  </div>
+  <div class="panel" style="page-break-before:always;">
+    <h3 style="margin-top:0;">Statement of Comprehensive Income</h3>
+    <p style="font-size:.78rem;color:var(--muted);margin-top:-6px;">for the year ended ${fy.end} (comparative ${pfy.end})</p>
+    <table class="report-table">${cols}<tbody>
+      ${row('Revenue', plC.revenue, plP.revenue)}
+      ${row('Cost of sales', -plC.cos, -plP.cos)}
+      ${row('Gross profit', plC.grossProfit, plP.grossProfit, {bold:true})}
+      ${head('Operating expenses')}
+      ${exKeys.map(k=>row((exC[k]||exP[k]).name, -((exC[k]||{}).amount||0), -((exP[k]||{}).amount||0), {indent:true})).join('')}
+      ${row('Profit before tax', plC.profitBeforeTax, plP.profitBeforeTax, {bold:true})}
+      ${row('Income tax expense (note 3)', -plC.incomeTax, -plP.incomeTax)}
+      ${row('Profit / (loss) for the year', plC.netProfit, plP.netProfit, {bold:true})}
+    </tbody></table>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">Statement of Changes in Equity</h3>
+    <table class="report-table">${cols}<tbody>
+      ${row('Balance at the beginning of the year', openEq, openEqP)}
+      ${row('Profit / (loss) for the year', plC.netProfit, plP.netProfit)}
+      ${row('Capital introduced, drawings, dividends and other movements', otherEq, otherEqP)}
+      ${row('Balance at the end of the year', closeEq, bsP.equity, {bold:true})}
+    </tbody></table>
+  </div>
+  <div class="panel" style="page-break-before:always;">
+    <h3 style="margin-top:0;">Statement of Cash Flows</h3>
+    <table class="report-table">${cols}<tbody>
+      ${row('Cash receipts from customers', cfC.cashFromRevenue, cfP.cashFromRevenue)}
+      ${row('Cash paid to suppliers, employees and SARS', -paidOut(cfC), -paidOut(cfP))}
+      ${row('Net cash from operating activities', cfC.netOperating, cfP.netOperating, {bold:true})}
+      ${row('Net cash from investing activities', cfC.netInvesting, cfP.netInvesting)}
+      ${row('Net cash from financing activities', cfC.netFinancing, cfP.netFinancing)}
+      ${(cfC.otherCashMovements || cfP.otherCashMovements) ? row('Other cash movements (journals)', cfC.otherCashMovements, cfP.otherCashMovements) : ''}
+      ${row('Net increase / (decrease) in cash', cfC.netChange, cfP.netChange, {bold:true})}
+      ${row('Cash at the beginning of the year', cfC.openingCash, cfP.openingCash)}
+      ${row('Cash at the end of the year', cfC.closingCashActual, cfP.closingCashActual, {bold:true})}
+    </tbody></table>
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">Notes to the financial statements</h3>
+    <h4 style="margin-bottom:4px;">1. Basis of preparation</h4>
+    <p style="font-size:.85rem;margin-top:0;">The statements are prepared on the accrual basis from the company's accounting records and are presented in South African rand. Revenue and expenses are shown excluding VAT. The reporting framework (for example IFRS for SMEs) and any further accounting policies are to be confirmed by management and the company's accountant.</p>
+    <h4 style="margin-bottom:4px;">2. Property, plant and equipment</h4>
+    <table class="report-table"><thead><tr><th></th><th style="text-align:right;">${fy.end}</th><th style="text-align:right;">${pfy.end}</th></tr></thead><tbody>
+      ${row('Cost', regC.cost, regP.cost)}
+      ${row('Accumulated depreciation', -regC.accumulatedDep, -regP.accumulatedDep)}
+      ${row('Carrying amount', regC.nbv, regP.nbv, {bold:true})}
+    </tbody></table>
+    <h4 style="margin-bottom:4px;">3. Taxation</h4>
+    <table class="report-table"><tbody>
+      <tr><td>Profit before tax</td><td style="text-align:right;">${sg(taxC.profitBeforeTax)}</td></tr>
+      <tr><td>Add back: non-deductible and separately treated items</td><td style="text-align:right;">${sg(taxC.totalAdd)}</td></tr>
+      <tr><td>Less: allowances and exempt amounts</td><td style="text-align:right;">${sg(-taxC.totalDed)}</td></tr>
+      ${taxC.lossUsed ? `<tr><td>Less: assessed loss utilised</td><td style="text-align:right;">${sg(-taxC.lossUsed)}</td></tr>` : ''}
+      <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Taxable income</td><td style="text-align:right;">${sg(taxC.taxableIncome)}</td></tr>
+      <tr><td>Normal tax at ${(COMPANY_TAX_RATE*100).toFixed(0)}%</td><td style="text-align:right;">${sg(taxC.tax)}</td></tr>
+      <tr><td>Tax recognised in the statement of comprehensive income</td><td style="text-align:right;">${sg(plC.incomeTax)}</td></tr>
+    </tbody></table>
+    ${Math.abs(taxC.tax - plC.incomeTax) >= 0.01 ? `<p style="font-size:.8rem;color:var(--danger);">The tax computed (${fmt(taxC.tax)}) differs from the tax recognised in the books (${fmt(plC.incomeTax)}). Post the income tax provision on the Company Tax tab so the statements agree.</p>` : ''}
+    <h4 style="margin-bottom:4px;">4. Employee costs</h4>
+    <p style="font-size:.85rem;margin-top:0;">Salaries, wages and employer contributions (UIF and SDL): ${fmt(plC.payrollCost)} (prior year ${fmt(plP.payrollCost)}).</p>
+    <div style="display:flex;gap:40px;margin-top:30px;font-size:.85rem;">
+      <div style="flex:1;border-top:1px solid var(--border);padding-top:6px;">Director / authorised signatory</div>
+      <div style="flex:1;border-top:1px solid var(--border);padding-top:6px;">Date approved</div>
+    </div>
+  </div>
+  <p style="color:var(--muted);font-size:.8rem;">Every figure here comes from the general ledger. Use Print / Save PDF at the top for a copy. These are management-prepared statements, not audited or reviewed, and not tax or legal advice.</p>`;
+}
+
 function renderCompanyTax(){
   const fy = companyFinancialYearBounds(state.companyTaxFYOffset || 0);
   const ct = computeProvisionalTax(fy);
@@ -7404,6 +8154,7 @@ function renderCompanyTax(){
       <button class="btn small secondary" id="companytax-next-fy">Next FY &rsaquo;</button>
       <button class="btn small secondary" id="companytax-this-fy" style="margin-left:auto;">Current FY</button>
     </div>
+    ${renderTaxComputation(fy)}
     <div class="grid">
       <div class="card" style="--accent-c:var(--c-reports);"><h3>Est. Net Profit (full FY)</h3><div class="value ${ct.estimatedAnnualProfit<0?'negative':''}">${fmt(ct.estimatedAnnualProfit)}</div><div class="sub">${ct.isFYComplete ? `Actual, for the full year` : `Extrapolated from ${fmt(ct.ytdProfit)} to ${ct.ytdThrough}`}</div></div>
       <div class="card"><h3>Est. Company Income Tax</h3><div class="value">${fmt(ct.estimatedAnnualTax)}</div><div class="sub">${(COMPANY_TAX_RATE*100).toFixed(0)}% flat company rate</div></div>
@@ -7424,7 +8175,7 @@ function renderCompanyTax(){
         }).join('')}
       </tbody></table>
     </div>
-    <p style="color:var(--muted);font-size:.8rem;">Estimate only, at the flat ${(COMPANY_TAX_RATE*100).toFixed(0)}% standard company rate — this does not model Small Business Corporation graduated rates or turnover tax, and (while the financial year is still in progress) extrapolates from your Profit &amp; Loss to date. SARS' actual first and second provisional tax due dates fall on the last day of the 6th and 12th months of your financial year. Not tax advice — confirm exact dates and figures with your accountant or SARS eFiling before paying.</p>
+    <p style="color:var(--muted);font-size:.8rem;">The provisional estimate below is at the flat ${(COMPANY_TAX_RATE*100).toFixed(0)}% standard company rate on profit before tax — it does not model Small Business Corporation graduated rates or turnover tax, and (while the financial year is still in progress) extrapolates from your Profit &amp; Loss to date. SARS' actual first and second provisional tax due dates fall on the last day of the 6th and 12th months of your financial year. Not tax advice — confirm exact dates and figures with your accountant or SARS eFiling before paying.</p>
   `;
 }
 
@@ -7494,6 +8245,62 @@ function attachReportsHandlers(){
     state.reportsPeriod = {mode:'custom', start, end};
     render();
   });
+  document.querySelectorAll('[data-health-go]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      if(btn.dataset.healthTab) state.reportsTab = btn.dataset.healthTab;
+      goToView(btn.dataset.healthGo);
+    });
+  });
+  document.getElementById('fx-rate-suggest')?.addEventListener('click', async ()=>{
+    const cur = document.getElementById('fx-rate-currency').value;
+    const r = await fetchFxRate(cur, document.getElementById('fx-rate-date').value);
+    if(r){ document.getElementById('fx-rate-value').value = r; toast(`Suggested ${cur} rate: ${r} — check it before saving.`); }
+    else toast('Could not fetch a rate — please type it in.');
+  });
+  document.getElementById('fx-rate-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const rate = parseFloat(document.getElementById('fx-rate-value').value) || 0;
+    if(rate <= 0){ toast('Enter a valid rate.'); return; }
+    const date = document.getElementById('fx-rate-date').value;
+    if(isPeriodLocked(date)){ toast(periodLockMessage()); return; }
+    const currency = document.getElementById('fx-rate-currency').value;
+    const {error} = await sb.from('cc_fx_rates').upsert({company_id: state.company.id, rate_date: date, currency, rate, created_by: state.user.id}, {onConflict:'company_id,rate_date,currency'});
+    if(error){ toast(error.message); return; }
+    await logActivity('create', 'fx_rate', null, `${currency} ${rate} at ${date}`);
+    await refreshAll(); render(); toast('Rate saved.');
+  });
+  document.querySelectorAll('[data-del-fx-rate]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const r = (state.fxRates||[]).find(x=>x.id===btn.dataset.delFxRate);
+      if(r && isPeriodLocked(r.rate_date)){ toast(periodLockMessage()); return; }
+      if(!confirm('Delete this rate? Its revaluation will be removed from the ledger.')) return;
+      await sb.from('cc_fx_rates').delete().eq('id', btn.dataset.delFxRate);
+      await refreshAll(); render();
+    });
+  });
+  document.getElementById('afs-prev-fy')?.addEventListener('click', ()=>{ state.afsFYOffset = (state.afsFYOffset||0) - 1; render(); });
+  document.getElementById('afs-next-fy')?.addEventListener('click', ()=>{ state.afsFYOffset = (state.afsFYOffset||0) + 1; render(); });
+  document.getElementById('afs-this-fy')?.addEventListener('click', ()=>{ state.afsFYOffset = 0; render(); });
+  document.getElementById('tax-adj-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const amount = parseFloat(document.getElementById('tax-adj-amount').value) || 0;
+    const label = document.getElementById('tax-adj-label').value.trim();
+    if(amount <= 0 || !label){ toast('Enter a description and an amount.'); return; }
+    const {error} = await sb.from('cc_tax_adjustments').insert({
+      company_id: state.company.id, fy_end: document.getElementById('tax-adj-fy').value,
+      kind: document.getElementById('tax-adj-kind').value, label, amount, created_by: state.user.id
+    });
+    if(error){ toast(error.message); return; }
+    await refreshAll(); render(); toast('Added.');
+  });
+  document.querySelectorAll('[data-del-tax-adj]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      await sb.from('cc_tax_adjustments').delete().eq('id', btn.dataset.delTaxAdj);
+      await refreshAll(); render();
+    });
+  });
+  document.getElementById('tax-post-provision')?.addEventListener('click', (e)=>postTaxProvision(e.currentTarget.dataset.fyEnd));
+  document.getElementById('tax-remove-provision')?.addEventListener('click', (e)=>removeTaxProvision(e.currentTarget.dataset.fyEnd));
   document.getElementById('companytax-prev-fy')?.addEventListener('click', ()=>{ state.companyTaxFYOffset = (state.companyTaxFYOffset||0) - 1; render(); });
   document.getElementById('companytax-next-fy')?.addEventListener('click', ()=>{ state.companyTaxFYOffset = (state.companyTaxFYOffset||0) + 1; render(); });
   document.getElementById('companytax-this-fy')?.addEventListener('click', ()=>{ state.companyTaxFYOffset = 0; render(); });
