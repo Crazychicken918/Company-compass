@@ -821,6 +821,8 @@ let state = {
   stockItems: [],   // cc_stock_items
   provisionalTax: [],     // cc_provisional_tax rows (company income tax, 2 periods/year)
   emp201Submissions: [],  // cc_emp201_submissions rows (monthly PAYE/UIF/SDL tracking)
+  vatPayments: [],        // cc_vat_payments rows (payments to / refunds from SARS; refunds stored negative)
+  invoiceWriteoffs: [],   // cc_invoice_writeoffs rows (bad debts written off)
   coidaReturns: [],       // cc_coida_returns rows (annual Return of Earnings tracking)
   supplierInvoices: [],
   supplierInvoiceItems: {}, // supplierInvoiceId -> items[]
@@ -1209,7 +1211,7 @@ async function refreshAll(){
   state.leaveEntries = leaveEntriesRes.data || [];
   state.taskNotes = taskNotesRes.data || [];
   state.attachments = attachmentsRes.data || [];
-  const [auditLogRes, bankTxRes, stockRes, quotesRes, provTaxRes, emp201Res, coidaRes, liabilityPaymentsRes] = await Promise.all([
+  const [auditLogRes, bankTxRes, stockRes, quotesRes, provTaxRes, emp201Res, coidaRes, liabilityPaymentsRes, vatPaymentsRes, writeoffsRes] = await Promise.all([
     sb.from('cc_audit_log').select('*').eq('company_id', cid).order('created_at', {ascending:false}).limit(300),
     sb.from('cc_bank_transactions').select('*').eq('company_id', cid).order('tx_date', {ascending:false}),
     sb.from('cc_stock_items').select('*').eq('company_id', cid).order('name', {ascending:true}),
@@ -1217,8 +1219,12 @@ async function refreshAll(){
     sb.from('cc_provisional_tax').select('*').eq('company_id', cid),
     sb.from('cc_emp201_submissions').select('*').eq('company_id', cid),
     sb.from('cc_coida_returns').select('*').eq('company_id', cid),
-    sb.from('cc_liability_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false})
+    sb.from('cc_liability_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false}),
+    sb.from('cc_vat_payments').select('*').eq('company_id', cid).order('payment_date', {ascending:false}),
+    sb.from('cc_invoice_writeoffs').select('*').eq('company_id', cid).order('write_off_date', {ascending:false})
   ]);
+  state.vatPayments = vatPaymentsRes.data || [];
+  state.invoiceWriteoffs = writeoffsRes.data || [];
   state.auditLog = auditLogRes.data || [];
   state.bankTransactions = bankTxRes.data || [];
   state.stockItems = stockRes.data || [];
@@ -2172,7 +2178,7 @@ function renderDashboard(){
   const v = vatFromLedger();
   const unmatchedBankTx = state.bankTransactions.filter(x=>x.status==='unmatched');
   const today = todayIso();
-  const outstandingInvoices = state.invoices.filter(i=>i.status==='sent'||i.status==='overdue');
+  const outstandingInvoices = state.invoices.filter(i=>(i.status==='sent'||i.status==='overdue') && !(invoiceWrittenOff(i.id) > 0 && invoiceBalance(i).balance < 0.005));
   const overdueInvoices = outstandingInvoices.filter(i=>i.due_date && i.due_date < today);
   const overdueLiabilities = state.liabilities.filter(l=>l.is_current && l.due_date && l.due_date < today);
   const dueSoonLiabilities = state.liabilities.filter(l=>l.is_current && l.due_date && l.due_date >= today && daysBetween(today, l.due_date) <= 7);
@@ -2436,7 +2442,7 @@ function assetMonthlyDepreciation(a){
 function assetNBV(a){ return Number(a.value) - Number(a.accumulated_depreciation||0); }
 function renderAssets(){
   const canEdit = hasModule('assets');
-  const total = state.assets.reduce((s,a)=>s+Number(a.value),0);
+  const total = state.assets.filter(a=>!a.disposed_date).reduce((s,a)=>s+Number(a.value),0);
   return `
     <div class="section-header" style="--accent-c:var(--c-assets);"><h1>Assets</h1>${canEdit ? `<button class="btn" id="add-asset-btn">+ Add Asset</button>` : ''}</div>
     <p class="section-caption">What the business owns — current assets, plus fixed assets that depreciate over time.</p>
@@ -2445,16 +2451,33 @@ function renderAssets(){
       ${state.assets.length ? `<table><thead><tr><th>Description</th><th>Category</th><th>Value</th><th>Type</th><th>Purchase Date</th><th>Monthly Depr.</th><th>Accum. Depr.</th><th>NBV</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
         ${state.assets.map(a=>{
           const md = assetMonthlyDepreciation(a);
-          const canRun = canEdit && !a.is_current && md && assetNBV(a) > Number(a.residual_value||0) && a.last_depreciation_run !== todayIso();
-          const typeLabel = a.is_current ? 'Current' : `Fixed · ${depreciationMethodLabel(a.depreciation_method)}`;
-          return `<tr><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td><td>${typeLabel}</td><td>${a.purchase_date||'—'}</td><td>${md!==null?fmt(md):'—'}</td><td>${fmt(Number(a.accumulated_depreciation||0))}</td><td>${a.is_current?'—':fmt(assetNBV(a))}</td>${canEdit?`<td>
+          const disposed = !!a.disposed_date;
+          const canRun = canEdit && !disposed && !a.is_current && md && assetNBV(a) > Number(a.residual_value||0) && a.last_depreciation_run !== todayIso();
+          const typeLabel = disposed ? `Disposed ${a.disposed_date}` : (a.is_current ? 'Current' : `Fixed · ${depreciationMethodLabel(a.depreciation_method)}`);
+          return `<tr${disposed?' style="opacity:.65;"':''}><td>${a.description}</td><td>${a.category||'—'}</td><td>${fmt(a.value)}</td><td>${typeLabel}</td><td>${a.purchase_date||'—'}</td><td>${md!==null?fmt(md):'—'}</td><td>${fmt(Number(a.accumulated_depreciation||0))}</td><td>${a.is_current?'—':fmt(assetNBV(a))}</td>${canEdit?`<td>
             ${canRun?`<button class="btn small secondary" data-run-depr="${a.id}">Run Depreciation</button>`:''}
+            ${(!a.is_current && !disposed) ? `<button class="btn small secondary" data-dispose-asset="${a.id}">Dispose</button>` : ''}
+            ${disposed && isAdmin() ? `<button class="btn small secondary" data-undo-dispose="${a.id}">Undo disposal</button>` : ''}
             <button class="btn small danger" data-del-asset="${a.id}">Delete</button>
           </td>`:''}</tr>`;
         }).join('')}
       </tbody></table>` : `<div class="empty">No assets recorded yet.</div>`}
     </div>
     ${canEdit ? `
+    <div class="modal-backdrop hidden" id="asset-dispose-backdrop"><div class="modal">
+      <button class="close-x" id="asset-dispose-close">✕</button>
+      <h2>Dispose of asset</h2>
+      <p id="asset-dispose-summary" style="font-size:.88rem;color:var(--muted);"></p>
+      <form id="asset-dispose-form">
+        <input type="hidden" id="asset-dispose-id">
+        <div class="field"><label>Date of disposal</label><input type="date" id="asset-dispose-date" required></div>
+        <div class="field"><label>Proceeds received (R) — enter 0 if scrapped</label><input type="number" step="0.01" min="0" id="asset-dispose-proceeds" value="0" required></div>
+        ${weAreVatRegistered() ? `<div class="field"><label><input type="checkbox" id="asset-dispose-vat" style="width:auto;"> Proceeds include VAT (output tax is payable on the sale)</label></div>` : ''}
+        <div class="field"><label>Notes (optional)</label><input type="text" id="asset-dispose-note"></div>
+        <div id="asset-dispose-preview" style="font-size:.88rem;margin:6px 0;"></div>
+        <div class="modal-actions"><button type="button" class="btn secondary" id="asset-dispose-cancel">Cancel</button><button type="submit" class="btn">Record disposal</button></div>
+      </form>
+    </div></div>
     <div class="modal-backdrop hidden" id="asset-modal-backdrop"><div class="modal">
       <button class="close-x" id="asset-modal-close">✕</button>
       <h2>Add Asset</h2>
@@ -2516,6 +2539,60 @@ function attachAssetHandlers(){
     await logActivity('create', 'asset', savedAsset && savedAsset.id, `${assetDescription} (${fmt(assetValue)})`);
     await refreshAll(); render(); toast('Saved.');
   });
+  // ---- disposals ----
+  const disposeBackdrop = document.getElementById('asset-dispose-backdrop');
+  function updateDisposePreview(){
+    const a = state.assets.find(x=>x.id===document.getElementById('asset-dispose-id').value);
+    if(!a) return;
+    const gross = parseFloat(document.getElementById('asset-dispose-proceeds').value) || 0;
+    const vatOn = !!document.getElementById('asset-dispose-vat')?.checked;
+    const vat = vatOn ? round2(gross - gross/(1+VAT_RATE)) : 0;
+    const gain = round2((gross - vat) - assetNBV(a));
+    document.getElementById('asset-dispose-preview').innerHTML = `Net book value ${fmt(assetNBV(a))} · net proceeds ${fmt(gross - vat)} · <strong class="${gain<0?'negative':'positive'}">${gain>=0?'profit':'loss'} on disposal ${fmt(Math.abs(gain))}</strong>`;
+  }
+  document.querySelectorAll('[data-dispose-asset]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const a = state.assets.find(x=>x.id===btn.dataset.disposeAsset); if(!a) return;
+      document.getElementById('asset-dispose-id').value = a.id;
+      document.getElementById('asset-dispose-date').value = todayIso();
+      document.getElementById('asset-dispose-proceeds').value = '0';
+      document.getElementById('asset-dispose-note').value = '';
+      const vc = document.getElementById('asset-dispose-vat'); if(vc) vc.checked = false;
+      document.getElementById('asset-dispose-summary').textContent = `${a.description} — cost ${fmt(a.value)}, accumulated depreciation ${fmt(Number(a.accumulated_depreciation||0))}.`;
+      updateDisposePreview();
+      disposeBackdrop.classList.remove('hidden');
+    });
+  });
+  ['asset-dispose-proceeds','asset-dispose-vat'].forEach(id=>document.getElementById(id)?.addEventListener('input', updateDisposePreview));
+  document.getElementById('asset-dispose-cancel')?.addEventListener('click', ()=>disposeBackdrop.classList.add('hidden'));
+  document.getElementById('asset-dispose-close')?.addEventListener('click', ()=>disposeBackdrop.classList.add('hidden'));
+  document.getElementById('asset-dispose-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const a = state.assets.find(x=>x.id===document.getElementById('asset-dispose-id').value); if(!a) return;
+    const date = document.getElementById('asset-dispose-date').value;
+    if(isPeriodLocked(date)){ toast(periodLockMessage()); return; }
+    if(a.purchase_date && date < a.purchase_date){ toast('The disposal date is before the purchase date.'); return; }
+    const proceeds = parseFloat(document.getElementById('asset-dispose-proceeds').value) || 0;
+    const {error} = await sb.from('cc_assets').update({
+      disposed_date: date, disposal_proceeds: proceeds,
+      disposal_vat: !!document.getElementById('asset-dispose-vat')?.checked,
+      disposal_note: document.getElementById('asset-dispose-note').value.trim() || null
+    }).eq('id', a.id);
+    if(error){ toast(error.message); return; }
+    await logActivity('update', 'asset', a.id, `Disposed of ${a.description} for ${fmt(proceeds)}`);
+    disposeBackdrop.classList.add('hidden');
+    await refreshAll(); render(); toast('Disposal recorded.');
+  });
+  document.querySelectorAll('[data-undo-dispose]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const a = state.assets.find(x=>x.id===btn.dataset.undoDispose); if(!a) return;
+      if(isPeriodLocked(a.disposed_date)){ toast(periodLockMessage()); return; }
+      if(!confirm('Undo this disposal? The asset goes back on the books.')) return;
+      await sb.from('cc_assets').update({disposed_date:null, disposal_proceeds:0, disposal_vat:false, disposal_note:null}).eq('id', a.id);
+      await logActivity('update', 'asset', a.id, `Disposal undone: ${a.description}`);
+      await refreshAll(); render();
+    });
+  });
   document.querySelectorAll('[data-del-asset]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this asset?')) return;
@@ -2529,6 +2606,7 @@ function attachAssetHandlers(){
     btn.addEventListener('click', async ()=>{
       const asset = state.assets.find(a=>a.id===btn.dataset.runDepr);
       if(!asset) return;
+      if(asset.disposed_date){ toast('This asset has been disposed of.'); return; }
       const monthly = assetMonthlyDepreciation(asset);
       if(!monthly){ toast('Set a useful life to run depreciation.'); return; }
       const remaining = assetNBV(asset) - Number(asset.residual_value||0);
@@ -2754,6 +2832,8 @@ const DEFAULT_CHART = [
   {key:'PAYROLL', code:'6100', name:'Payroll & Staff Costs', type:'expense'},
   {key:'DEPR', code:'6200', name:'Depreciation', type:'expense'},
   {key:'INT', code:'6300', name:'Interest Expense', type:'expense'},
+  {key:'BADDEBT', code:'6400', name:'Bad Debts Written Off', type:'expense'},
+  {key:'DISP', code:'6500', name:'Loss / (Profit) on Disposal of Assets', type:'expense'},
 ];
 const CHART_TYPE_LABELS = {asset:'Assets', liability:'Liabilities', equity:'Equity', revenue:'Revenue', expense:'Expenses'};
 
@@ -2778,6 +2858,13 @@ function ledgerSplitVat(amount, vatApplicable){
 }
 function ledgerStockLike(a){ return /stock|inventory/i.test((a && a.category) || ''); }
 
+// Same day-of-month, k months later (clipped to the end of shorter months).
+function addMonthsClipped(iso, k){
+  const y = Number(iso.slice(0,4)), m = Number(iso.slice(5,7)) - 1, d = Number(iso.slice(8,10));
+  const target = new Date(Date.UTC(y, m + k, 1));
+  const last = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+  return new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), Math.min(d, last))).toISOString().slice(0,10);
+}
 // SDL is accrued per payslip (1% of basic + travel allowance) once the business is over the R500k
 // threshold — the same rule the Monthly EMP201 Tracking panel uses, so the two always agree.
 function payrollSdlApplicable(){ return !!computeStatutorySummary().sdl.applicable; }
@@ -2920,6 +3007,33 @@ function buildLedger(){
     post(p.payment_date, 'Loan Repayment', `Principal repaid${l ? ' — '+l.description : ''}`, [[l && l.is_current ? 'OCL' : 'NCL', principal],['BANK', -principal]]);
   });
 
+  // Fixed-asset disposals: cost and accumulated depreciation come off the books; the difference between
+  // net proceeds and net book value is the profit (credit) or loss (debit) on disposal.
+  (state.assets||[]).filter(a=>!a.is_current && a.disposed_date).forEach(a=>{
+    const cost = round2((Number(a.value)||0) - (assetDelta[a.id]||0));
+    const accum = round2(Number(a.accumulated_depreciation)||0);
+    const proceeds = round2(Number(a.disposal_proceeds)||0);
+    const vat = a.disposal_vat ? round2(proceeds - proceeds/(1+VAT_RATE)) : 0;
+    const net = round2(proceeds - vat);
+    const nbv = round2(cost - accum);
+    post(a.disposed_date, 'Asset Disposal', `Disposal — ${a.description}`,
+      [['BANK', proceeds],['FA_DEP', accum],['FA_COST', -cost],['VAT', -vat],['DISP', -round2(net - nbv)]]);
+  });
+
+  // Bad debts written off: the unpaid receivable is cleared to an expense (optionally reclaiming the VAT).
+  (state.invoiceWriteoffs||[]).forEach(w=>{
+    const inv = (state.invoices||[]).find(i=>i.id===w.invoice_id);
+    const gross = round2(Number(w.amount)||0);
+    const vat = w.vat_adjust ? round2(gross - gross/(1+VAT_RATE)) : 0;
+    post(w.write_off_date, 'Bad Debt', `Bad debt written off${inv ? ' — '+inv.invoice_number : ''}`, [['BADDEBT', gross - vat],['VAT', vat],['AR', -gross]], w.id);
+  });
+
+  // Payments to SARS (positive) and refunds from SARS (negative) clear the VAT Control account.
+  (state.vatPayments||[]).forEach(v=>{
+    const amt = round2(Number(v.amount)||0);
+    post(v.payment_date, 'VAT Payment', amt >= 0 ? `VAT paid to SARS${v.reference ? ' — '+v.reference : ''}` : `VAT refund received from SARS${v.reference ? ' — '+v.reference : ''}`, [['VAT', amt],['BANK', -amt]], v.id);
+  });
+
   // Stock on hand that no purchase bill or recorded asset accounts for (opening stock, or goods bought
   // without a bill) is brought in against Opening Balance Equity so Inventory ties to the stock list.
   if(tracksInventory() && (state.stockItems||[]).length){
@@ -2947,7 +3061,23 @@ function buildLedger(){
       const amt = Number(l.amount)||0;
       return [key, l.side === 'debit' ? amt : -amt];
     });
-    post(j.journal_date, j.kind === 'year_end_close' ? 'Year-End Close' : 'Manual Journal', j.description, lines);
+    if(j.kind === 'year_end_close'){ post(j.journal_date, 'Year-End Close', j.description, lines); return; }
+    // Recurring journals repeat monthly until their end date (derived, so nothing is stored twice);
+    // reversing journals post the exact opposite on the reversal date. Only pure ledger journals qualify.
+    const pure = (state.manualJournalLines||{})[j.id] && ((state.manualJournalLines||{})[j.id]||[]).every(l=>l.account_key);
+    if(j.recur_monthly && pure){
+      const until = j.recur_until || todayIso();
+      for(let k = 0; k < 60; k++){
+        const d = addMonthsClipped(j.journal_date, k);
+        if(d > until) break;
+        post(d, 'Manual Journal', k ? `${j.description} (recurring ${k+1})` : j.description, lines);
+      }
+      return;
+    }
+    post(j.journal_date, 'Manual Journal', j.description, lines);
+    if(j.auto_reverse && j.reverse_date && pure){
+      post(j.reverse_date, 'Manual Journal', `Reversal of: ${j.description}`, lines.map(([k, v])=>[k, -v]));
+    }
   });
 
   return journals;
@@ -3246,7 +3376,7 @@ function renderManualJournals(){
       const credits = lines.filter(l=>l.side==='credit').reduce((s,l)=>s+Number(l.amount),0);
       return `
       <details class="collapsible">
-        <summary>${j.journal_date} — ${j.description} (${fmt(debits)}) ${approvalPill(j)}${j.kind==='year_end_close' ? ' <span class="tag-pill">year-end close</span>' : ''}</summary>
+        <summary>${j.journal_date} — ${j.description} (${fmt(debits)}) ${approvalPill(j)}${j.kind==='year_end_close' ? ' <span class="tag-pill">year-end close</span>' : ''}${j.auto_reverse && j.reverse_date ? ` <span class="tag-pill">reverses ${j.reverse_date}</span>` : ''}${j.recur_monthly ? ` <span class="tag-pill">monthly until ${j.recur_until||'—'}</span>` : ''}</summary>
         <div class="panel">
           <table><thead><tr><th>Account</th><th>Debit</th><th>Credit</th><th>Memo</th></tr></thead><tbody>
             ${lines.map(l=>`<tr><td>${journalLineAccountLabel(l)}</td><td>${l.side==='debit'?fmt(l.amount):'—'}</td><td>${l.side==='credit'?fmt(l.amount):'—'}</td><td>${l.memo||'—'}</td></tr>`).join('')}
@@ -3279,6 +3409,12 @@ function journalModal(){
       </table>
       <button type="button" class="btn secondary small" id="journal-add-line" style="margin-top:8px;">+ Add line</button>
       <div id="journal-balance-display" style="margin-top:10px;font-size:.85rem;"></div>
+      <div class="row" style="margin-top:12px;align-items:flex-end;">
+        <div class="field"><label>Auto-reverse on (optional — accruals/prepayments)</label><input type="date" id="journal-reverse-date"></div>
+        <div class="field"><label><input type="checkbox" id="journal-recur" style="width:auto;"> Repeat monthly</label></div>
+        <div class="field"><label>Repeat until</label><input type="date" id="journal-recur-until"></div>
+      </div>
+      <p style="font-size:.78rem;color:var(--muted);margin:2px 0 8px;">A reversing journal posts the exact opposite on the date you choose. A recurring journal posts again each month on the same day until the end date. Use one or the other.</p>
       ${attachmentCaptureField('journal-attachment-file')}
       <div class="modal-actions">
         <button type="button" class="btn secondary" id="journal-cancel">Cancel</button>
@@ -3397,6 +3533,9 @@ function attachManualJournalHandlers(){
     document.getElementById('journal-description').value = '';
     document.getElementById('journal-lines-body').innerHTML = manualJournalLineRow() + manualJournalLineRow();
     document.getElementById('journal-attachment-file').value = '';
+    document.getElementById('journal-reverse-date').value = '';
+    document.getElementById('journal-recur').checked = false;
+    document.getElementById('journal-recur-until').value = '';
     updateJournalBalanceDisplay();
     backdrop.classList.remove('hidden');
   });
@@ -3421,12 +3560,20 @@ function attachManualJournalHandlers(){
     const totalDebits = round2(parsed.filter(l=>l.side==='debit').reduce((s,l)=>s+l.amount,0));
     const totalCredits = round2(parsed.filter(l=>l.side==='credit').reduce((s,l)=>s+l.amount,0));
     if(Math.abs(totalDebits - totalCredits) > 0.005){ toast(`Debits (${fmt(totalDebits)}) must equal credits (${fmt(totalCredits)}) before you can post this journal.`); return; }
+    const reverseDate = document.getElementById('journal-reverse-date').value || null;
+    const recur = document.getElementById('journal-recur').checked;
+    const recurUntil = document.getElementById('journal-recur-until').value || null;
+    if(reverseDate && recur){ toast('Choose either auto-reverse or repeat monthly, not both.'); return; }
+    if(reverseDate && reverseDate <= journalDate){ toast('The reversal date must be after the journal date.'); return; }
+    if(recur && (!recurUntil || recurUntil <= journalDate)){ toast('Choose a repeat-until date after the journal date.'); return; }
     const {data: journal, error} = await sb.from('cc_manual_journals').insert({
       company_id: state.company.id,
       journal_date: journalDate,
       description,
       created_by: state.user.id,
-      approval_status: approvalStatusForNew()
+      approval_status: approvalStatusForNew(),
+      auto_reverse: !!reverseDate, reverse_date: reverseDate,
+      recur_monthly: recur, recur_until: recur ? recurUntil : null
     }).select().single();
     if(error){ toast(error.message); return; }
     for(const line of parsed){
@@ -3488,10 +3635,14 @@ function billBalance(bill){
 }
 // Customer-invoice equivalent of billBalance() — in ZAR, via docTotalZAR(), so a foreign-currency
 // invoice's balance is on the same footing as a ZAR bank statement line.
+function invoiceWrittenOff(invId){
+  return round2((state.invoiceWriteoffs||[]).filter(w=>w.invoice_id===invId).reduce((s,w)=>s+Number(w.amount||0),0));
+}
 function invoiceBalance(inv){
   const total = docTotalZAR(inv, state.invoiceItems[inv.id]);
   const paid = (state.invoicePayments||[]).filter(p=>p.invoice_id===inv.id).reduce((s,p)=>s+Number(p.amount),0);
-  return {total, paid, balance: Math.max(0, total - paid)};
+  const writtenOff = invoiceWrittenOff(inv.id);
+  return {total, paid, writtenOff, balance: Math.max(0, total - paid - writtenOff)};
 }
 // Liability (loan) equivalent of billBalance()/invoiceBalance(). Only the principal portion of a
 // payment reduces the balance — interest is a P&L expense, posted separately as a cc_entries row
@@ -4262,6 +4413,10 @@ function openClientStatementView(clientId, fromDate, toDate){
     const inv = state.invoices.find(i=>i.id===p.invoice_id);
     lines.push({date:p.payment_date, label:`Payment received (${inv?inv.invoice_number:'—'})`, amount: -Number(p.amount)});
   });
+  (state.invoiceWriteoffs||[]).filter(w=>clientInvoiceIds.has(w.invoice_id) && inRange(w.write_off_date)).forEach(w=>{
+    const inv = state.invoices.find(i=>i.id===w.invoice_id);
+    lines.push({date:w.write_off_date, label:`Written off (${inv?inv.invoice_number:'—'})`, amount: -Number(w.amount)});
+  });
   lines.sort((a,b)=> a.date < b.date ? -1 : (a.date > b.date ? 1 : 0));
   let running = 0;
   const withBalance = lines.map(l=>{ running = round2(running + l.amount); return {...l, balance: running}; });
@@ -4677,7 +4832,10 @@ async function openInvoiceView(invoiceId){
   const isForeign = inv.currency && inv.currency !== 'ZAR';
   const zarTotal = isForeign ? round2(total * (Number(inv.exchange_rate)||1)) : total;
   const totalPaid = payments.reduce((s,p)=>s+Number(p.amount),0);
-  const balance = Math.max(0, zarTotal - totalPaid);
+  const writeoffs = (state.invoiceWriteoffs||[]).filter(w=>w.invoice_id===inv.id);
+  const writtenOff = round2(writeoffs.reduce((s,w)=>s+Number(w.amount||0),0));
+  const balance = Math.max(0, zarTotal - totalPaid - writtenOff);
+  const canWriteOff = hasModule('invoices') && inv.approval_status === 'approved';
   const canRecordPayment = hasModule('invoices') && inv.approval_status === 'approved';
   const mailtoSubject = encodeURIComponent(`Invoice ${inv.invoice_number} from ${state.company.name}`);
   const mailtoBody = encodeURIComponent(`Hi ${client?client.name:''},\n\nPlease find invoice ${inv.invoice_number} for ${fmt(total)}, ${inv.due_date?('due '+inv.due_date):'due on receipt'}.\n\n(Use "Print / Save PDF" first and attach it — this just opens a pre-filled email, it can't attach the file for you.)\n\nThanks,\n${state.company.name}`);
@@ -4697,7 +4855,7 @@ async function openInvoiceView(invoiceId){
       <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
       ${weAreVatRegistered() ? `<div>VAT (15%): ${fmt(vatTotal)}</div>` : ''}
       <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmtCurrency(total, inv.currency)}${isForeign ? ` (≈ ${fmt(zarTotal)} @ ${inv.exchange_rate})` : ''}</div>
-      ${totalPaid ? `<div style="color:var(--accent2);">Paid: ${fmt(totalPaid)}</div><div style="font-weight:700;">Balance due: ${fmt(balance)}</div>` : ''}
+      ${(totalPaid || writtenOff) ? `${totalPaid ? `<div style="color:var(--accent2);">Paid: ${fmt(totalPaid)}</div>` : ''}${writtenOff ? `<div style="color:var(--danger);">Written off as bad debt: ${fmt(writtenOff)}</div>` : ''}<div style="font-weight:700;">Balance due: ${fmt(balance)}</div>` : ''}
     </div>
     ${inv.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${inv.notes}</p>` : ''}
     ${inv.approval_status === 'rejected' && inv.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${inv.rejection_note}</p>` : ''}
@@ -4708,6 +4866,17 @@ async function openInvoiceView(invoiceId){
         ${payments.map(p=>`<tr><td>${p.payment_date}</td><td>${fmt(p.amount)}</td><td>${p.notes||'—'}</td>${canRecordPayment?`<td><button class="btn small danger" data-del-invoice-payment="${p.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No payments recorded yet.</div>`}
       ${awaitingPayments.length ? `<p style="font-size:.8rem;color:var(--muted);margin:8px 0 2px;">Not yet counted:</p>${awaitingPayments.map(p=>`<div style="font-size:.82rem;">${p.payment_date} — ${fmt(p.amount)} ${approvalPill(p)}${p.approval_status==='rejected' && p.rejection_note ? ' — '+p.rejection_note : ''}${canRecordPayment?` <button class="btn small danger" data-del-invoice-payment="${p.id}">Delete</button>`:''}</div>`).join('')}` : ''}
+      ${writeoffs.length ? `<p style="font-size:.82rem;margin:10px 0 2px;">Bad debt write-offs:</p>${writeoffs.map(w=>`<div style="font-size:.82rem;">${w.write_off_date} — ${fmt(w.amount)}${w.vat_adjust?' (VAT reclaimed)':''}${w.notes?' — '+w.notes:''}${canWriteOff?` <button class="btn small danger" data-del-writeoff="${w.id}">Reverse write-off</button>`:''}</div>`).join('')}` : ''}
+      ${(canWriteOff && balance > 0.005) ? `<button type="button" class="btn secondary small" id="add-writeoff-btn" style="margin-top:10px;">Write off as bad debt</button>
+      <form id="writeoff-form" class="hidden" style="margin-top:10px;">
+        <div class="row">
+          <div class="field"><label>Date</label><input type="date" id="writeoff-date" required></div>
+          <div class="field"><label>Amount to write off (R)</label><input type="number" step="0.01" min="0.01" max="${balance.toFixed(2)}" id="writeoff-amount" value="${balance.toFixed(2)}" required></div>
+        </div>
+        ${weAreVatRegistered() ? `<div class="field"><label><input type="checkbox" id="writeoff-vat" style="width:auto;"> Reclaim the output VAT on this amount (bad-debt relief — SARS conditions apply, e.g. at least 12 months overdue)</label></div>` : ''}
+        <div class="field"><label>Reason (optional)</label><input type="text" id="writeoff-notes"></div>
+        <div class="modal-actions"><button type="submit" class="btn small danger">Write off</button></div>
+      </form>` : ''}
       ${canRecordPayment ? `<button type="button" class="btn secondary small" id="add-invoice-payment-btn" style="margin-top:10px;">+ Record Payment</button>
       <form id="invoice-payment-form" class="hidden" style="margin-top:10px;">
         <div class="row">
@@ -4751,6 +4920,36 @@ async function openInvoiceView(invoiceId){
   document.getElementById('add-invoice-payment-btn')?.addEventListener('click', ()=>{
     document.getElementById('invoice-payment-date').value = new Date().toISOString().slice(0,10);
     document.getElementById('invoice-payment-form').classList.remove('hidden');
+  });
+  document.getElementById('add-writeoff-btn')?.addEventListener('click', ()=>{
+    document.getElementById('writeoff-date').value = todayIso();
+    document.getElementById('writeoff-form').classList.remove('hidden');
+  });
+  document.getElementById('writeoff-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const date = document.getElementById('writeoff-date').value;
+    const amt = round2(parseFloat(document.getElementById('writeoff-amount').value) || 0);
+    if(amt <= 0 || amt > balance + 0.005){ toast('Enter an amount up to the balance due.'); return; }
+    if(isPeriodLocked(date)){ toast(periodLockMessage()); return; }
+    if(!confirm(`Write off ${fmt(amt)} of ${inv.invoice_number} as a bad debt?`)) return;
+    const {data: row, error} = await sb.from('cc_invoice_writeoffs').insert({
+      company_id: state.company.id, invoice_id: inv.id, write_off_date: date, amount: amt,
+      vat_adjust: !!document.getElementById('writeoff-vat')?.checked,
+      notes: document.getElementById('writeoff-notes').value.trim() || null, created_by: state.user.id
+    }).select().single();
+    if(error){ toast(error.message); return; }
+    await logActivity('create', 'bad_debt', row && row.id, `${inv.invoice_number} — ${fmt(amt)} written off`);
+    await refreshAll(); render(); openInvoiceView(inv.id); toast('Written off.');
+  });
+  document.querySelectorAll('[data-del-writeoff]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const w = writeoffs.find(x=>x.id===btn.dataset.delWriteoff);
+      if(w && isPeriodLocked(w.write_off_date)){ toast(periodLockMessage()); return; }
+      if(!confirm('Reverse this write-off? The amount becomes receivable again.')) return;
+      await sb.from('cc_invoice_writeoffs').delete().eq('id', btn.dataset.delWriteoff);
+      await logActivity('delete', 'bad_debt', btn.dataset.delWriteoff, inv.invoice_number);
+      await refreshAll(); render(); openInvoiceView(inv.id);
+    });
   });
   document.getElementById('invoice-payment-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
@@ -6481,15 +6680,16 @@ function renderCF(cf){
   `;
 }
 function computeAssetRegister(start, end){
-  const rows = state.assets.filter(a=>!a.is_current).map(a=>{
-    const monthlyDep = assetMonthlyDepreciation(a);
+  const rows = state.assets.filter(a=>!a.is_current && !(a.disposed_date && a.disposed_date < start)).map(a=>{
+    const disposed = !!(a.disposed_date && a.disposed_date <= end);
+    const monthlyDep = disposed ? 0 : assetMonthlyDepreciation(a);
     const purchasedInMonth = !!(a.purchase_date && a.purchase_date>=start && a.purchase_date<=end);
     const depreciatedInMonth = !!(a.last_depreciation_run && a.last_depreciation_run>=start && a.last_depreciation_run<=end);
     return {
-      id: a.id, description: a.description, category: a.category,
-      purchase_date: a.purchase_date, cost: Number(a.value),
+      id: a.id, description: a.description + (disposed ? ` (disposed ${a.disposed_date})` : ''), category: a.category,
+      purchase_date: a.purchase_date, cost: disposed ? 0 : Number(a.value),
       method: a.depreciation_method || 'straight_line',
-      monthlyDep, accumulatedDep: Number(a.accumulated_depreciation||0), nbv: assetNBV(a),
+      monthlyDep, accumulatedDep: disposed ? 0 : Number(a.accumulated_depreciation||0), nbv: disposed ? 0 : assetNBV(a),
       purchasedInMonth, depreciatedInMonth
     };
   }).sort((a,b)=> (a.description||'').localeCompare(b.description||''));
@@ -6520,9 +6720,7 @@ function computeARAging(){
     .filter(i=>i.approval_status==='approved' && (i.status==='sent'||i.status==='overdue') && i.due_date)
     .map(i=>{
       const daysOverdue = daysBetween(i.due_date, today);
-      const total = docTotal(state.invoiceItems[i.id]);
-      const paid = (state.invoicePayments||[]).filter(p=>p.invoice_id===i.id).reduce((s,p)=>s+Number(p.amount),0);
-      const balance = Math.max(0, total - paid);
+      const balance = invoiceBalance(i).balance;
       return {id:i.id, number:i.invoice_number, client:clientName(i.client_id), due_date:i.due_date, daysOverdue, bucket: agingBucketLabel(daysOverdue), total: balance};
     })
     .filter(r=>r.total > 0.005);
@@ -7048,15 +7246,18 @@ function computeVatRec(start, end){
   const creditNotes = cr(['Credit Note']);                    // negative: reduces output tax
   const supplierCreditNotes = cr(['Supplier Credit Note']);   // positive: reduces input tax
   const journals = cr(['Manual Journal','Year-End Close']);
+  const vatPayments = cr(['VAT Payment']);                    // negative when paid to SARS
+  const assetDisposals = cr(['Asset Disposal']);              // output tax on assets sold
+  const badDebts = cr(['Bad Debt']);                          // VAT reclaimed on bad debts (negative)
   const ledgerMovement = round2(inP.reduce((s,l)=>s + l.credit - l.debit, 0));
-  const other = round2(ledgerMovement - (outputSales - inputPurchases + creditNotes + supplierCreditNotes + journals));
+  const other = round2(ledgerMovement - (outputSales - inputPurchases + creditNotes + supplierCreditNotes + journals + vatPayments + assetDisposals + badDebts));
   const closing = round2(all.filter(l=>l.date <= end).reduce((s,l)=>s + l.credit - l.debit, 0));
   const opening = round2(all.filter(l=>l.date < start).reduce((s,l)=>s + l.credit - l.debit, 0));
   return {
     start, end,
     per201: {output: v.vatCollected, input: v.vatPaid, net: v.vatPayable},
     roundingOutput: round2(outputSales - v.vatCollected), roundingInput: round2(-(inputPurchases - v.vatPaid)),
-    outputSales, inputPurchases, creditNotes, supplierCreditNotes, journals, other,
+    outputSales, inputPurchases, creditNotes, supplierCreditNotes, journals, vatPayments, assetDisposals, badDebts, other,
     ledgerMovement, opening, closing,
     vatRegistered: weAreVatRegistered(),
   };
@@ -7078,6 +7279,9 @@ function renderVatRec(r){
       ${line('Customer credit notes issued', r.creditNotes, 'Reduce output tax — not picked up by the entries-based VAT201 figure')}
       ${line('Supplier credit notes received', r.supplierCreditNotes, 'Reduce input tax')}
       ${line('Manual journals to VAT Control', r.journals)}
+      ${Math.abs(r.assetDisposals) >= 0.005 ? line('Output tax on assets sold', r.assetDisposals) : ''}
+      ${Math.abs(r.badDebts) >= 0.005 ? line('VAT reclaimed on bad debts', r.badDebts) : ''}
+      ${Math.abs(r.vatPayments) >= 0.005 ? line('Paid to / (refunded by) SARS', r.vatPayments, 'Recorded on the VAT tab') : ''}
       ${Math.abs(r.other) >= 0.005 ? line('Other postings', r.other) : ''}
       <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Movement on VAT Control account per ledger</td><td style="text-align:right;">${s(r.ledgerMovement)}</td></tr>
       <tr style="font-weight:600;"><td colspan="2" style="padding-top:14px;">VAT Control balance (payable positive)</td></tr>
@@ -7085,7 +7289,7 @@ function renderVatRec(r){
       ${line('Movement in the period', r.ledgerMovement)}
       <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Closing — as at ${r.end}</td><td style="text-align:right;">${s(r.closing)}</td></tr>
     </tbody></table>
-    <p style="color:var(--muted);font-size:.82rem;margin-bottom:0;">${Math.abs(r.creditNotes + r.supplierCreditNotes) >= 0.005 ? 'Credit notes in this period mean the ledger figure, not the entries-based VAT201 figure, is the amount that reflects what you should declare. ' : ''}Payments to or refunds from SARS aren't tracked automatically: record them with a manual journal (debit VAT Control, credit Bank &amp; Cash, for a payment) so the closing balance clears. Review against your VAT201 return before filing — not tax advice.</p>
+    <p style="color:var(--muted);font-size:.82rem;margin-bottom:0;">${Math.abs(r.creditNotes + r.supplierCreditNotes) >= 0.005 ? 'Credit notes in this period mean the ledger figure, not the entries-based VAT201 figure, is the amount that reflects what you should declare. ' : ''}Record what you pay to (or get back from) SARS on the VAT tab so the closing balance clears. Review against your VAT201 return before filing — not tax advice.</p>
   </div>`;
 }
 
@@ -7410,6 +7614,7 @@ function renderVat(){
       <div class="card"><h3>VAT Paid</h3><div class="value">${fmt(v.vatPaid)}</div><div class="sub">From expenses marked VAT-inclusive</div></div>
       <div class="card"><h3>VAT Payable</h3><div class="value ${v.vatPayable<0?'negative':''}">${fmt(v.vatPayable)}</div><div class="sub">Collected − paid. Negative = refund due to you.</div></div>
     </div>
+    ${renderVatPaymentsPanel()}
     <div class="panel">
       ${weAreVatRegistered() ? `
       <p style="color:var(--muted);font-size:.85rem;">Standard South African VAT rate of ${(VAT_RATE*100).toFixed(0)}% is used to back out VAT from amounts you've marked as VAT-inclusive on Revenue and Expense entries. ${mode==='alltime' ? 'Showing an all-time running total across every entry.' : (matchingPeriod ? `Scoped to the ${matchingPeriod.label} VAT201 period (${state.vatPeriodStart} to ${state.vatPeriodEnd}).` : `Scoped to your custom range (${state.vatPeriodStart||'…'} to ${state.vatPeriodEnd||'…'}).`)} This is not tax advice; confirm figures with your accountant or SARS eFiling before submitting a return.</p>
@@ -7419,6 +7624,38 @@ function renderVat(){
       `}
     </div>
   `;
+}
+function vatControlBalance(){
+  const t = ledgerTotals(ledgerLines(), null, null).VAT;
+  return t ? round2(t.credit - t.debit) : 0;       // positive = owed to SARS, negative = refund due
+}
+function renderVatPaymentsPanel(){
+  const canEdit = isAdmin();
+  const bal = vatControlBalance();
+  const rows = state.vatPayments || [];
+  return `
+  <div class="panel" style="border-top:3px solid var(--c-vat);">
+    <h3 style="margin-top:0;">Payments to SARS</h3>
+    <p style="font-size:.9rem;margin:0 0 10px;"><strong>${bal >= 0 ? 'Owed to SARS' : 'Refund due from SARS'} per the ledger (VAT Control):</strong> <span class="${bal<0?'positive':''}">${fmt(Math.abs(bal))}</span></p>
+    ${rows.length ? `<table><thead><tr><th>Date</th><th>Type</th><th>Period</th><th>Amount</th><th>Reference</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+      ${rows.map(v=>`<tr><td>${v.payment_date}</td><td>${Number(v.amount)>=0?'Paid to SARS':'Refund received'}</td><td>${v.period_start && v.period_end ? v.period_start+' to '+v.period_end : '—'}</td><td>${fmt(Math.abs(Number(v.amount)))}</td><td>${v.reference||'—'}</td>${canEdit?`<td><button class="btn small danger" data-del-vat-payment="${v.id}">Delete</button></td>`:''}</tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No VAT payments or refunds recorded yet.</div>`}
+    ${canEdit ? `
+    <button type="button" class="btn secondary small" id="add-vat-payment-btn" style="margin-top:10px;">+ Record VAT payment / refund</button>
+    <form id="vat-payment-form" class="hidden" style="margin-top:10px;">
+      <div class="row">
+        <div class="field"><label>Date</label><input type="date" id="vat-payment-date" required></div>
+        <div class="field"><label>Type</label><select id="vat-payment-type"><option value="pay">Paid to SARS</option><option value="refund">Refund received from SARS</option></select></div>
+        <div class="field"><label>Amount (R)</label><input type="number" step="0.01" min="0.01" id="vat-payment-amount" value="${bal>0?bal.toFixed(2):''}" required></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>VAT201 period end (optional)</label><input type="date" id="vat-payment-period-end"></div>
+        <div class="field"><label>Reference / payment reference (optional)</label><input type="text" id="vat-payment-ref"></div>
+      </div>
+      <div class="modal-actions"><button type="submit" class="btn small">Save</button></div>
+    </form>` : ''}
+    <p style="color:var(--muted);font-size:.78rem;margin-bottom:0;">Recording a payment takes it out of Bank &amp; Cash and clears VAT Control in the ledger. Not tax advice.</p>
+  </div>`;
 }
 async function updateVatCategory(cat){
   const {error} = await sb.from('cc_companies').update({vat_category: cat}).eq('id', state.company.id);
@@ -7443,6 +7680,36 @@ function attachVatHandlers(){
       state.vatPeriodStart = start; state.vatPeriodEnd = end;
     }
     render();
+  });
+  document.getElementById('add-vat-payment-btn')?.addEventListener('click', ()=>{
+    document.getElementById('vat-payment-date').value = todayIso();
+    document.getElementById('vat-payment-form').classList.remove('hidden');
+  });
+  document.getElementById('vat-payment-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const date = document.getElementById('vat-payment-date').value;
+    const amt = parseFloat(document.getElementById('vat-payment-amount').value) || 0;
+    if(amt <= 0){ toast('Enter an amount.'); return; }
+    if(isPeriodLocked(date)){ toast(periodLockMessage()); return; }
+    const isRefund = document.getElementById('vat-payment-type').value === 'refund';
+    const periodEnd = document.getElementById('vat-payment-period-end').value || null;
+    const {data: row, error} = await sb.from('cc_vat_payments').insert({
+      company_id: state.company.id, payment_date: date, amount: isRefund ? -amt : amt,
+      period_end: periodEnd, reference: document.getElementById('vat-payment-ref').value.trim() || null, created_by: state.user.id
+    }).select().single();
+    if(error){ toast(error.message); return; }
+    await logActivity('create', 'vat_payment', row && row.id, `${isRefund?'VAT refund':'VAT payment'} ${fmt(amt)}`);
+    await refreshAll(); render(); toast('Saved.');
+  });
+  document.querySelectorAll('[data-del-vat-payment]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const v = (state.vatPayments||[]).find(x=>x.id===btn.dataset.delVatPayment);
+      if(v && isPeriodLocked(v.payment_date)){ toast(periodLockMessage()); return; }
+      if(!confirm('Delete this VAT payment record?')) return;
+      await sb.from('cc_vat_payments').delete().eq('id', btn.dataset.delVatPayment);
+      await logActivity('delete', 'vat_payment', btn.dataset.delVatPayment, v ? fmt(v.amount) : '');
+      await refreshAll(); render();
+    });
   });
   document.getElementById('vat-custom-from')?.addEventListener('change', (e)=>{ state.vatPeriodStart = e.target.value || null; render(); });
   document.getElementById('vat-custom-to')?.addEventListener('change', (e)=>{ state.vatPeriodEnd = e.target.value || null; render(); });
