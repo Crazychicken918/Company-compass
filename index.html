@@ -18,7 +18,7 @@
     --c-payroll:#14b8a6; --c-vat:#fb923c; --c-team:#64748b; --c-reports:#1d4ed8;
     --c-settings:#334155;
     --c-scenarios:#059669; --c-supplierinvoices:#0ea5e9; --c-tasks:#7c3aed;
-    --c-quotes:#eab308; --c-stock:#84cc16; --c-manualjournals:#b45309; --c-chartofaccounts:#0e7490;
+    --c-quotes:#eab308; --c-stock:#84cc16; --c-manualjournals:#b45309; --c-chartofaccounts:#0e7490; --c-documents:#0891b2;
     --grid-line: rgba(25,26,35,.03);
   }
   /* Dark mode: follows the OS setting by default; a manual toggle (data-theme)
@@ -122,6 +122,7 @@
   #sidebar nav button[data-view="stock"]{--dot:var(--c-stock);}
   #sidebar nav button[data-view="manualjournals"]{--dot:var(--c-manualjournals);}
   #sidebar nav button[data-view="chartofaccounts"]{--dot:var(--c-chartofaccounts);}
+  #sidebar nav button[data-view="documents"]{--dot:var(--c-documents);}
   #sidebar .logout{margin-top:10px;font-size:.8rem;color:var(--muted);background:none;border:none;text-align:left;padding:9px 10px;}
 
   #main{flex:1;padding:26px 32px;max-width:1100px;}
@@ -285,6 +286,7 @@
       <div class="nav-group" data-nav-group="compliance">
         <div class="nav-group-label">Tax &amp; Compliance</div>
         <button data-view="vat"><span class="dot"></span>VAT</button>
+        <button data-view="documents"><span class="dot"></span>Documents</button>
       </div>
       <div class="nav-group" data-nav-group="reporting">
         <div class="nav-group-label">Reports &amp; Planning</div>
@@ -314,6 +316,8 @@
   </div>
   <div id="legal-content" style="font-size:.86rem;line-height:1.6;color:var(--text);"></div>
 </div></div>
+
+<div class="modal-backdrop hidden" id="prepay-modal-backdrop"><div class="modal" id="prepay-modal-content" style="max-width:760px;width:100%;"></div></div>
 
 <div class="modal-backdrop hidden" id="attachments-modal-backdrop"><div class="modal">
   <button class="close-x" id="attachments-modal-close">✕</button>
@@ -839,6 +843,15 @@ let state = {
   employeeTasks: [],
   taskNotes: [],       // notes logged against employee tasks (cc_task_notes)
   attachments: [],     // receipts/documents attached to revenue/expense/invoice/supplier_invoice records (cc_attachments)
+  partyCredits: [],      // cc_party_credits rows (customer deposits received / supplier prepayments paid)
+  creditAllocations: [], // cc_credit_allocations rows (credit applied to an invoice/bill, or refunded)
+  prepayCtx: null,
+  creditsCtx: null,
+  documents: [],        // cc_documents rows (the Documents library catalogue)
+  docFilter: {cat:'all', q:'', source:'all'},
+  docEditId: null,
+  statementLog: [],     // cc_statement_log rows (statements emailed to clients)
+  stmtDist: null,       // state of the Send Statements dialog
   attachmentsCtx: null, // {entityType, entityId, label, canUpload} for the currently-open Attachments modal
   auditLog: [],        // who created/updated/deleted what (cc_audit_log), newest first
   bankTransactions: [], // imported bank statement lines awaiting reconciliation (cc_bank_transactions)
@@ -912,7 +925,7 @@ const ALL_VIEWS = [
   ['dashboard','Dashboard'], ['revenue','Revenue'], ['expenses','Expenses'], ['assets','Assets'], ['stock','Stock'],
   ['liabilities','Liabilities'], ['supplierinvoices','Supplier Invoices'], ['clients','Clients'], ['quotes','Quotes'],
   ['invoices','Invoices'], ['creditnotes','Credit Notes'], ['payroll','Payroll'], ['tasks','Tasks'],
-  ['vat','VAT'], ['reports','Reports'], ['scenarios','Scenarios'], ['manualjournals','Manual Journals'], ['chartofaccounts','Chart of Accounts'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'], ['settings','Settings'],
+  ['vat','VAT'], ['documents','Documents'], ['reports','Reports'], ['scenarios','Scenarios'], ['manualjournals','Manual Journals'], ['chartofaccounts','Chart of Accounts'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'], ['settings','Settings'],
 ];
 // Owner/admin/viewer always see every tab. A staff member sees every tab UNLESS an admin has
 // explicitly restricted them to a specific list (m.permissions.tabs) via the Team page — so
@@ -958,7 +971,7 @@ function roleLabel(m){
   }
   return m.role;
 }
-const MODULE_LABELS = {revenue:'Revenue', expenses:'Expenses', assets:'Assets', liabilities:'Liabilities', clients:'Clients', invoices:'Invoices', credit_notes:'Credit Notes', payroll:'Payroll', supplier_invoices:'Supplier Invoices'};
+const MODULE_LABELS = {revenue:'Revenue', expenses:'Expenses', assets:'Assets', liabilities:'Liabilities', clients:'Clients', invoices:'Invoices', credit_notes:'Credit Notes', payroll:'Payroll', supplier_invoices:'Supplier Invoices', documents:'Documents'};
 function moduleLabel(k){ return MODULE_LABELS[k] || k; }
 
 /* ========================= AUTH ========================= */
@@ -1247,6 +1260,11 @@ async function refreshAll(){
   state.manualJournals = manualJournalsRes.data || [];
   const chartRes = await sb.from('cc_chart_accounts').select('*').eq('company_id', cid);
   state.chartAccounts = chartRes.data || [];
+  await refreshCredits();
+  const docsRes = await sb.from('cc_documents').select('*').eq('company_id', cid).order('created_at', {ascending:false});
+  state.documents = docsRes.data || [];
+  const stmtLogRes = await sb.from('cc_statement_log').select('*').eq('company_id', cid).order('sent_at', {ascending:false});
+  state.statementLog = stmtLogRes.data || [];
 
   const invoiceIds = state.invoices.map(i=>i.id);
   const creditNoteIds = state.creditNotes.map(cn=>cn.id);
@@ -1513,6 +1531,540 @@ async function deleteAttachmentsForEntity(entityType, entityId){
 }
 
 
+/* ========================= PREPAYMENTS (customer deposits & supplier prepayments) ========================= */
+// A customer who pays before an invoice exists (or before it is due) is held as CREDIT on their account:
+// Dr Bank / Cr Customer Deposits (a liability). Applying the credit to an invoice moves it against
+// receivables with no cash movement: Dr Customer Deposits / Cr Accounts Receivable. Suppliers mirror it:
+// Dr Supplier Prepayments (an asset) / Cr Bank, then Dr Accounts Payable / Cr Supplier Prepayments.
+// cc_party_credits holds the receipts/payments; cc_credit_allocations holds every use of them
+// (kind 'invoice' | 'bill' | 'refund'). Credit is held in Rand, so it applies to Rand documents only.
+function creditAllocs(creditId){ return (state.creditAllocations||[]).filter(a=>a.credit_id===creditId); }
+function creditRemaining(c){ return round2(Number(c.amount) - creditAllocs(c.id).reduce((s,a)=>s+Number(a.amount||0), 0)); }
+function partyCreditsFor(type, partyId){ return (state.partyCredits||[]).filter(c=>c.party_type===type && c.party_id===partyId); }
+function partyCreditBalance(type, partyId){ return round2(partyCreditsFor(type, partyId).reduce((s,c)=>s+creditRemaining(c), 0)); }
+function totalUnallocatedCredit(type){ return round2((state.partyCredits||[]).filter(c=>c.party_type===type).reduce((s,c)=>s+creditRemaining(c), 0)); }
+function docAllocated(kind, docId){ return round2((state.creditAllocations||[]).filter(a=>a.kind===kind && a.doc_id===docId).reduce((s,a)=>s+Number(a.amount||0), 0)); }
+function creditPartyName(type, id){ return type === 'client' ? clientName(id) : supplierName(id); }
+function creditNoun(type){ return type === 'client' ? 'customer' : 'supplier'; }
+function canManageCredits(type){ return type === 'client' ? hasModule('invoices') : hasModule('supplier_invoices'); }
+function creditGuard(type, date){
+  if(!canManageCredits(type)) return 'You do not have access to record prepayments here.';
+  if(makerCheckerOn() && !canApprove()) return 'Prepayments move money, so with approvals switched on a manager or approver needs to record them.';
+  if(date && isPeriodLocked(date)) return periodLockMessage();
+  return null;
+}
+async function savePartyCredit(o){
+  const err = creditGuard(o.type, o.date);
+  if(err){ toast(err); return false; }
+  const amount = round2(Number(o.amount));
+  if(!(amount > 0)){ toast('Enter an amount.'); return false; }
+  if(!o.partyId){ toast(`Choose the ${creditNoun(o.type)}.`); return false; }
+  if(!o.date){ toast('Choose a date.'); return false; }
+  const {data: row, error} = await sb.from('cc_party_credits').insert({
+    company_id: state.company.id, party_type: o.type, party_id: o.partyId, credit_date: o.date, amount,
+    reference: o.reference || null, notes: o.notes || null, bank_transaction_id: o.bankTxId || null, created_by: state.user.id
+  }).select().single();
+  if(error || !row){ toast((error && error.message) || 'Could not save.'); return false; }
+  if(o.bankTxId){
+    const {error: bankErr} = await sb.from('cc_bank_transactions').update({status:'matched', matched_entry_type: o.type==='client' ? 'client_credit' : 'supplier_credit', matched_entry_id: row.id, linked_payment_id: null}).eq('id', o.bankTxId);
+    if(bankErr) toast(bankErr.message);
+  }
+  await logActivity('create', 'prepayment', row.id, `${o.type==='client'?'Prepayment received from':'Prepayment paid to'} ${creditPartyName(o.type, o.partyId)} (${fmt(amount)})`);
+  return true;
+}
+// Applies credit to one invoice/bill, drawing on the oldest credit first (so one document can use several receipts).
+async function allocateCredit(o){
+  const type = o.kind === 'invoice' ? 'client' : 'supplier';
+  const err = creditGuard(type, o.date);
+  if(err){ toast(err); return false; }
+  const doc = o.kind === 'invoice' ? state.invoices.find(i=>i.id===o.docId) : state.supplierInvoices.find(b=>b.id===o.docId);
+  if(!doc || doc.approval_status !== 'approved'){ toast('Only approved documents can take credit.'); return false; }
+  if(isForeignDoc(doc)){ toast('Credit is held in Rand, so it can only be applied to Rand documents.'); return false; }
+  const partyId = o.kind === 'invoice' ? doc.client_id : doc.supplier_id;
+  const owing = (o.kind === 'invoice' ? invoiceBalance(doc) : billBalance(doc)).balance;
+  const avail = partyCreditBalance(type, partyId);
+  const amount = round2(Number(o.amount));
+  if(!(amount > 0)){ toast('Enter an amount.'); return false; }
+  if(amount > owing + 0.005){ toast(`That is more than the ${fmt(owing)} still owing.`); return false; }
+  if(amount > avail + 0.005){ toast(`Only ${fmt(avail)} of credit is available.`); return false; }
+  const credits = partyCreditsFor(type, partyId).filter(c=>creditRemaining(c) > 0.005)
+    .sort((a,b)=> a.credit_date < b.credit_date ? -1 : (a.credit_date > b.credit_date ? 1 : ((a.created_at||'') < (b.created_at||'') ? -1 : 1)));
+  let left = amount; const rows = [];
+  for(const c of credits){
+    if(left <= 0.004) break;
+    const take = round2(Math.min(left, creditRemaining(c)));
+    const allocDate = o.date >= c.credit_date ? o.date : c.credit_date;
+    if(isPeriodLocked(allocDate)){ toast(periodLockMessage()); return false; }
+    rows.push({company_id: state.company.id, credit_id: c.id, kind: o.kind, doc_id: o.docId, alloc_date: allocDate, amount: take, created_by: state.user.id});
+    left = round2(left - take);
+  }
+  const {error} = await sb.from('cc_credit_allocations').insert(rows);
+  if(error){ toast(error.message); return false; }
+  await logActivity('update', 'prepayment', o.docId, `${fmt(amount)} of ${creditPartyName(type, partyId)}'s credit applied to ${o.kind==='invoice'?doc.invoice_number:doc.bill_number}`);
+  return true;
+}
+async function refundCredit(creditId, amount, date){
+  const c = (state.partyCredits||[]).find(x=>x.id===creditId);
+  if(!c) return false;
+  if(!canApprove()){ toast('Only a manager or approver can refund credit.'); return false; }
+  const err = creditGuard(c.party_type, date);
+  if(err){ toast(err); return false; }
+  amount = round2(Number(amount));
+  if(!(amount > 0) || amount > creditRemaining(c) + 0.005){ toast(`Enter an amount up to ${fmt(creditRemaining(c))}.`); return false; }
+  const when = date >= c.credit_date ? date : c.credit_date;
+  const {error} = await sb.from('cc_credit_allocations').insert({company_id: state.company.id, credit_id: c.id, kind: 'refund', doc_id: null, alloc_date: when, amount, created_by: state.user.id});
+  if(error){ toast(error.message); return false; }
+  await logActivity('create', 'prepayment', c.id, `${fmt(amount)} of ${creditPartyName(c.party_type, c.party_id)}'s credit refunded`);
+  return true;
+}
+async function removeCreditAllocation(allocId){
+  const a = (state.creditAllocations||[]).find(x=>x.id===allocId);
+  if(!a) return false;
+  const c = (state.partyCredits||[]).find(x=>x.id===a.credit_id);
+  const err = creditGuard(c ? c.party_type : 'client', a.alloc_date);
+  if(err){ toast(err); return false; }
+  const {error} = await sb.from('cc_credit_allocations').delete().eq('id', allocId);
+  if(error){ toast(error.message); return false; }
+  await logActivity('delete', 'prepayment', a.credit_id, `Credit allocation of ${fmt(a.amount)} removed`);
+  return true;
+}
+async function deletePartyCredit(creditId){
+  const c = (state.partyCredits||[]).find(x=>x.id===creditId);
+  if(!c) return false;
+  if(!isAdmin()){ toast('Only an admin can delete a prepayment.'); return false; }
+  if(creditAllocs(c.id).length){ toast('Remove its allocations and refunds first.'); return false; }
+  if(c.bank_transaction_id){ toast('This prepayment came from the Bank Feed. Unmatch the bank line there to remove it.'); return false; }
+  if(isPeriodLocked(c.credit_date)){ toast(periodLockMessage()); return false; }
+  const {error} = await sb.from('cc_party_credits').delete().eq('id', c.id);
+  if(error){ toast(error.message); return false; }
+  await logActivity('delete', 'prepayment', c.id, `Prepayment of ${fmt(c.amount)} from ${creditPartyName(c.party_type, c.party_id)} deleted`);
+  return true;
+}
+async function refreshCredits(){
+  const [c, a] = await Promise.all([
+    sb.from('cc_party_credits').select('*').eq('company_id', state.company.id).order('credit_date', {ascending:true}),
+    sb.from('cc_credit_allocations').select('*').eq('company_id', state.company.id).order('alloc_date', {ascending:true})
+  ]);
+  state.partyCredits = c.data || [];
+  state.creditAllocations = a.data || [];
+}
+function prepayHost(){ return document.getElementById('prepay-modal-content'); }
+function closePrepayModal(){ document.getElementById('prepay-modal-backdrop').classList.add('hidden'); }
+// ---- Record a prepayment (from the Clients / Suppliers pages or a bank line) ----
+function openPrepayModal(o){
+  state.prepayCtx = Object.assign({date: todayIso()}, o);
+  const x = state.prepayCtx;
+  const parties = x.type === 'client' ? state.clients : state.suppliers;
+  prepayHost().innerHTML = `
+    <button class="close-x" id="prepay-close">✕</button>
+    <h2 style="margin-top:0;">${x.type==='client' ? 'Customer prepayment' : 'Supplier prepayment'}</h2>
+    <p style="font-size:.82rem;color:var(--muted);margin-top:-8px;">${x.type==='client'
+      ? 'Money received before it is matched to an invoice. It is held as a credit on the customer’s account until you apply it.'
+      : 'Money paid to a supplier before the bill is matched. It is held as a prepayment on the supplier’s account until you apply it.'}</p>
+    <form id="prepay-form">
+      <div class="field"><label>${x.type==='client'?'Customer':'Supplier'}</label><select id="prepay-party" required>
+        <option value="">Choose…</option>
+        ${parties.map(p=>`<option value="${p.id}" ${p.id===x.partyId?'selected':''}>${escHtml(p.name)}</option>`).join('')}
+      </select></div>
+      <div class="row">
+        <div class="field"><label>Date</label><input type="date" id="prepay-date" value="${x.date}" required></div>
+        <div class="field"><label>Amount (R)</label><input type="number" step="0.01" min="0.01" id="prepay-amount" value="${x.amount ? Number(x.amount).toFixed(2) : ''}" required></div>
+      </div>
+      <div class="field"><label>Reference (optional)</label><input type="text" id="prepay-ref" value="${escHtml(x.reference||'')}" placeholder="e.g. quote number, deposit for order 123"></div>
+      <div class="field"><label>Notes (optional)</label><input type="text" id="prepay-notes"></div>
+      ${x.bankTxId ? `<p style="font-size:.78rem;color:var(--muted);">This will match the bank line, so you will not need to record it separately.</p>` : ''}
+      <div class="modal-actions"><button type="button" class="btn secondary" id="prepay-cancel">Cancel</button><button type="submit" class="btn" id="prepay-save">Save prepayment</button></div>
+    </form>`;
+  document.getElementById('prepay-close').addEventListener('click', closePrepayModal);
+  document.getElementById('prepay-cancel').addEventListener('click', closePrepayModal);
+  document.getElementById('prepay-form').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const ok = await savePartyCredit({
+      type: x.type, partyId: document.getElementById('prepay-party').value, date: document.getElementById('prepay-date').value,
+      amount: document.getElementById('prepay-amount').value, reference: document.getElementById('prepay-ref').value.trim(),
+      notes: document.getElementById('prepay-notes').value.trim(), bankTxId: x.bankTxId
+    });
+    if(!ok) return;
+    closePrepayModal();
+    await refreshAll(); render(); toast('Prepayment recorded.');
+  });
+  document.getElementById('prepay-modal-backdrop').classList.remove('hidden');
+}
+// ---- Manage a party's credit: apply, refund, history ----
+function openCreditsModal(type, partyId){
+  state.creditsCtx = {type, partyId};
+  renderCreditsModal();
+  document.getElementById('prepay-modal-backdrop').classList.remove('hidden');
+}
+function creditOpenDocs(type, partyId){
+  if(type === 'client') return state.invoices.filter(i=>i.client_id===partyId && i.approval_status==='approved' && !isForeignDoc(i)).map(i=>({id:i.id, label:`Invoice ${i.invoice_number} (${i.issue_date})`, balance: invoiceBalance(i).balance})).filter(d=>d.balance > 0.005);
+  return state.supplierInvoices.filter(b=>b.supplier_id===partyId && b.approval_status==='approved' && !isForeignDoc(b)).map(b=>({id:b.id, label:`Bill ${b.bill_number} (${b.issue_date})`, balance: billBalance(b).balance})).filter(d=>d.balance > 0.005);
+}
+function renderCreditsModal(){
+  const {type, partyId} = state.creditsCtx;
+  const name = creditPartyName(type, partyId);
+  const credits = partyCreditsFor(type, partyId);
+  const avail = partyCreditBalance(type, partyId);
+  const docs = creditOpenDocs(type, partyId);
+  const manage = canManageCredits(type);
+  const allocs = (state.creditAllocations||[]).filter(a=>credits.some(c=>c.id===a.credit_id)).sort((a,b)=> a.alloc_date < b.alloc_date ? 1 : -1);
+  const allocLabel = a => {
+    if(a.kind === 'refund') return type === 'client' ? 'Refunded to customer' : 'Refund received from supplier';
+    const d = a.kind === 'invoice' ? state.invoices.find(i=>i.id===a.doc_id) : state.supplierInvoices.find(b=>b.id===a.doc_id);
+    return d ? (a.kind==='invoice' ? 'Invoice ' + d.invoice_number : 'Bill ' + d.bill_number) : '(removed document)';
+  };
+  prepayHost().innerHTML = `
+    <button class="close-x" id="credits-close">✕</button>
+    <h2 style="margin-top:0;">${type==='client'?'Customer credit':'Supplier prepayments'} — ${escHtml(name)}</h2>
+    <p style="font-size:.9rem;">Available to apply: <strong>${fmt(avail)}</strong></p>
+    <table><thead><tr><th>Date</th><th>Reference</th><th style="text-align:right;">Amount</th><th style="text-align:right;">Used</th><th style="text-align:right;">Available</th><th></th></tr></thead><tbody>
+      ${credits.length ? credits.map(c=>{
+        const rem = creditRemaining(c);
+        return `<tr><td>${c.credit_date}</td><td>${escHtml(c.reference||'—')}${c.bank_transaction_id?'<div style="font-size:.72rem;color:var(--muted);">from bank feed</div>':''}</td><td style="text-align:right;">${fmt(c.amount)}</td><td style="text-align:right;">${fmt(round2(c.amount - rem))}</td><td style="text-align:right;">${fmt(rem)}</td>
+          <td style="white-space:nowrap;">${rem > 0.005 && canApprove() && manage ? `<button type="button" class="btn small secondary" data-refund-credit="${c.id}">${type==='client'?'Refund':'Got refund'}</button>` : ''}${isAdmin() && !creditAllocs(c.id).length ? ` <button type="button" class="btn small danger" data-del-credit="${c.id}">Delete</button>` : ''}</td></tr>`;
+      }).join('') : `<tr><td colspan="6"><div class="empty">No prepayments recorded.</div></td></tr>`}
+    </tbody></table>
+    ${manage ? `<div class="modal-actions" style="justify-content:flex-start;"><button type="button" class="btn small secondary" id="credits-add">+ Record another prepayment</button></div>` : ''}
+    ${(manage && avail > 0.005) ? `
+    <div class="panel" style="margin-top:12px;">
+      <h3 style="margin-top:0;">Apply credit to ${type==='client'?'an invoice':'a bill'}</h3>
+      ${docs.length ? `<form id="credits-apply-form">
+        <div class="field"><label>${type==='client'?'Invoice':'Bill'}</label><select id="credits-apply-doc">${docs.map(d=>`<option value="${d.id}" data-balance="${d.balance.toFixed(2)}">${escHtml(d.label)} — owing ${fmt(d.balance)}</option>`).join('')}</select></div>
+        <div class="row">
+          <div class="field"><label>Date</label><input type="date" id="credits-apply-date" value="${todayIso()}" required></div>
+          <div class="field"><label>Amount (R)</label><input type="number" step="0.01" min="0.01" id="credits-apply-amount" value="${Math.min(avail, docs[0].balance).toFixed(2)}" required></div>
+        </div>
+        <div class="modal-actions"><button type="submit" class="btn small">Apply credit</button></div>
+      </form>` : `<div class="empty">No open Rand ${type==='client'?'invoices':'bills'} for ${escHtml(name)} yet. The credit stays on the account until one exists.</div>`}
+    </div>` : ''}
+    <h3>History</h3>
+    ${allocs.length ? `<table><thead><tr><th>Date</th><th>Used for</th><th style="text-align:right;">Amount</th><th></th></tr></thead><tbody>
+      ${allocs.map(a=>`<tr><td>${a.alloc_date}</td><td>${escHtml(allocLabel(a))}</td><td style="text-align:right;">${fmt(a.amount)}</td><td>${manage ? `<button type="button" class="btn small secondary" data-unapply-credit="${a.id}">Undo</button>` : ''}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty">Nothing applied yet.</div>`}
+    <p style="font-size:.74rem;color:var(--muted);">A refund is recorded in the books but not matched to a bank line. When it appears in the Bank Feed, choose Ignore.</p>`;
+  const rerun = async ()=>{ await refreshAll(); render(); renderCreditsModal(); };
+  document.getElementById('credits-close').addEventListener('click', closePrepayModal);
+  document.getElementById('credits-add')?.addEventListener('click', ()=>openPrepayModal({type, partyId}));
+  const docSel = document.getElementById('credits-apply-doc');
+  docSel?.addEventListener('change', ()=>{
+    const bal = Number(docSel.selectedOptions[0].dataset.balance);
+    document.getElementById('credits-apply-amount').value = Math.min(avail, bal).toFixed(2);
+  });
+  document.getElementById('credits-apply-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const ok = await allocateCredit({kind: type==='client'?'invoice':'bill', docId: docSel.value, amount: document.getElementById('credits-apply-amount').value, date: document.getElementById('credits-apply-date').value});
+    if(ok){ await rerun(); toast('Credit applied.'); }
+  });
+  document.querySelectorAll('[data-refund-credit]').forEach(b=>b.addEventListener('click', async ()=>{
+    const c = state.partyCredits.find(x=>x.id===b.dataset.refundCredit);
+    const answer = prompt(`${type==='client'?'Refund how much to':'How much was refunded by'} ${name}? (up to ${fmt(creditRemaining(c))})`, creditRemaining(c).toFixed(2));
+    if(answer === null) return;
+    if(await refundCredit(c.id, parseFloat(String(answer).replace(/\s/g,'').replace(',', '.')), todayIso())){ await rerun(); toast('Refund recorded.'); }
+  }));
+  document.querySelectorAll('[data-del-credit]').forEach(b=>b.addEventListener('click', async ()=>{
+    if(!confirm('Delete this prepayment?')) return;
+    if(await deletePartyCredit(b.dataset.delCredit)){ await rerun(); toast('Deleted.'); }
+  }));
+  document.querySelectorAll('[data-unapply-credit]').forEach(b=>b.addEventListener('click', async ()=>{
+    if(!confirm('Undo this allocation? The credit goes back to the account and the document owes it again.')) return;
+    if(await removeCreditAllocation(b.dataset.unapplyCredit)){ await rerun(); toast('Allocation removed.'); }
+  }));
+}
+function wireCreditButtons(){
+  document.querySelectorAll('[data-credits]').forEach(b=>b.addEventListener('click', ()=>{ const [t, id] = b.dataset.credits.split('|'); openCreditsModal(t, id); }));
+  document.querySelectorAll('[data-new-prepay]').forEach(b=>b.addEventListener('click', ()=>{ const [t, id] = b.dataset.newPrepay.split('|'); openPrepayModal({type: t, partyId: id}); }));
+}
+// Credit panel inside the invoice / bill view: shows what has been applied and offers to apply more.
+function docCreditPanelHtml(kind, doc, balance){
+  const type = kind === 'invoice' ? 'client' : 'supplier';
+  const partyId = kind === 'invoice' ? doc.client_id : doc.supplier_id;
+  const avail = partyCreditBalance(type, partyId);
+  const allocs = (state.creditAllocations||[]).filter(a=>a.kind===kind && a.doc_id===doc.id);
+  if(avail <= 0.005 && !allocs.length) return '';
+  const foreign = isForeignDoc(doc);
+  const canApply = canManageCredits(type) && balance > 0.005 && avail > 0.005 && !foreign;
+  return `<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;">
+    <h4 style="margin:0 0 6px;">${type==='client'?'Customer credit':'Supplier prepayment'}</h4>
+    ${allocs.length ? `<table><tbody>${allocs.map(a=>`<tr><td>${a.alloc_date}</td><td>Credit applied</td><td style="text-align:right;">${fmt(a.amount)}</td><td>${canManageCredits(type) ? `<button type="button" class="btn small secondary" data-doc-unapply="${a.id}">Undo</button>` : ''}</td></tr>`).join('')}</tbody></table>` : ''}
+    ${avail > 0.005 ? `<p style="font-size:.85rem;margin:6px 0;">${type==='client'?'This customer has':'You have'} <strong>${fmt(avail)}</strong> ${type==='client'?'of credit on account':'prepaid to this supplier'}.${foreign ? ' Credit is held in Rand, so it can only be applied to Rand documents.' : ''}</p>` : ''}
+    ${canApply ? `<button type="button" class="btn secondary small" id="doc-apply-credit-btn">Apply credit</button>
+    <form id="doc-apply-credit-form" class="hidden" style="margin-top:8px;">
+      <div class="row">
+        <div class="field"><label>Date</label><input type="date" id="doc-apply-credit-date" value="${todayIso()}" required></div>
+        <div class="field"><label>Amount (R)</label><input type="number" step="0.01" min="0.01" max="${Math.min(avail, balance).toFixed(2)}" id="doc-apply-credit-amount" value="${Math.min(avail, balance).toFixed(2)}" required></div>
+      </div>
+      <div class="modal-actions"><button type="submit" class="btn small">Apply</button></div>
+    </form>` : ''}
+  </div>`;
+}
+function attachDocCreditHandlers(kind, doc, reopen){
+  document.getElementById('doc-apply-credit-btn')?.addEventListener('click', ()=>document.getElementById('doc-apply-credit-form').classList.remove('hidden'));
+  document.getElementById('doc-apply-credit-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const ok = await allocateCredit({kind, docId: doc.id, amount: document.getElementById('doc-apply-credit-amount').value, date: document.getElementById('doc-apply-credit-date').value});
+    if(ok){ await refreshAll(); render(); reopen(); toast('Credit applied.'); }
+  });
+  document.querySelectorAll('[data-doc-unapply]').forEach(b=>b.addEventListener('click', async ()=>{
+    if(!confirm('Undo this credit allocation?')) return;
+    if(await removeCreditAllocation(b.dataset.docUnapply)){ await refreshAll(); render(); reopen(); toast('Allocation removed.'); }
+  }));
+}
+
+
+/* ========================= DOCUMENTS LIBRARY ========================= */
+// One place for every document the business keeps: company records (CIPC), supplier invoices and
+// statements, tax correspondence, contracts and so on. Files live in the private 'documents' bucket
+// under <company_id>/library/<category>/…; the catalogue (title, category, dates, notes) is cc_documents.
+// Anything already attached to an invoice, bill or entry (cc_attachments) is listed here automatically.
+const DOC_CATEGORIES = [
+  ['cipc','CIPC & company records'], ['supplier','Supplier invoices & statements'], ['customer','Customer invoices & statements'],
+  ['tax','Tax & SARS'], ['bank','Bank statements'], ['contracts','Contracts & agreements'], ['payroll','Payroll & HR'],
+  ['insurance','Insurance & licences'], ['assets','Asset & property documents'], ['other','Other']
+];
+function docCategoryLabel(k){ const c = DOC_CATEGORIES.find(x=>x[0]===k); return c ? c[1] : 'Other'; }
+function safeFileName(n){ return String(n||'file').replace(/[^\w.\- ]+/g,'_'); }
+function fmtFileSize(b){
+  const n = Number(b)||0;
+  if(!n) return '';
+  if(n < 1024) return n + ' B';
+  if(n < 1048576) return (n/1024).toFixed(0) + ' KB';
+  return (n/1048576).toFixed(1) + ' MB';
+}
+function docExpiryStatus(d){
+  if(!d || !d.expiry_date) return null;
+  const today = todayIso();
+  if(d.expiry_date < today) return 'expired';
+  if(daysBetween(today, d.expiry_date) <= 30) return 'soon';
+  return null;
+}
+function docPartyLabel(d){
+  if(d.party_type === 'client') return 'Client: ' + clientName(d.party_id);
+  if(d.party_type === 'supplier') return 'Supplier: ' + supplierName(d.party_id);
+  return '';
+}
+function attachmentEntityInfo(a){
+  const t = a.entity_type, id = a.entity_id;
+  if(t === 'invoice'){ const i = (state.invoices||[]).find(x=>x.id===id); return {cat:'customer', label: 'Invoice ' + (i ? i.invoice_number + ' · ' + clientName(i.client_id) : '(removed)')}; }
+  if(t === 'credit_note'){ const n = (state.creditNotes||[]).find(x=>x.id===id); return {cat:'customer', label: 'Credit note ' + (n ? n.credit_note_number + ' · ' + clientName(n.client_id) : '(removed)')}; }
+  if(t === 'supplier_invoice'){ const b = (state.supplierInvoices||[]).find(x=>x.id===id); return {cat:'supplier', label: 'Bill ' + (b ? b.bill_number + ' · ' + supplierName(b.supplier_id) : '(removed)')}; }
+  if(t === 'supplier_credit_note'){ const n = (state.supplierCreditNotes||[]).find(x=>x.id===id); return {cat:'supplier', label: 'Supplier credit note ' + (n ? n.credit_note_number + ' · ' + supplierName(n.supplier_id) : '(removed)')}; }
+  if(t === 'revenue' || t === 'expense'){ const e = (state.entries||[]).find(x=>x.id===id); return {cat:'other', label: (t==='revenue'?'Revenue':'Expense') + ' entry' + (e && e.description ? ' · ' + e.description : '')}; }
+  if(t === 'manual_journal'){ const j = (state.manualJournals||[]).find(x=>x.id===id); return {cat:'other', label: 'Journal' + (j && j.description ? ' · ' + j.description : '')}; }
+  return {cat:'other', label: t || 'Record'};
+}
+function libraryDocs(){
+  const own = (state.documents||[]).map(d=>({...d, auto:false, source:'Uploaded here', linked: docPartyLabel(d)}));
+  const auto = (state.attachments||[]).map(a=>{
+    const info = attachmentEntityInfo(a);
+    return {id:'att:'+a.id, auto:true, attId:a.id, category:info.cat, title:a.file_name, file_name:a.file_name, file_path:a.file_path,
+      doc_date:(a.created_at||'').slice(0,10), expiry_date:null, notes:null, uploaded_by:a.uploaded_by, created_at:a.created_at,
+      source:'Attached to a record', linked: info.label};
+  });
+  return own.concat(auto).sort((a,b)=> (a.created_at||'') < (b.created_at||'') ? 1 : ((a.created_at||'') > (b.created_at||'') ? -1 : 0));
+}
+function libraryDocsFiltered(ignoreCategory){
+  const f = state.docFilter || {cat:'all', q:'', source:'all'};
+  const q = (f.q||'').trim().toLowerCase();
+  return libraryDocs().filter(d=>{
+    if(!ignoreCategory && f.cat !== 'all' && d.category !== f.cat) return false;
+    if(f.source === 'uploaded' && d.auto) return false;
+    if(f.source === 'attached' && !d.auto) return false;
+    if(f.source === 'expiring' && !docExpiryStatus(d)) return false;
+    if(q){
+      const hay = [d.title, d.file_name, d.notes, d.linked, d.uploaded_by, docCategoryLabel(d.category)].join(' ').toLowerCase();
+      if(!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+function renderDocumentsList(){
+  const f = state.docFilter;
+  const base = libraryDocsFiltered(true);
+  const rows = libraryDocsFiltered(false);
+  const canAdd = hasModule('documents');
+  const pills = `<div class="tabbar" style="margin-bottom:12px;">
+    <button class="btn ${f.cat==='all'?'':'secondary'} small" data-doc-cat="all">All (${base.length})</button>
+    ${DOC_CATEGORIES.map(([k,l])=>`<button class="btn ${f.cat===k?'':'secondary'} small" data-doc-cat="${k}">${escHtml(l)} (${base.filter(d=>d.category===k).length})</button>`).join('')}
+  </div>`;
+  if(!rows.length) return pills + `<div class="empty">${libraryDocs().length ? 'No documents match this filter.' : 'No documents yet. Upload your CIPC documents, supplier statements and other records here.'}</div>`;
+  return pills + `<table><thead><tr><th>Document</th><th>Category</th><th>Linked to</th><th>Date</th><th>Expiry</th><th>Added by</th><th></th></tr></thead><tbody>
+    ${rows.map(d=>{
+      const ex = docExpiryStatus(d);
+      const exCell = d.expiry_date ? `${escHtml(d.expiry_date)} ${ex==='expired' ? '<span class="status-pill status-overdue">Expired</span>' : ex==='soon' ? '<span class="status-pill status-pending">Due soon</span>' : ''}` : '—';
+      return `<tr>
+        <td><div style="font-weight:600;word-break:break-word;">${escHtml(d.title)}</div>
+          <div style="font-size:.74rem;color:var(--muted);word-break:break-all;">${escHtml(d.file_name)}${d.file_size ? ' · ' + fmtFileSize(d.file_size) : ''}</div>
+          ${d.notes ? `<div style="font-size:.76rem;color:var(--muted);white-space:pre-line;">${escHtml(d.notes)}</div>` : ''}</td>
+        <td>${escHtml(docCategoryLabel(d.category))}</td>
+        <td style="font-size:.84rem;">${d.linked ? escHtml(d.linked) : '—'}<div style="font-size:.72rem;color:var(--muted);">${escHtml(d.source)}</div></td>
+        <td style="white-space:nowrap;">${escHtml(d.doc_date||'—')}</td>
+        <td style="white-space:nowrap;">${exCell}</td>
+        <td style="font-size:.8rem;">${escHtml(d.uploaded_by||'—')}</td>
+        <td style="white-space:nowrap;">
+          <button type="button" class="btn small secondary" data-view-doc="${d.id}">View</button>
+          ${!d.auto && canAdd ? `<button type="button" class="btn small secondary" data-edit-doc="${d.id}">Edit</button>` : ''}
+          ${!d.auto && isAdmin() ? `<button type="button" class="btn small danger" data-del-doc="${d.id}">Delete</button>` : ''}
+        </td></tr>`;
+    }).join('')}
+  </tbody></table>`;
+}
+function renderDocuments(){
+  const f = state.docFilter;
+  const all = libraryDocs();
+  const canAdd = hasModule('documents');
+  const expired = all.filter(d=>docExpiryStatus(d)==='expired').length;
+  const soon = all.filter(d=>docExpiryStatus(d)==='soon').length;
+  const uploaded = all.filter(d=>!d.auto).length;
+  return `
+    <div class="section-header" style="--accent-c:var(--c-documents);"><h1>Documents</h1>${canAdd ? `<button class="btn" id="doc-upload-btn">+ Upload documents</button>` : ''}</div>
+    <p class="section-caption">Company records, supplier invoices and statements, tax letters and contracts, kept in one place. Receipts attached to invoices, bills and entries are listed here automatically.</p>
+    <div class="grid">
+      <div class="card" style="--accent-c:var(--c-documents);"><h3>All documents</h3><div class="value">${all.length}</div><div class="sub">${uploaded} uploaded here, ${all.length-uploaded} attached to records</div></div>
+      <div class="card" style="--accent-c:var(--c-documents);"><h3>Expired</h3><div class="value ${expired?'negative':''}">${expired}</div><div class="sub">Past their expiry or renewal date</div></div>
+      <div class="card" style="--accent-c:var(--c-documents);"><h3>Due soon</h3><div class="value">${soon}</div><div class="sub">Expiring in the next 30 days</div></div>
+    </div>
+    <div class="panel">
+      <div class="row" style="margin-bottom:12px;">
+        <div class="field" style="flex:2;min-width:200px;margin:0;"><label>Search</label><input type="search" id="doc-search" value="${escHtml(f.q)}" placeholder="Title, file name, client, supplier, notes…"></div>
+        <div class="field" style="margin:0;"><label>Show</label><select id="doc-source">
+          <option value="all" ${f.source==='all'?'selected':''}>Everything</option>
+          <option value="uploaded" ${f.source==='uploaded'?'selected':''}>Uploaded here</option>
+          <option value="attached" ${f.source==='attached'?'selected':''}>Attached to records</option>
+          <option value="expiring" ${f.source==='expiring'?'selected':''}>Expired or due soon</option>
+        </select></div>
+      </div>
+      <div id="doc-list">${renderDocumentsList()}</div>
+    </div>
+    ${canAdd ? docModal() : ''}`;
+}
+function docModal(){
+  return `
+  <div class="modal-backdrop hidden" id="doc-modal-backdrop"><div class="modal">
+    <button class="close-x" id="doc-modal-close">✕</button>
+    <h2 id="doc-modal-title">Upload documents</h2>
+    <form id="doc-form">
+      <div class="field" id="doc-file-field"><label>Files</label><input type="file" id="doc-files" multiple><p style="font-size:.72rem;color:var(--muted);margin:2px 0 0;">PDFs, scans, photos, spreadsheets. You can pick several at once; they all get the details below.</p></div>
+      <div class="field"><label>Title (optional)</label><input type="text" id="doc-title" placeholder="Defaults to the file name"></div>
+      <div class="row">
+        <div class="field"><label>Category</label><select id="doc-category">${DOC_CATEGORIES.map(([k,l])=>`<option value="${k}">${escHtml(l)}</option>`).join('')}</select></div>
+        <div class="field"><label>Document date</label><input type="date" id="doc-date"></div>
+        <div class="field"><label>Expiry / renewal date</label><input type="date" id="doc-expiry"></div>
+      </div>
+      <div class="field"><label>Linked to (optional)</label><select id="doc-party">
+        <option value="">Nobody</option>
+        <optgroup label="Clients">${(state.clients||[]).map(c=>`<option value="client|${c.id}">${escHtml(c.name)}</option>`).join('')}</optgroup>
+        <optgroup label="Suppliers">${(state.suppliers||[]).map(s=>`<option value="supplier|${s.id}">${escHtml(s.name)}</option>`).join('')}</optgroup>
+      </select></div>
+      <div class="field"><label>Notes</label><textarea id="doc-notes" rows="2"></textarea></div>
+      <div class="modal-actions"><button type="button" class="btn secondary" id="doc-cancel">Cancel</button><button type="submit" class="btn" id="doc-save">Upload</button></div>
+    </form>
+  </div></div>`;
+}
+async function reloadDocuments(){
+  const {data} = await sb.from('cc_documents').select('*').eq('company_id', state.company.id).order('created_at', {ascending:false});
+  state.documents = data || [];
+}
+async function openLibraryFile(d){
+  if(d.mime_type === 'text/html'){
+    // Storage serves HTML as plain text, so statements we archived are fetched and re-opened as a real page.
+    const {data, error} = await sb.storage.from('documents').download(d.file_path);
+    if(error || !data){ toast((error && error.message) || 'Could not open file.'); return; }
+    const text = await data.text();
+    window.open(URL.createObjectURL(new Blob([text], {type:'text/html'})), '_blank');
+    return;
+  }
+  const {data, error} = await sb.storage.from('documents').createSignedUrl(d.file_path, 300);
+  if(error || !data){ toast((error && error.message) || 'Could not open file.'); return; }
+  window.open(data.signedUrl, '_blank');
+}
+function openDocModal(docId){
+  state.docEditId = docId || null;
+  const d = docId ? (state.documents||[]).find(x=>x.id===docId) : null;
+  document.getElementById('doc-modal-title').textContent = d ? 'Edit document' : 'Upload documents';
+  document.getElementById('doc-save').textContent = d ? 'Save' : 'Upload';
+  document.getElementById('doc-file-field').classList.toggle('hidden', !!d);
+  document.getElementById('doc-files').value = '';
+  document.getElementById('doc-title').value = d ? d.title : '';
+  document.getElementById('doc-category').value = d ? d.category : ((state.docFilter.cat && state.docFilter.cat !== 'all') ? state.docFilter.cat : 'cipc');
+  document.getElementById('doc-date').value = d ? (d.doc_date||'') : todayIso();
+  document.getElementById('doc-expiry').value = d ? (d.expiry_date||'') : '';
+  document.getElementById('doc-party').value = d && d.party_type ? d.party_type + '|' + d.party_id : '';
+  document.getElementById('doc-notes').value = d ? (d.notes||'') : '';
+  document.getElementById('doc-modal-backdrop').classList.remove('hidden');
+}
+function attachDocumentsHandlers(){
+  const backdrop = document.getElementById('doc-modal-backdrop');
+  const refreshList = ()=>{ document.getElementById('doc-list').innerHTML = renderDocumentsList(); wireDocList(); };
+  const wireDocList = ()=>{
+    document.querySelectorAll('[data-doc-cat]').forEach(b=>b.addEventListener('click', ()=>{ state.docFilter.cat = b.dataset.docCat; refreshList(); }));
+    document.querySelectorAll('[data-view-doc]').forEach(b=>b.addEventListener('click', ()=>{
+      const d = libraryDocs().find(x=>String(x.id)===b.dataset.viewDoc);
+      if(d) openLibraryFile(d);
+    }));
+    document.querySelectorAll('[data-edit-doc]').forEach(b=>b.addEventListener('click', ()=>openDocModal(b.dataset.editDoc)));
+    document.querySelectorAll('[data-del-doc]').forEach(b=>b.addEventListener('click', async ()=>{
+      const d = (state.documents||[]).find(x=>x.id===b.dataset.delDoc);
+      if(!d || !confirm(`Delete "${d.title}"? The file is removed permanently.`)) return;
+      const {error} = await sb.from('cc_documents').delete().eq('id', d.id);
+      if(error){ toast(error.message); return; }
+      await sb.storage.from('documents').remove([d.file_path]);
+      await logActivity('delete', 'document', d.id, `Deleted document "${d.title}"`);
+      await reloadDocuments(); render(); toast('Document deleted.');
+    }));
+  };
+  wireDocList();
+  document.getElementById('doc-search')?.addEventListener('input', (e)=>{ state.docFilter.q = e.target.value; refreshList(); });
+  document.getElementById('doc-source')?.addEventListener('change', (e)=>{ state.docFilter.source = e.target.value; refreshList(); });
+  document.getElementById('doc-upload-btn')?.addEventListener('click', ()=>openDocModal(null));
+  document.getElementById('doc-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('doc-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('doc-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const partyRaw = document.getElementById('doc-party').value;
+    const [partyType, partyId] = partyRaw ? partyRaw.split('|') : [null, null];
+    const common = {
+      category: document.getElementById('doc-category').value,
+      doc_date: document.getElementById('doc-date').value || null,
+      expiry_date: document.getElementById('doc-expiry').value || null,
+      party_type: partyType, party_id: partyId,
+      notes: document.getElementById('doc-notes').value.trim() || null
+    };
+    const title = document.getElementById('doc-title').value.trim();
+    const saveBtn = document.getElementById('doc-save');
+    if(state.docEditId){
+      const d = (state.documents||[]).find(x=>x.id===state.docEditId);
+      if(!d) return;
+      const {error} = await sb.from('cc_documents').update({...common, title: title || d.title}).eq('id', d.id);
+      if(error){ toast(error.message); return; }
+      await logActivity('update', 'document', d.id, `Updated document "${title || d.title}"`);
+      await reloadDocuments(); backdrop.classList.add('hidden'); render(); toast('Saved.');
+      return;
+    }
+    const files = [...(document.getElementById('doc-files').files || [])];
+    if(!files.length){ toast('Choose at least one file.'); return; }
+    saveBtn.disabled = true; saveBtn.textContent = 'Uploading…';
+    let done = 0; const failures = [];
+    for(const file of files){
+      const path = `${state.company.id}/library/${common.category}/${Date.now()}_${done}_${safeFileName(file.name)}`;
+      const {error: upErr} = await sb.storage.from('documents').upload(path, file);
+      if(upErr){ failures.push(file.name + ': ' + upErr.message); continue; }
+      const rowTitle = files.length === 1 ? (title || file.name) : (title ? `${title} – ${file.name}` : file.name);
+      const {data: row, error: rowErr} = await sb.from('cc_documents').insert({
+        company_id: state.company.id, ...common, title: rowTitle, file_path: path, file_name: file.name,
+        file_size: file.size || null, mime_type: file.type || null, uploaded_by: state.user.email
+      }).select().single();
+      if(rowErr){ failures.push(file.name + ': ' + rowErr.message); await sb.storage.from('documents').remove([path]); continue; }
+      done++;
+      await logActivity('create', 'document', row ? row.id : null, `Uploaded document "${rowTitle}" (${docCategoryLabel(common.category)})`);
+    }
+    saveBtn.disabled = false; saveBtn.textContent = 'Upload';
+    await reloadDocuments();
+    backdrop.classList.add('hidden'); render();
+    toast(failures.length ? `${done} uploaded, ${failures.length} failed — ${failures[0]}` : `${done} document${done>1?'s':''} uploaded.`);
+  });
+}
+
+
 /* ========================= ACTIVITY LOG ========================= */
 async function logActivity(action, entityType, entityId, summary){
   try {
@@ -1691,6 +2243,12 @@ async function ignoreBankTransaction(txId){
 }
 async function unmatchBankTransaction(txId){
   const tx = state.bankTransactions.find(t=>t.id===txId);
+  if(tx && (tx.matched_entry_type === 'client_credit' || tx.matched_entry_type === 'supplier_credit')){
+    const c = (state.partyCredits||[]).find(x=>x.id===tx.matched_entry_id);
+    if(c && creditAllocs(c.id).length){ toast('This prepayment has already been applied or refunded. Undo those allocations first.'); return; }
+    if(c && isPeriodLocked(c.credit_date)){ toast(periodLockMessage()); return; }
+    if(c) await sb.from('cc_party_credits').delete().eq('id', c.id);
+  }
   const {error} = await sb.from('cc_bank_transactions').update({status:'unmatched', matched_entry_type:null, matched_entry_id:null, linked_payment_id:null}).eq('id', txId);
   if(error){ toast(error.message); return; }
   if(tx && tx.linked_payment_id){
@@ -1724,6 +2282,10 @@ function bankTxEntryLabel(tx){
   if(tx.matched_entry_type === 'supplier_invoice'){
     const bill = state.supplierInvoices.find(x=>x.id===tx.matched_entry_id);
     return bill ? `Bill ${bill.bill_number} (${fmt(Math.abs(Number(tx.amount)))})` : 'linked bill no longer exists';
+  }
+  if(tx.matched_entry_type === 'client_credit' || tx.matched_entry_type === 'supplier_credit'){
+    const c = (state.partyCredits||[]).find(x=>x.id===tx.matched_entry_id);
+    return c ? `${c.party_type==='client'?'Customer':'Supplier'} prepayment — ${creditPartyName(c.party_type, c.party_id)} (${fmt(c.amount)})` : 'linked prepayment no longer exists';
   }
   const e = state.entries.find(x=>x.id===tx.matched_entry_id);
   return e ? `${e.description} (${fmt(e.amount)})` : 'linked entry no longer exists';
@@ -1785,6 +2347,7 @@ function renderBankFeed(){
           </div>` : `<div style="margin-top:8px;font-size:.82rem;color:var(--muted);">No matching entry found within 10 days.</div>`}
           <div class="modal-actions" style="justify-content:flex-start;margin-top:8px;">
             <button type="button" class="btn small" data-create-entry-from-tx="${t.id}">Create ${Number(t.amount)>=0?'revenue':'expense'} entry</button>
+            ${canManageCredits(Number(t.amount)>=0 ? 'client' : 'supplier') ? `<button type="button" class="btn small secondary" data-prepay-tx="${t.id}">Record as ${Number(t.amount)>=0?'customer':'supplier'} prepayment</button>` : ''}
             <button type="button" class="btn small secondary" data-find-match-toggle="${t.id}">${state.bankFindMatchOpenTx===t.id?'Hide':'Find & Match'} ${Number(t.amount)>=0?'invoice':'bill'}</button>
             <button type="button" class="btn small secondary" data-ignore-tx="${t.id}">Ignore</button>
           </div>
@@ -1849,6 +2412,13 @@ function attachBankFeedHandlers(){
   });
   document.querySelectorAll('[data-create-entry-from-tx]').forEach(btn=>{
     btn.addEventListener('click', ()=>createEntryFromBankTransaction(btn.dataset.createEntryFromTx));
+  });
+  document.querySelectorAll('[data-prepay-tx]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const tx = state.bankTransactions.find(t=>t.id===btn.dataset.prepayTx);
+      if(!tx) return;
+      openPrepayModal({type: Number(tx.amount) >= 0 ? 'client' : 'supplier', amount: Math.abs(Number(tx.amount)), date: tx.tx_date, reference: tx.description || '', bankTxId: tx.id});
+    });
   });
   document.querySelectorAll('[data-ignore-tx]').forEach(btn=>{
     btn.addEventListener('click', ()=>ignoreBankTransaction(btn.dataset.ignoreTx));
@@ -2112,6 +2682,7 @@ function render(){
     case 'payroll': main.innerHTML = renderPayroll(); attachPayrollHandlers(); break;
     case 'tasks': main.innerHTML = renderTasks(); attachTasksHandlers(); break;
     case 'vat': main.innerHTML = renderVat(); attachVatHandlers(); break;
+    case 'documents': main.innerHTML = renderDocuments(); attachDocumentsHandlers(); break;
     case 'reports': main.innerHTML = renderReports(); attachReportsHandlers(); break;
     case 'scenarios': main.innerHTML = renderScenarios(); attachScenarioHandlers(); break;
     case 'activitylog': main.innerHTML = renderActivityLog(); attachActivityLogHandlers(); break;
@@ -2866,10 +3437,12 @@ const DEFAULT_CHART = [
   {key:'AR', code:'1100', name:'Accounts Receivable', type:'asset'},
   {key:'INV', code:'1200', name:'Inventory / Stock', type:'asset'},
   {key:'OCA', code:'1300', name:'Other Current Assets', type:'asset'},
+  {key:'SUPPREPAY', code:'1350', name:'Supplier Prepayments', type:'asset'},
   {key:'FA_COST', code:'1500', name:'Fixed Assets — Cost', type:'asset'},
   {key:'FA_DEP', code:'1510', name:'Fixed Assets — Accumulated Depreciation', type:'asset'},
   {key:'AP', code:'2000', name:'Accounts Payable', type:'liability'},
   {key:'OCL', code:'2100', name:'Other Current Liabilities', type:'liability'},
+  {key:'CUSTDEP', code:'2150', name:'Customer Deposits (Prepayments Received)', type:'liability'},
   {key:'SARS', code:'2310', name:'SARS Payable — PAYE, UIF & SDL', type:'liability'},
   {key:'PAYDED', code:'2320', name:'Payroll Deductions Payable (pension, medical, other)', type:'liability'},
   {key:'NCL', code:'2200', name:'Non-Current Liabilities (Loans)', type:'liability'},
@@ -3052,6 +3625,28 @@ function buildLedger(){
     const items = (state.supplierCreditNoteItems||{})[cn.id] || [];
     const {gross, net, vat} = ledgerSplitVat(docTotal(items), items.some(it=>it.vat_applicable));
     post(cn.issue_date, 'Supplier Credit Note', `Supplier credit note ${cn.credit_note_number}`, [['AP', gross],['OPEX', -net],['VAT', -vat]]);
+  });
+
+  // Prepayments: customer deposits received / supplier prepayments paid, and each use of them.
+  (state.partyCredits||[]).forEach(c=>{
+    const amt = Number(c.amount)||0;
+    if(c.party_type === 'client') post(c.credit_date, 'Customer Prepayment', `Prepayment received — ${clientName(c.party_id)}`, [['BANK', amt],['CUSTDEP', -amt]], c.id);
+    else post(c.credit_date, 'Supplier Prepayment', `Prepayment paid — ${supplierName(c.party_id)}`, [['SUPPREPAY', amt],['BANK', -amt]], c.id);
+  });
+  (state.creditAllocations||[]).forEach(a=>{
+    const c = (state.partyCredits||[]).find(x=>x.id===a.credit_id);
+    if(!c) return;
+    const amt = Number(a.amount)||0;
+    if(a.kind === 'invoice'){
+      const inv = (state.invoices||[]).find(i=>i.id===a.doc_id);
+      post(a.alloc_date, 'Credit Allocation', `Customer credit applied${inv ? ' — '+inv.invoice_number : ''}`, [['CUSTDEP', amt],['AR', -amt]], a.id);
+    } else if(a.kind === 'bill'){
+      const bill = (state.supplierInvoices||[]).find(b=>b.id===a.doc_id);
+      post(a.alloc_date, 'Credit Allocation', `Supplier prepayment applied${bill ? ' — '+bill.bill_number : ''}`, [['AP', amt],['SUPPREPAY', -amt]], a.id);
+    } else if(a.kind === 'refund'){
+      if(c.party_type === 'client') post(a.alloc_date, 'Customer Refund', `Credit refunded — ${clientName(c.party_id)}`, [['CUSTDEP', amt],['BANK', -amt]], a.id);
+      else post(a.alloc_date, 'Supplier Refund', `Prepayment refunded by ${supplierName(c.party_id)}`, [['BANK', amt],['SUPPREPAY', -amt]], a.id);
+    }
   });
 
   // Unrealised FX: open foreign receivables/payables are revalued at each closing rate on file and the
@@ -3268,8 +3863,8 @@ function computeLedgerVsBS(end){
   const t = ledgerTotals(lines, null, end);
   const bal = k => { const r = t[k]; return r ? r.debit - r.credit : 0; };
   const vatNet = bal('VAT');
-  const assetKeys = ['BANK','AR','INV','OCA','FA_COST','FA_DEP'];
-  const liabKeys = ['AP','OCL','SARS','PAYDED','TAXPAY','NCL'];
+  const assetKeys = ['BANK','AR','INV','OCA','SUPPREPAY','FA_COST','FA_DEP'];
+  const liabKeys = ['AP','OCL','CUSTDEP','SARS','PAYDED','TAXPAY','NCL'];
   const ledgerAssets = assetKeys.reduce((s,k)=>s+bal(k),0) + Math.max(0, vatNet);
   const ledgerLiabs = liabKeys.reduce((s,k)=>s-bal(k),0) + Math.max(0, -vatNet);
   const bs = computeBS(end);
@@ -3802,7 +4397,8 @@ function wireFxPaymentPreview(o){
 function billBalance(bill){
   const total = docTotalZAR(bill, state.supplierInvoiceItems[bill.id]);
   const paid = round2((state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===bill.id).reduce((s,p)=>s+paymentCleared(p, bill),0));
-  return {total, paid, balance: Math.max(0, round2(total - paid))};
+  const allocated = docAllocated('bill', bill.id);
+  return {total, paid, allocated, balance: Math.max(0, round2(total - paid - allocated))};
 }
 // Customer-invoice equivalent of billBalance() — in ZAR, via docTotalZAR(), so a foreign-currency
 // invoice's balance is on the same footing as a ZAR bank statement line.
@@ -3813,7 +4409,8 @@ function invoiceBalance(inv){
   const total = docTotalZAR(inv, state.invoiceItems[inv.id]);
   const paid = round2((state.invoicePayments||[]).filter(p=>p.invoice_id===inv.id).reduce((s,p)=>s+paymentCleared(p, inv),0));
   const writtenOff = invoiceWrittenOff(inv.id);
-  return {total, paid, writtenOff, balance: Math.max(0, total - paid - writtenOff)};
+  const allocated = docAllocated('invoice', inv.id);
+  return {total, paid, writtenOff, allocated, balance: Math.max(0, round2(total - paid - writtenOff - allocated))};
 }
 // Liability (loan) equivalent of billBalance()/invoiceBalance(). Only the principal portion of a
 // payment reduces the balance — interest is a P&L expense, posted separately as a cc_entries row
@@ -3866,8 +4463,8 @@ function renderSupplierInvoices(){
     ${pendingCount ? `<div class="panel" style="border-top:3px solid var(--warn);"><h3 style="margin-top:0;color:var(--warn);">Pending approval (${pendingCount})</h3><p style="color:var(--muted);font-size:.85rem;margin-bottom:0;">${canApprove() ? 'Open one below to approve or reject it.' : 'Waiting on management or an approver to review.'}</p></div>` : ''}
     <div class="panel">
       <h3 style="margin-top:0;">Suppliers</h3>
-      ${state.suppliers.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.suppliers.map(s=>`<tr><td>${s.name}</td><td>${s.email||'—'}</td><td>${s.phone||'—'}</td>${canEdit?`<td><button class="btn small danger" data-del-supplier="${s.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.suppliers.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Prepaid</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.suppliers.map(s=>`<tr><td>${s.name}</td><td>${s.email||'—'}</td><td>${s.phone||'—'}</td><td>${partyCreditsFor('supplier', s.id).length ? `<button class="btn small secondary" data-credits="supplier|${s.id}">${fmt(partyCreditBalance('supplier', s.id))}</button>` : '—'}</td>${canEdit?`<td><button class="btn small secondary" data-new-prepay="supplier|${s.id}">Prepayment</button> <button class="btn small danger" data-del-supplier="${s.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No suppliers yet.</div>`}
     </div>
     <div class="panel">
@@ -3994,6 +4591,7 @@ function supplierCreditNoteModal(){
 }
 function attachSupplierInvoiceHandlers(){
   const canEdit = hasModule('supplier_invoices');
+  wireCreditButtons();
   // ---- Suppliers ----
   const supplierBackdrop = document.getElementById('supplier-modal-backdrop');
   document.getElementById('add-supplier-btn')?.addEventListener('click', ()=>supplierBackdrop.classList.remove('hidden'));
@@ -4196,7 +4794,8 @@ async function openSupplierInvoiceView(billId){
   const docRate = fxDocRate(bill);
   const zarTotal = isForeign ? round2(total * docRate) : total;
   const totalPaid = round2(payments.reduce((s,p)=>s+paymentCleared(p, bill),0));
-  const balance = Math.max(0, round2(zarTotal - totalPaid));
+  const creditApplied = docAllocated('bill', bill.id);
+  const balance = Math.max(0, round2(zarTotal - totalPaid - creditApplied));
   const foreignOpen = isForeign ? Math.max(0, total - payments.reduce((s,p)=>s+settledForeign(p, bill),0)) : 0;
   const cf = v => fmtCurrency(v, bill.currency);
   const canRecordPayment = hasModule('supplier_invoices') && bill.approval_status === 'approved';
@@ -4238,6 +4837,7 @@ async function openSupplierInvoiceView(billId){
         <div class="field"><label>Notes (optional)</label><input type="text" id="supplier-payment-notes"></div>
         <div class="modal-actions"><button type="submit" class="btn small">Save Payment</button></div>
       </form>` : ''}
+      ${docCreditPanelHtml('bill', bill, balance)}
     </div>` : ''}
     ${(bill.approval_status === 'pending' && canApprove()) ? `
     <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
@@ -4249,6 +4849,7 @@ async function openSupplierInvoiceView(billId){
   `;
   backdrop.classList.remove('hidden');
   document.getElementById('supplier-invoice-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  attachDocCreditHandlers('bill', bill, ()=>openSupplierInvoiceView(bill.id));
   document.getElementById('add-supplier-payment-btn')?.addEventListener('click', ()=>{
     document.getElementById('supplier-payment-date').value = new Date().toISOString().slice(0,10);
     document.getElementById('supplier-payment-form').classList.remove('hidden');
@@ -4509,14 +5110,15 @@ async function applyStockPurchaseMovements(items){
 function renderClients(){
   const canEdit = hasModule('clients');
   return `
-    <div class="section-header" style="--accent-c:var(--c-clients);"><h1>Clients</h1>${canEdit ? `<button class="btn" id="add-client-btn">+ Add Client</button>` : ''}</div>
+    <div class="section-header" style="--accent-c:var(--c-clients);"><h1>Clients</h1><div style="display:flex;gap:8px;flex-wrap:wrap;">${hasModule('invoices') ? `<button class="btn secondary" id="send-statements-btn">Send statements</button>` : ''}${canEdit ? `<button class="btn" id="add-client-btn">+ Add Client</button>` : ''}</div></div>
     <p class="section-caption">The people and companies you invoice.</p>
     <div class="panel">
-      ${state.clients.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th></th></tr></thead><tbody>
-        ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td><td><button class="btn small secondary" data-statement-client="${c.id}">Statement</button>${canEdit?` <button class="btn small danger" data-del-client="${c.id}">Delete</button>`:''}</td></tr>`).join('')}
+      ${state.clients.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Credit</th><th></th></tr></thead><tbody>
+        ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td><td>${partyCreditsFor('client', c.id).length ? `<button class="btn small secondary" data-credits="client|${c.id}">${fmt(partyCreditBalance('client', c.id))}</button>` : '—'}</td><td><button class="btn small secondary" data-statement-client="${c.id}">Statement</button>${hasModule('invoices') ? ` <button class="btn small secondary" data-new-prepay="client|${c.id}">Prepayment</button>` : ''}${canEdit?` <button class="btn small danger" data-del-client="${c.id}">Delete</button>`:''}</td></tr>`).join('')}
       </tbody></table>` : `<div class="empty">No clients yet.</div>`}
     </div>
     ${clientStatementModal()}
+    ${stmtDistModal()}
     ${canEdit ? `
     <div class="modal-backdrop hidden" id="client-modal-backdrop"><div class="modal">
       <button class="close-x" id="client-modal-close">✕</button>
@@ -4556,6 +5158,8 @@ function attachClientHandlers(){
     });
   });
   attachClientStatementHandlers();
+  wireCreditButtons();
+  document.getElementById('send-statements-btn')?.addEventListener('click', openStmtDist);
 }
 
 function clientStatementModal(){
@@ -4607,30 +5211,90 @@ function attachClientStatementHandlers(){
   const viewBackdrop = document.getElementById('statement-view-backdrop');
   document.getElementById('statement-view-close')?.addEventListener('click', ()=>viewBackdrop.classList.add('hidden'));
 }
-function openClientStatementView(clientId, fromDate, toDate){
-  const client = state.clients.find(c=>c.id===clientId);
-  if(!client) return;
-  const inRange = (d) => (!fromDate || d >= fromDate) && (!toDate || d <= toDate);
-  const lines = [];
-  state.invoices.filter(i=>i.client_id===clientId && i.approval_status==='approved' && inRange(i.issue_date)).forEach(i=>{
-    lines.push({date:i.issue_date, label:`Invoice ${i.invoice_number}`, amount: docTotalZAR(i, state.invoiceItems[i.id])});
+/* ========================= CUSTOMER STATEMENTS (compute, render, distribute) ========================= */
+// Builds one client's statement for a date range: the balance brought forward from before the range,
+// every approved invoice / credit note / payment / write-off inside it, a running balance and the closing balance.
+function computeClientStatement(clientId, fromDate, toDate){
+  const client = state.clients.find(c=>c.id===clientId) || null;
+  const all = [];
+  state.invoices.filter(i=>i.client_id===clientId && i.approval_status==='approved').forEach(i=>{
+    all.push({date:i.issue_date, label:`Invoice ${i.invoice_number}`, amount: docTotalZAR(i, state.invoiceItems[i.id])});
   });
-  state.creditNotes.filter(n=>n.client_id===clientId && n.approval_status==='approved' && inRange(n.issue_date)).forEach(n=>{
-    lines.push({date:n.issue_date, label:`Credit Note ${n.credit_note_number}`, amount: -docTotalZAR(n, state.creditNoteItems[n.id])});
+  state.creditNotes.filter(n=>n.client_id===clientId && n.approval_status==='approved').forEach(n=>{
+    all.push({date:n.issue_date, label:`Credit Note ${n.credit_note_number}`, amount: -docTotalZAR(n, state.creditNoteItems[n.id])});
   });
   const clientInvoiceIds = new Set(state.invoices.filter(i=>i.client_id===clientId).map(i=>i.id));
-  state.invoicePayments.filter(p=>clientInvoiceIds.has(p.invoice_id) && inRange(p.payment_date)).forEach(p=>{
+  state.invoicePayments.filter(p=>clientInvoiceIds.has(p.invoice_id)).forEach(p=>{
     const inv = state.invoices.find(i=>i.id===p.invoice_id);
-    lines.push({date:p.payment_date, label:`Payment received (${inv?inv.invoice_number:'—'})`, amount: -paymentCleared(p, inv)});
+    all.push({date:p.payment_date, label:`Payment received (${inv?inv.invoice_number:'—'})`, amount: -paymentCleared(p, inv)});
   });
-  (state.invoiceWriteoffs||[]).filter(w=>clientInvoiceIds.has(w.invoice_id) && inRange(w.write_off_date)).forEach(w=>{
+  (state.invoiceWriteoffs||[]).filter(w=>clientInvoiceIds.has(w.invoice_id)).forEach(w=>{
     const inv = state.invoices.find(i=>i.id===w.invoice_id);
-    lines.push({date:w.write_off_date, label:`Written off (${inv?inv.invoice_number:'—'})`, amount: -Number(w.amount)});
+    all.push({date:w.write_off_date, label:`Written off (${inv?inv.invoice_number:'—'})`, amount: -Number(w.amount)});
   });
-  lines.sort((a,b)=> a.date < b.date ? -1 : (a.date > b.date ? 1 : 0));
-  let running = 0;
-  const withBalance = lines.map(l=>{ running = round2(running + l.amount); return {...l, balance: running}; });
-  const closingBalance = running;
+  // Prepayments received sit on the account as credit; applying them to an invoice changes nothing here
+  // (the invoice and the credit offset), but a refund of unused credit puts the balance back up.
+  partyCreditsFor('client', clientId).forEach(c=>{
+    all.push({date:c.credit_date, label:`Prepayment received${c.reference ? ' ('+c.reference+')' : ''}`, amount: -Number(c.amount)});
+    creditAllocs(c.id).filter(a=>a.kind==='refund').forEach(a=>{ all.push({date:a.alloc_date, label:'Credit refunded', amount: Number(a.amount)}); });
+  });
+  all.sort((a,b)=> a.date < b.date ? -1 : (a.date > b.date ? 1 : 0));
+  const opening = fromDate ? round2(all.filter(l=>l.date < fromDate).reduce((s,l)=>s+l.amount, 0)) : 0;
+  const inPeriod = all.filter(l=>(!fromDate || l.date >= fromDate) && (!toDate || l.date <= toDate));
+  let running = opening;
+  const lines = inPeriod.map(l=>{ running = round2(running + l.amount); return {...l, balance: running}; });
+  return {
+    client, from: fromDate || null, to: toDate || null, opening, lines, closing: running,
+    invoiced: round2(inPeriod.filter(l=>l.amount>0).reduce((s,l)=>s+l.amount, 0)),
+    received: round2(-inPeriod.filter(l=>l.amount<0).reduce((s,l)=>s+l.amount, 0))
+  };
+}
+function stmtPeriodLabel(from, to){
+  if(from && to) return `${from} to ${to}`;
+  if(from) return `from ${from}`;
+  if(to) return `up to ${to}`;
+  return 'full history';
+}
+// Self-contained, inline-styled statement block: used as the email body, the archived copy and the print pack.
+function statementDocumentHtml(stmt, opts){
+  opts = opts || {};
+  const co = state.company;
+  const td = 'padding:6px 8px;border-bottom:1px solid #eee;';
+  const amt = v => (v < 0 ? '-' : '') + fmt(Math.abs(v));
+  const rows = [];
+  if(stmt.from) rows.push(`<tr style="background:#fafafa;"><td style="${td}">${escHtml(stmt.from)}</td><td style="${td}"><em>Balance brought forward</em></td><td style="${td}text-align:right;"></td><td style="${td}text-align:right;">${amt(stmt.opening)}</td></tr>`);
+  stmt.lines.forEach(l=>rows.push(`<tr><td style="${td}">${escHtml(l.date)}</td><td style="${td}">${escHtml(l.label)}</td><td style="${td}text-align:right;">${amt(l.amount)}</td><td style="${td}text-align:right;">${amt(l.balance)}</td></tr>`));
+  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:680px;margin:0 auto 24px;color:#222;${opts.pageBreak ? 'page-break-after:always;' : ''}">
+  ${opts.message ? `<div style="white-space:pre-line;margin-bottom:18px;">${escHtml(opts.message)}</div>` : ''}
+  <div style="border:1px solid #ddd;border-radius:8px;padding:18px;">
+    <div style="font-size:20px;font-weight:700;">${escHtml(co.name)}</div>
+    ${weAreVatRegistered() && co.vat_number ? `<div style="color:#666;font-size:13px;">VAT ${escHtml(co.vat_number)}</div>` : ''}
+    ${co.address ? `<div style="color:#666;font-size:13px;white-space:pre-line;">${escHtml(co.address)}</div>` : ''}
+    <h2 style="margin:16px 0 4px;">Statement of Account</h2>
+    <div style="font-size:13px;color:#666;">Period: ${escHtml(stmtPeriodLabel(stmt.from, stmt.to))} · Printed ${escHtml(todayIso())}</div>
+    <div style="margin:10px 0;"><strong>Customer:</strong> ${escHtml(stmt.client ? stmt.client.name : '')}</div>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;"><thead><tr style="background:#f5f5f5;"><th style="padding:6px 8px;text-align:left;">Date</th><th style="padding:6px 8px;text-align:left;">Description</th><th style="padding:6px 8px;text-align:right;">Amount</th><th style="padding:6px 8px;text-align:right;">Balance</th></tr></thead><tbody>${rows.length ? rows.join('') : `<tr><td colspan="4" style="${td}color:#666;">No activity in this period.</td></tr>`}</tbody></table>
+    <div style="text-align:right;margin-top:12px;font-size:14px;">
+      ${stmt.from ? `<div>Balance brought forward: ${amt(stmt.opening)}</div>` : ''}
+      <div>Invoiced in period: ${fmt(stmt.invoiced)} · Received / credited: ${fmt(stmt.received)}</div>
+      <div style="font-size:17px;font-weight:700;margin-top:4px;">Balance due: ${amt(stmt.closing)}</div>
+    </div>
+  </div></div>`;
+}
+function statementFileHtml(stmt){
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Statement – ${escHtml(stmt.client ? stmt.client.name : '')}</title></head><body style="margin:20px;background:#fff;">${statementDocumentHtml(stmt, {})}</body></html>`;
+}
+function openStatementPrintPack(stmts){
+  const body = stmts.map(s=>statementDocumentHtml(s, {pageBreak:true})).join('');
+  const doc = `<!doctype html><html><head><meta charset="utf-8"><title>Customer statements</title><style>@media print{.noprint{display:none !important;}} body{margin:20px;background:#fff;}</style></head><body><div class="noprint" style="text-align:center;margin-bottom:16px;font-family:Arial,sans-serif;"><button onclick="window.print()" style="padding:8px 16px;font-size:14px;cursor:pointer;">Print / Save as PDF</button> <span style="color:#666;font-size:13px;">${stmts.length} statement${stmts.length>1?'s':''}, one per page</span></div>${body}</body></html>`;
+  const w = window.open(URL.createObjectURL(new Blob([doc], {type:'text/html'})), '_blank');
+  if(!w) toast('Your browser blocked the pop-up. Allow pop-ups for this site and try again.');
+}
+function openClientStatementView(clientId, fromDate, toDate){
+  const stmt = computeClientStatement(clientId, fromDate, toDate);
+  const client = stmt.client;
+  if(!client) return;
+  const amt = v => (v < 0 ? '-' : '') + fmt(Math.abs(v));
   const backdrop = document.getElementById('statement-view-backdrop');
   document.getElementById('statement-view-content').innerHTML = `
     <button class="close-x" id="statement-view-close">✕</button>
@@ -4638,15 +5302,208 @@ function openClientStatementView(clientId, fromDate, toDate){
     <p style="color:var(--muted);margin-top:-8px;">${state.company.name}</p>
     <p><strong>${client.name}</strong>${client.email?' ('+client.email+')':''}</p>
     <p style="font-size:.85rem;color:var(--muted);">${fromDate||toDate ? `${fromDate||'…'} to ${toDate||'…'}` : 'Full history'}</p>
-    ${withBalance.length ? `<table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Balance</th></tr></thead><tbody>
-      ${withBalance.map(l=>`<tr><td>${l.date}</td><td>${l.label}</td><td>${l.amount<0?'-':''}${fmt(Math.abs(l.amount))}</td><td>${fmt(l.balance)}</td></tr>`).join('')}
+    ${stmt.lines.length || (fromDate && stmt.opening) ? `<table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Balance</th></tr></thead><tbody>
+      ${fromDate ? `<tr><td>${fromDate}</td><td><em>Balance brought forward</em></td><td></td><td>${amt(stmt.opening)}</td></tr>` : ''}
+      ${stmt.lines.map(l=>`<tr><td>${l.date}</td><td>${l.label}</td><td>${amt(l.amount)}</td><td>${fmt(l.balance)}</td></tr>`).join('')}
     </tbody></table>` : `<div class="empty">No activity in this period.</div>`}
-    <div style="text-align:right;margin-top:10px;font-weight:700;font-size:1.1rem;">Balance due: ${fmt(closingBalance)}</div>
+    <div style="text-align:right;margin-top:10px;font-weight:700;font-size:1.1rem;">Balance due: ${amt(stmt.closing)}</div>
     <div class="modal-actions"><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
   `;
   backdrop.classList.remove('hidden');
   document.getElementById('statement-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
 }
+
+// ---- Distribute statements to many clients at once ----
+let STMT_SEND_DELAY_MS = 600;   // pause between emails (Resend rate limit); tests set this to 0
+const STMT_DEFAULT_SUBJECT = 'Statement of account from {company} ({period})';
+const STMT_DEFAULT_MESSAGE = 'Dear {client},\n\nPlease find your statement of account for {period} below. The balance outstanding is {balance}.\n\nIf you have already paid, please disregard this reminder, and let us know if anything looks incorrect.\n\nKind regards,\n{company}';
+function isoParts(iso){ const [y,m,d] = iso.split('-').map(Number); return {y, m, d}; }
+function isoFromParts(y, m, d){ return new Date(Date.UTC(y, m-1, d)).toISOString().slice(0,10); }
+function stmtPresetRange(key){
+  const t = isoParts(todayIso());
+  if(key === 'thismonth') return {from: isoFromParts(t.y, t.m, 1), to: todayIso()};
+  if(key === 'lastmonth') return {from: isoFromParts(t.y, t.m-1, 1), to: isoFromParts(t.y, t.m, 0)};
+  if(key === 'lastquarter'){
+    const q = Math.floor((t.m-1)/3);            // 0..3 for the current quarter
+    const startMonth = (q-1)*3 + 1;             // may be <= 0 for Q1 -> previous year; Date.UTC normalises
+    return {from: isoFromParts(t.y, startMonth, 1), to: isoFromParts(t.y, startMonth+3, 0)};
+  }
+  if(key === 'ytd') return {from: companyFinancialYearBounds(0).start, to: todayIso()};
+  return {from: null, to: null};
+}
+function fillStmtTemplate(tpl, vars){
+  return String(tpl||'').replace(/\{(client|company|period|balance)\}/g, (_, k)=>vars[k]);
+}
+function stmtLastSent(clientId){
+  return (state.statementLog||[]).filter(l=>l.client_id===clientId).sort((a,b)=> (a.sent_at||'') < (b.sent_at||'') ? 1 : -1)[0] || null;
+}
+function stmtDistCompute(){
+  const d = state.stmtDist;
+  d.rows = state.clients.map(c=>({client:c, stmt: computeClientStatement(c.id, d.from, d.to), hasEmail: !!(c.email && c.email.trim())}));
+  d.sel = {};
+  d.rows.forEach(r=>{ d.sel[r.client.id] = (r.stmt.lines.length > 0 || Math.abs(r.stmt.closing) > 0.004); });
+  d.results = {};
+}
+function stmtDistModal(){
+  return `<div class="modal-backdrop hidden" id="stmt-dist-backdrop"><div class="modal" id="stmt-dist-content" style="max-width:980px;width:100%;"></div></div>`;
+}
+function openStmtDist(){
+  const r = stmtPresetRange('lastmonth');
+  state.stmtDist = {from: r.from, to: r.to, rows: [], sel: {}, results: {}, sending: false,
+    subject: STMT_DEFAULT_SUBJECT, message: STMT_DEFAULT_MESSAGE, archive: hasModule('documents'), preset: 'lastmonth'};
+  stmtDistCompute();
+  renderStmtDist();
+  document.getElementById('stmt-dist-backdrop').classList.remove('hidden');
+}
+function renderStmtDist(){
+  const d = state.stmtDist;
+  if(!d) return;
+  const amt = v => (v < 0 ? '-' : '') + fmt(Math.abs(v));
+  const picked = d.rows.filter(r=>d.sel[r.client.id]);
+  const pickedEmail = picked.filter(r=>r.hasEmail);
+  const totalDue = round2(picked.reduce((s,r)=>s + r.stmt.closing, 0));
+  const preset = (k, label) => `<button type="button" class="btn small ${d.preset===k?'':'secondary'}" data-stmt-preset="${k}">${label}</button>`;
+  const statusCell = r => {
+    const res = d.results[r.client.id];
+    if(res) return res.ok ? '<span class="status-pill status-paid">Sent</span>' : `<span class="status-pill status-overdue" title="${escHtml(res.msg)}">Failed</span><div style="font-size:.72rem;color:var(--danger);max-width:180px;">${escHtml(res.msg)}</div>`;
+    if(d.sending && d.sel[r.client.id] && r.hasEmail) return '<span class="status-pill status-draft">Queued</span>';
+    return '';
+  };
+  document.getElementById('stmt-dist-content').innerHTML = `
+    <button class="close-x" id="stmt-dist-close">✕</button>
+    <h2 style="margin-top:0;">Send customer statements</h2>
+    <p style="font-size:.82rem;color:var(--muted);margin-top:-8px;">Pick the period and the clients, then email every statement in one go or print them all as a single pack. Each statement shows the balance brought forward from before the period.</p>
+    <div class="row" style="margin-bottom:10px;">
+      <div class="field" style="flex:1;min-width:150px;"><label>From</label><input type="date" id="stmt-dist-from" value="${d.from||''}"></div>
+      <div class="field" style="flex:1;min-width:150px;"><label>To</label><input type="date" id="stmt-dist-to" value="${d.to||''}"></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;padding-bottom:4px;">${preset('lastmonth','Last month')}${preset('thismonth','This month')}${preset('lastquarter','Last quarter')}${preset('ytd','Year to date')}</div>
+    </div>
+    <div style="max-height:300px;overflow:auto;border:1px solid var(--border);border-radius:10px;">
+    <table><thead><tr><th style="width:36px;"><input type="checkbox" id="stmt-dist-all" ${picked.length===d.rows.length && d.rows.length ? 'checked' : ''}></th><th>Client</th><th>Email</th><th style="text-align:right;">Brought fwd</th><th style="text-align:right;">Activity</th><th style="text-align:right;">Balance due</th><th>Last sent</th><th>Status</th><th></th></tr></thead><tbody>
+      ${d.rows.length ? d.rows.map(r=>{
+        const last = stmtLastSent(r.client.id);
+        return `<tr data-stmt-row="${r.client.id}">
+          <td><input type="checkbox" data-stmt-pick="${r.client.id}" ${d.sel[r.client.id]?'checked':''}></td>
+          <td>${escHtml(r.client.name)}</td>
+          <td style="font-size:.82rem;">${r.hasEmail ? escHtml(r.client.email) : '<span style="color:var(--muted);">No email — print only</span>'}</td>
+          <td style="text-align:right;">${amt(r.stmt.opening)}</td>
+          <td style="text-align:right;">${r.stmt.lines.length}</td>
+          <td style="text-align:right;font-weight:600;">${amt(r.stmt.closing)}</td>
+          <td style="font-size:.78rem;color:var(--muted);">${last ? escHtml((last.sent_at||'').slice(0,10)) + '<div>' + escHtml(stmtPeriodLabel(last.period_from, last.period_to)) + '</div>' : '—'}</td>
+          <td>${statusCell(r)}</td>
+          <td><button type="button" class="btn small secondary" data-stmt-preview="${r.client.id}">Preview</button></td></tr>`;
+      }).join('') : '<tr><td colspan="9"><div class="empty">No clients yet.</div></td></tr>'}
+    </tbody></table></div>
+    <p style="font-size:.8rem;color:var(--muted);margin:8px 0;">${picked.length} selected (${pickedEmail.length} with an email address) · combined balance ${amt(totalDue)}. Clients with no activity and a nil balance are unticked by default.</p>
+    <div class="field"><label>Email subject</label><input type="text" id="stmt-dist-subject" value="${escHtml(d.subject)}"></div>
+    <div class="field"><label>Email message</label><textarea id="stmt-dist-message" rows="6">${escHtml(d.message)}</textarea>
+      <p style="font-size:.72rem;color:var(--muted);margin:2px 0 0;">You can use {client}, {company}, {period} and {balance}. The statement itself is added under your message.</p></div>
+    <label style="display:flex;gap:8px;align-items:center;font-size:.85rem;margin-bottom:10px;${hasModule('documents')?'':'opacity:.5;'}"><input type="checkbox" style="width:auto;flex:none;" id="stmt-dist-archive" ${d.archive?'checked':''} ${hasModule('documents')?'':'disabled'}> Keep a copy of each emailed statement in Documents</label>
+    <div class="modal-actions">
+      <button type="button" class="btn secondary" id="stmt-dist-print" ${picked.length && !d.sending ? '' : 'disabled'}>Print / Save PDF pack (${picked.length})</button>
+      <button type="button" class="btn" id="stmt-dist-send" ${pickedEmail.length && !d.sending ? '' : 'disabled'}>${d.sending ? 'Sending…' : `Email ${pickedEmail.length} statement${pickedEmail.length===1?'':'s'}`}</button>
+    </div>`;
+  attachStmtDistHandlers();
+}
+function attachStmtDistHandlers(){
+  const d = state.stmtDist;
+  const keepText = ()=>{
+    const s = document.getElementById('stmt-dist-subject'), m = document.getElementById('stmt-dist-message'), a = document.getElementById('stmt-dist-archive');
+    if(s) d.subject = s.value; if(m) d.message = m.value; if(a && !a.disabled) d.archive = a.checked;
+  };
+  document.getElementById('stmt-dist-close')?.addEventListener('click', ()=>{ if(!d.sending) document.getElementById('stmt-dist-backdrop').classList.add('hidden'); });
+  const dateChanged = ()=>{
+    keepText();
+    d.from = document.getElementById('stmt-dist-from').value || null;
+    d.to = document.getElementById('stmt-dist-to').value || null;
+    d.preset = null;
+    stmtDistCompute(); renderStmtDist();
+  };
+  document.getElementById('stmt-dist-from')?.addEventListener('change', dateChanged);
+  document.getElementById('stmt-dist-to')?.addEventListener('change', dateChanged);
+  document.querySelectorAll('[data-stmt-preset]').forEach(b=>b.addEventListener('click', ()=>{
+    keepText();
+    const r = stmtPresetRange(b.dataset.stmtPreset);
+    d.from = r.from; d.to = r.to; d.preset = b.dataset.stmtPreset;
+    stmtDistCompute(); renderStmtDist();
+  }));
+  document.querySelectorAll('[data-stmt-pick]').forEach(cb=>cb.addEventListener('change', ()=>{ keepText(); d.sel[cb.dataset.stmtPick] = cb.checked; renderStmtDist(); }));
+  document.getElementById('stmt-dist-all')?.addEventListener('change', (e)=>{ keepText(); d.rows.forEach(r=>{ d.sel[r.client.id] = e.target.checked; }); renderStmtDist(); });
+  document.querySelectorAll('[data-stmt-preview]').forEach(b=>b.addEventListener('click', ()=>{
+    keepText();
+    document.getElementById('stmt-dist-backdrop').classList.add('hidden');
+    openClientStatementView(b.dataset.stmtPreview, d.from, d.to);
+  }));
+  document.getElementById('stmt-dist-subject')?.addEventListener('input', keepText);
+  document.getElementById('stmt-dist-message')?.addEventListener('input', keepText);
+  document.getElementById('stmt-dist-archive')?.addEventListener('change', keepText);
+  document.getElementById('stmt-dist-print')?.addEventListener('click', ()=>{
+    keepText();
+    const picked = d.rows.filter(r=>d.sel[r.client.id]);
+    if(!picked.length){ toast('Select at least one client.'); return; }
+    openStatementPrintPack(picked.map(r=>r.stmt));
+  });
+  document.getElementById('stmt-dist-send')?.addEventListener('click', ()=>{ keepText(); sendStmtDistEmails(); });
+}
+async function archiveStatement(stmt){
+  if(!hasModule('documents')) return false;
+  const period = stmtPeriodLabel(stmt.from, stmt.to);
+  const fileName = safeFileName(`Statement_${stmt.client.name}_${stmt.from||'start'}_${stmt.to||'latest'}.html`);
+  const path = `${state.company.id}/library/customer/${Date.now()}_${fileName}`;
+  const blob = new Blob([statementFileHtml(stmt)], {type:'text/html'});
+  const {error: upErr} = await sb.storage.from('documents').upload(path, blob, {contentType:'text/html'});
+  if(upErr) return false;
+  const {error} = await sb.from('cc_documents').insert({
+    company_id: state.company.id, category: 'customer', title: `Statement – ${stmt.client.name} (${period})`,
+    file_path: path, file_name: fileName, file_size: blob.size, mime_type: 'text/html', doc_date: stmt.to || todayIso(),
+    party_type: 'client', party_id: stmt.client.id, notes: 'Statement of account emailed to the customer', uploaded_by: state.user.email
+  });
+  return !error;
+}
+async function sendStmtDistEmails(){
+  const d = state.stmtDist;
+  const rows = d.rows.filter(r=>d.sel[r.client.id] && r.hasEmail);
+  if(!rows.length){ toast('Select at least one client with an email address.'); return; }
+  if(!confirm(`Email ${rows.length} statement${rows.length>1?'s':''} for ${stmtPeriodLabel(d.from, d.to)}?`)) return;
+  d.sending = true; d.results = {}; renderStmtDist();
+  let sent = 0, failed = 0, archived = 0, stopped = null;
+  for(let i=0; i<rows.length; i++){
+    const r = rows[i];
+    const vars = {client: r.client.name, company: state.company.name, period: stmtPeriodLabel(d.from, d.to), balance: fmtCurrency(r.stmt.closing, 'ZAR')};
+    const subject = fillStmtTemplate(d.subject, vars);
+    const html = statementDocumentHtml(r.stmt, {message: fillStmtTemplate(d.message, vars)});
+    let failure = null, notConfigured = false;
+    try{
+      const {data, error} = await sb.functions.invoke('send-invoice-email', {body:{company_id: state.company.id, to: r.client.email.trim(), subject, html, reply_to: state.company.email || null, from_name: state.company.name}});
+      if(error) failure = error.message || 'Could not send';
+      else if(data && data.error){
+        notConfigured = data.error === 'email_not_configured';
+        failure = notConfigured ? 'Email sending is not set up yet (the Resend API key has not been added to Supabase).' : data.error;
+      }
+    }catch(err){ failure = err.message || 'Could not send'; }
+    if(failure){
+      d.results[r.client.id] = {ok:false, msg:failure}; failed++;
+      renderStmtDist();
+      if(notConfigured){ stopped = failure; break; }
+    } else {
+      d.results[r.client.id] = {ok:true}; sent++;
+      const {data: logRow} = await sb.from('cc_statement_log').insert({
+        company_id: state.company.id, client_id: r.client.id, period_from: d.from, period_to: d.to,
+        closing_balance: r.stmt.closing, sent_to: r.client.email.trim(), sent_by: state.user.email
+      }).select().single();
+      if(logRow) state.statementLog = [logRow].concat(state.statementLog||[]);
+      await logActivity('email', 'statement', r.client.id, `Statement for ${r.client.name} (${stmtPeriodLabel(d.from, d.to)}) emailed to ${r.client.email.trim()}`);
+      if(d.archive && await archiveStatement(r.stmt)) archived++;
+      renderStmtDist();
+    }
+    if(i < rows.length-1 && STMT_SEND_DELAY_MS > 0) await new Promise(res=>setTimeout(res, STMT_SEND_DELAY_MS));
+  }
+  d.sending = false;
+  if(archived) await reloadDocuments();
+  renderStmtDist();
+  toast(stopped ? stopped + ' Use the print pack instead.' : `${sent} statement${sent===1?'':'s'} emailed${failed ? `, ${failed} failed` : ''}${archived ? `; ${archived} saved to Documents` : ''}.`);
+}
+
 
 /* ========================= INVOICES ========================= */
 function nextInvoiceNumber(){
@@ -5080,7 +5937,8 @@ async function openInvoiceView(invoiceId){
   const docRate = fxDocRate(inv);
   const writeoffs = (state.invoiceWriteoffs||[]).filter(w=>w.invoice_id===inv.id);
   const writtenOff = round2(writeoffs.reduce((s,w)=>s+Number(w.amount||0),0));
-  const balance = Math.max(0, round2(zarTotal - totalPaid - writtenOff));
+  const creditApplied = docAllocated('invoice', inv.id);
+  const balance = Math.max(0, round2(zarTotal - totalPaid - writtenOff - creditApplied));
   const foreignOpen = isForeign ? Math.max(0, total - payments.reduce((s,p)=>s+settledForeign(p, inv),0) - writtenOff / docRate) : 0;
   const canWriteOff = hasModule('invoices') && inv.approval_status === 'approved';
   const canRecordPayment = hasModule('invoices') && inv.approval_status === 'approved';
@@ -5102,7 +5960,7 @@ async function openInvoiceView(invoiceId){
       <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
       ${weAreVatRegistered() ? `<div>VAT (15%): ${fmt(vatTotal)}</div>` : ''}
       <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmtCurrency(total, inv.currency)}${isForeign ? ` (≈ ${fmt(zarTotal)} @ ${inv.exchange_rate})` : ''}</div>
-      ${(totalPaid || writtenOff) ? `${totalPaid ? `<div style="color:var(--accent2);">Paid: ${fmt(totalPaid)}</div>` : ''}${writtenOff ? `<div style="color:var(--danger);">Written off as bad debt: ${fmt(writtenOff)}</div>` : ''}<div style="font-weight:700;">Balance due: ${fmt(balance)}</div>` : ''}
+      ${(totalPaid || writtenOff || creditApplied) ? `${totalPaid ? `<div style="color:var(--accent2);">Paid: ${fmt(totalPaid)}</div>` : ''}${creditApplied ? `<div style="color:var(--accent2);">Customer credit applied: ${fmt(creditApplied)}</div>` : ''}${writtenOff ? `<div style="color:var(--danger);">Written off as bad debt: ${fmt(writtenOff)}</div>` : ''}<div style="font-weight:700;">Balance due: ${fmt(balance)}</div>` : ''}
     </div>
     ${inv.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${inv.notes}</p>` : ''}
     ${inv.approval_status === 'rejected' && inv.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${inv.rejection_note}</p>` : ''}
@@ -5138,6 +5996,7 @@ async function openInvoiceView(invoiceId){
         <div class="field"><label>Notes (optional)</label><input type="text" id="invoice-payment-notes"></div>
         <div class="modal-actions"><button type="submit" class="btn small">Save Payment</button></div>
       </form>` : ''}
+      ${docCreditPanelHtml('invoice', inv, balance)}
     </div>` : ''}
     ${(inv.approval_status === 'pending' && canApprove()) ? `
     <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
@@ -5178,6 +6037,7 @@ async function openInvoiceView(invoiceId){
       toast('Invoice updated.');
     });
   });
+  attachDocCreditHandlers('invoice', inv, ()=>openInvoiceView(inv.id));
   document.getElementById('email-invoice-btn')?.addEventListener('click', ()=>document.getElementById('email-invoice-form').classList.remove('hidden'));
   document.getElementById('email-invoice-cancel')?.addEventListener('click', ()=>document.getElementById('email-invoice-form').classList.add('hidden'));
   document.getElementById('email-invoice-form')?.addEventListener('submit', async (e)=>{
@@ -6823,13 +7683,15 @@ function computeBS(asOf){
   const vatPayableAmt = Math.max(0, -vatNet);
   const vatReceivableAmt = Math.max(0, vatNet);
   const inventoryValue = bal('INV');
-  const otherCurrentAssets = bal('INV') + bal('OCA') + customCurAssets;
+  const supplierPrepayments = bal('SUPPREPAY');
+  const otherCurrentAssets = bal('INV') + bal('OCA') + supplierPrepayments + customCurAssets;
   const fixedAssets = bal('FA_COST') + bal('FA_DEP') + customFixedAssets;
   const currentAssets = cash + accountsReceivable + otherCurrentAssets + vatReceivableAmt;
   const totalAssets = currentAssets + fixedAssets;
 
   const accountsPayableFromBills = -bal('AP');
-  const currentLiabOther = -bal('OCL') - bal('SARS') - bal('PAYDED') - bal('TAXPAY') + accountsPayableFromBills + customCurLiab;
+  const customerDeposits = -bal('CUSTDEP');
+  const currentLiabOther = -bal('OCL') - bal('SARS') - bal('PAYDED') - bal('TAXPAY') + customerDeposits + accountsPayableFromBills + customCurLiab;
   const nonCurrentLiab = -bal('NCL') + customNonCurLiab;
   const currentLiabilities = currentLiabOther + vatPayableAmt;
   const totalLiabilities = currentLiabilities + nonCurrentLiab;
@@ -6850,7 +7712,7 @@ function computeBS(asOf){
     otherCurrentAssets: r2(otherCurrentAssets), currentAssets: r2(currentAssets), fixedAssets: r2(fixedAssets), totalAssets: r2(totalAssets),
     vatPayableAmt: r2(vatPayableAmt), currentLiabOther: r2(currentLiabOther), accountsPayableFromBills: r2(accountsPayableFromBills),
     currentLiabilities: r2(currentLiabilities), nonCurrentLiab: r2(nonCurrentLiab), totalLiabilities: r2(totalLiabilities),
-    equity: r2(equity), inventoryValue: r2(inventoryValue), equityLines, equityFromLines,
+    equity: r2(equity), inventoryValue: r2(inventoryValue), customerDeposits: r2(customerDeposits), supplierPrepayments: r2(supplierPrepayments), equityLines, equityFromLines,
     balances: Math.abs(equityFromLines - r2(equity)) < 0.01
   };
 }
@@ -6892,13 +7754,13 @@ function computeCashFlowImpl(start, end){
     const net = l.debit - l.credit;
     switch(l.source){
       case 'Revenue': sum.cashFromRevenue += net; break;
-      case 'Invoice Payment': sum.invoicePaymentsIn += net; break;
+      case 'Invoice Payment': case 'Customer Prepayment': case 'Customer Refund': sum.invoicePaymentsIn += net; break;
       case 'Expense': {
         const e = entryById[l.ref];
         if(e && e.expense_category === 'cost_of_sales') sum.cosOut -= net; else sum.opexOut -= net;
         break;
       }
-      case 'Supplier Payment': sum.supplierPaymentsOut -= net; break;
+      case 'Supplier Payment': case 'Supplier Prepayment': case 'Supplier Refund': sum.supplierPaymentsOut -= net; break;
       case 'Payroll': sum.payrollOut -= net; break;
       case 'EMP201 Payment': sum.sarsOut -= net; break;
       case 'Loan Repayment': sum.principal -= net; break;
@@ -6945,10 +7807,10 @@ function renderCF(cf){
     <table class="report-table"><tbody>
       <tr style="font-weight:600;"><td colspan="2">Operating Activities</td></tr>
       <tr><td>Cash received from revenue</td><td style="text-align:right;">${fmt(cf.cashFromRevenue - cf.invoicePaymentsIn)}</td></tr>
-      ${cf.invoicePaymentsIn ? `<tr><td>Cash received — customer invoice payments</td><td style="text-align:right;">${fmt(cf.invoicePaymentsIn)}</td></tr>` : ''}
+      ${cf.invoicePaymentsIn ? `<tr><td>Cash received — customer payments and prepayments</td><td style="text-align:right;">${fmt(cf.invoicePaymentsIn)}</td></tr>` : ''}
       <tr><td>Cash paid — cost of sales</td><td style="text-align:right;">(${fmt(cf.cosOut)})</td></tr>
       <tr><td>Cash paid — operating expenses</td><td style="text-align:right;">(${fmt(cf.opexOut)})</td></tr>
-      ${cf.supplierPaymentsOut ? `<tr><td>Cash paid — supplier invoice payments</td><td style="text-align:right;">(${fmt(cf.supplierPaymentsOut)})</td></tr>` : ''}
+      ${cf.supplierPaymentsOut ? `<tr><td>Cash paid — supplier payments and prepayments</td><td style="text-align:right;">(${fmt(cf.supplierPaymentsOut)})</td></tr>` : ''}
       <tr><td>Cash paid — payroll (net pay)</td><td style="text-align:right;">(${fmt(cf.payrollOut)})</td></tr>
       ${cf.sarsOut ? `<tr><td>Cash paid — SARS (PAYE, UIF &amp; SDL, EMP201)</td><td style="text-align:right;">(${fmt(cf.sarsOut)})</td></tr>` : ''}
       <tr style="font-weight:700;border-top:1px solid var(--border);"><td>Net cash from operating activities</td><td style="text-align:right;" class="${cf.netOperating<0?'negative':'positive'}">${fmt(cf.netOperating)}</td></tr>
@@ -7069,7 +7931,7 @@ function renderDebtors(ar){
   return `
   <div class="section-header" style="--accent-c:var(--c-invoices);"><h1>Debtors</h1></div>
   <p class="section-caption">Money owed to you by clients, and how overdue it is.</p>
-  <div class="grid"><div class="card" style="--accent-c:var(--c-invoices);"><h3>Total Outstanding Debtors</h3><div class="value">${fmt(total)}</div></div></div>
+  <div class="grid"><div class="card" style="--accent-c:var(--c-invoices);"><h3>Total Outstanding Debtors</h3><div class="value">${fmt(total)}</div></div>${totalUnallocatedCredit('client') > 0.005 ? `<div class="card" style="--accent-c:var(--c-invoices);"><h3>Unallocated customer credit</h3><div class="value">${fmt(totalUnallocatedCredit('client'))}</div><div class="sub">Prepayments not yet applied to an invoice</div></div>` : ''}</div>
   <div class="panel">
     <h3 style="margin-top:0;">Accounts Receivable Aging</h3>
     ${agingBucketRow(ar.buckets)}
@@ -7086,7 +7948,7 @@ function renderCreditors(ap){
   return `
   <div class="section-header" style="--accent-c:var(--c-liabilities);"><h1>Creditors</h1></div>
   <p class="section-caption">Money you owe to suppliers, and when it's due.</p>
-  <div class="grid"><div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Outstanding Creditors</h3><div class="value negative">${fmt(total)}</div></div></div>
+  <div class="grid"><div class="card" style="--accent-c:var(--c-liabilities);"><h3>Total Outstanding Creditors</h3><div class="value negative">${fmt(total)}</div></div>${totalUnallocatedCredit('supplier') > 0.005 ? `<div class="card" style="--accent-c:var(--c-liabilities);"><h3>Supplier prepayments</h3><div class="value">${fmt(totalUnallocatedCredit('supplier'))}</div><div class="sub">Paid in advance, not yet applied to a bill</div></div>` : ''}</div>
   <div class="panel">
     <h3 style="margin-top:0;">Accounts Payable Aging</h3>
     ${agingBucketRow(ap.buckets)}
@@ -7394,7 +8256,8 @@ function renderBS(bs, prior){
       ${row('Cash &amp; Bank', bs.cash, cmp && prior.cash)}
       ${row('Accounts Receivable', bs.accountsReceivable, cmp && prior.accountsReceivable)}
       ${(bs.vatReceivableAmt>0 || (cmp && prior.vatReceivableAmt>0)) ? row('VAT Receivable', bs.vatReceivableAmt, cmp && prior.vatReceivableAmt) : ''}
-      ${row('Other Current Assets', bs.otherCurrentAssets, cmp && prior.otherCurrentAssets)}
+      ${(bs.supplierPrepayments || (cmp && prior.supplierPrepayments)) ? row('Supplier Prepayments', bs.supplierPrepayments, cmp && prior.supplierPrepayments) : ''}
+      ${row('Other Current Assets', round2(bs.otherCurrentAssets - bs.supplierPrepayments), cmp && round2(prior.otherCurrentAssets - prior.supplierPrepayments))}
       ${row('Total Current Assets', bs.currentAssets, cmp && prior.currentAssets, {bold:600})}
       ${row('Fixed / Non-Current Assets', bs.fixedAssets, cmp && prior.fixedAssets, {pad:true})}
       ${row('Total Assets', bs.totalAssets, cmp && prior.totalAssets, {bold:700})}
@@ -7404,7 +8267,8 @@ function renderBS(bs, prior){
     <h3 style="margin-top:0;">Liabilities</h3>
     <table class="report-table">${head}<tbody>
       ${(bs.vatPayableAmt>0 || (cmp && prior.vatPayableAmt>0)) ? row('VAT Payable', bs.vatPayableAmt, cmp && prior.vatPayableAmt) : ''}
-      ${row('Other Current Liabilities', bs.currentLiabOther, cmp && prior.currentLiabOther)}
+      ${(bs.customerDeposits || (cmp && prior.customerDeposits)) ? row('Customer Deposits (prepayments received)', bs.customerDeposits, cmp && prior.customerDeposits) : ''}
+      ${row('Other Current Liabilities', round2(bs.currentLiabOther - bs.customerDeposits), cmp && round2(prior.currentLiabOther - prior.customerDeposits))}
       ${row('Total Current Liabilities', bs.currentLiabilities, cmp && prior.currentLiabilities, {bold:600})}
       ${row('Non-Current Liabilities', bs.nonCurrentLiab, cmp && prior.nonCurrentLiab, {pad:true})}
       ${row('Total Liabilities', bs.totalLiabilities, cmp && prior.totalLiabilities, {bold:700})}
@@ -7861,7 +8725,7 @@ function computeHealthCheckImpl(){
     approvedInvoices.reduce((a,i)=>{
       const total = docTotalZAR(i, (state.invoiceItems||{})[i.id]);
       const paid = (state.invoicePayments||[]).filter(p=>p.invoice_id===i.id).reduce((x,p)=>x + paymentCleared(p, i), 0);
-      return a + total - paid - invoiceWrittenOff(i.id);
+      return a + total - paid - invoiceWrittenOff(i.id) - docAllocated('invoice', i.id);
     }, 0)
     - (state.creditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').reduce((a,cn)=>a + docTotalZAR(cn, (state.creditNoteItems||{})[cn.id]), 0));
   const arDiff = round2(arLedger - arExpected);
@@ -7872,12 +8736,20 @@ function computeHealthCheckImpl(){
     (state.supplierInvoices||[]).filter(b=>b.approval_status==='approved').reduce((a,b)=>{
       const total = docTotalZAR(b, (state.supplierInvoiceItems||{})[b.id]);
       const paid = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===b.id).reduce((x,p)=>x + paymentCleared(p, b), 0);
-      return a + total - paid;
+      return a + total - paid - docAllocated('bill', b.id);
     }, 0)
     - (state.supplierCreditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').reduce((a,cn)=>a + docTotal((state.supplierCreditNoteItems||{})[cn.id]), 0));
   const apDiff = round2(apLedger - apExpected);
   add('ap', 'Sub-ledgers', 'Payables ledger agrees to the bills', Math.abs(apDiff) < tol ? 'ok' : 'fail',
     Math.abs(apDiff) < tol ? `Both show ${money(apLedger)}.` : `Ledger ${money(apLedger)} vs bills ${money(apExpected)} (difference ${money(apDiff)}). Usually a bill edited after approval, or a manual journal to Accounts Payable.`, {view:'reports', tab:'creditors'});
+  const depLedger = round2(-lines.filter(l=>l.key==='CUSTDEP').reduce((a,l)=>a + l.debit - l.credit, 0));
+  const depExpected = totalUnallocatedCredit('client');
+  add('cust-deposits', 'Sub-ledgers', 'Customer deposits agree to unallocated credit', Math.abs(depLedger - depExpected) < tol ? 'ok' : 'fail',
+    Math.abs(depLedger - depExpected) < tol ? (depExpected ? `${money(depExpected)} of customer credit is waiting to be applied.` : 'No unallocated customer credit.') : `Ledger ${money(depLedger)} vs credits ${money(depExpected)}. Usually a manual journal to Customer Deposits.`, {view:'clients'});
+  const preLedger = round2(lines.filter(l=>l.key==='SUPPREPAY').reduce((a,l)=>a + l.debit - l.credit, 0));
+  const preExpected = totalUnallocatedCredit('supplier');
+  add('supp-prepay', 'Sub-ledgers', 'Supplier prepayments agree to unallocated credit', Math.abs(preLedger - preExpected) < tol ? 'ok' : 'fail',
+    Math.abs(preLedger - preExpected) < tol ? (preExpected ? `${money(preExpected)} prepaid to suppliers is waiting to be applied.` : 'No unallocated supplier prepayments.') : `Ledger ${money(preLedger)} vs prepayments ${money(preExpected)}. Usually a manual journal to Supplier Prepayments.`, {view:'supplierinvoices'});
   const entryInvIds = new Set((state.entries||[]).map(e=>e.source_invoice_id).filter(Boolean));
   const unposted = approvedInvoices.filter(i=>docTotal((state.invoiceItems||{})[i.id]) > 0 && !entryInvIds.has(i.id));
   add('inv-posted', 'Sub-ledgers', 'Every approved invoice is in the ledger', unposted.length ? 'fail' : 'ok',
@@ -7931,6 +8803,11 @@ function computeHealthCheckImpl(){
   const old90 = approvedInvoices.filter(i=>i.due_date && daysBetween(i.due_date, today) > 90 && invoiceBalance(i).balance > 0.005);
   add('overdue90', 'Operations', 'No invoices more than 90 days overdue', old90.length ? 'warn' : 'ok',
     old90.length ? `${old90.length} invoice${old90.length>1?'s are':' is'} over 90 days past due (${money(round2(old90.reduce((a,i)=>a + invoiceBalance(i).balance, 0)))}) — chase or write off.` : 'Nothing seriously overdue.', {view:'reports', tab:'debtors'});
+
+  const docsExpired = (state.documents||[]).filter(d=>docExpiryStatus(d)==='expired');
+  const docsSoon = (state.documents||[]).filter(d=>docExpiryStatus(d)==='soon');
+  add('docs-expiry', 'Operations', 'Documents are not expired or about to expire', (docsExpired.length || docsSoon.length) ? 'warn' : 'ok',
+    (docsExpired.length || docsSoon.length) ? `${docsExpired.length ? docsExpired.length + ' expired' : ''}${docsExpired.length && docsSoon.length ? ' and ' : ''}${docsSoon.length ? docsSoon.length + ' expiring within 30 days' : ''}, e.g. "${(docsExpired[0] || docsSoon[0]).title}" (${(docsExpired[0] || docsSoon[0]).expiry_date}).` : 'No expiring documents.', {view:'documents'});
 
   const summary = {ok: checks.filter(c=>c.status==='ok').length, warn: checks.filter(c=>c.status==='warn').length, fail: checks.filter(c=>c.status==='fail').length};
   return {checks, summary};
@@ -8571,6 +9448,7 @@ function renderTeam(){
           <label><input type="checkbox" class="member-module" value="credit_notes"> Credit Notes</label>
           <label><input type="checkbox" class="member-module" value="payroll"> Payroll</label>
           <label><input type="checkbox" class="member-module" value="supplier_invoices"> Supplier Invoices</label>
+          <label><input type="checkbox" class="member-module" value="documents"> Documents</label>
             <hr>
             <label><input type="checkbox" id="member-can-approve"> Can approve invoices &amp; credit notes (e.g. an accountant)</label>
           </div>
