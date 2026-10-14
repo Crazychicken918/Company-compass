@@ -855,6 +855,14 @@ let state = {
   attachmentsCtx: null, // {entityType, entityId, label, canUpload} for the currently-open Attachments modal
   auditLog: [],        // who created/updated/deleted what (cc_audit_log), newest first
   bankTransactions: [], // imported bank statement lines awaiting reconciliation (cc_bank_transactions)
+  reminderLog: [],      // cc_reminder_log rows (overdue reminders sent)
+  purchaseOrders: [],   // cc_purchase_orders
+  purchaseOrderItems: {}, // poId -> items[]
+  billPrefill: null,    // {poId, scanFile} while a pre-filled New Supplier Invoice form is open
+  bankRules: [],        // cc_bank_rules rows
+  bankRulesOpen: false,
+  bankRuleEditId: null,
+  bankRuleFromTx: null,
   bankImportPreview: null, // {accountId, rows[]} staged from a CSV before the user confirms the import
   bankFindMatchOpenTx: null, // id of the unmatched bank line whose Find & Match panel is open, or null = none open
   bankFindMatchQuery: '',    // current search text inside the open Find & Match panel
@@ -1171,6 +1179,8 @@ async function loadCompany(){
   document.querySelectorAll('#nav button[data-view]').forEach(b=>b.classList.toggle('active', b.dataset.view === state.view));
 
   await refreshAll();
+  // Recurring invoices and bills that fell due since the app was last opened (this never ran before Wave 54).
+  await runDueRecurringDocuments();
   render();
 }
 
@@ -1261,8 +1271,21 @@ async function refreshAll(){
   const chartRes = await sb.from('cc_chart_accounts').select('*').eq('company_id', cid);
   state.chartAccounts = chartRes.data || [];
   await refreshCredits();
+  const bankRulesRes = await sb.from('cc_bank_rules').select('*').eq('company_id', cid).order('sort_order', {ascending:true});
+  state.bankRules = bankRulesRes.data || [];
+  const reminderLogRes = await sb.from('cc_reminder_log').select('*').eq('company_id', cid).order('created_at', {ascending:false}).limit(500);
+  state.reminderLog = reminderLogRes.data || [];
+  const poRes = await sb.from('cc_purchase_orders').select('*').eq('company_id', cid).order('order_date', {ascending:false});
+  state.purchaseOrders = poRes.data || [];
+  const poIds = state.purchaseOrders.map(p=>p.id);
+  const poItemsRes = poIds.length ? await sb.from('cc_purchase_order_items').select('*').in('purchase_order_id', poIds) : {data: []};
+  state.purchaseOrderItems = {};
+  (poItemsRes.data||[]).forEach(it=>{ (state.purchaseOrderItems[it.purchase_order_id] = state.purchaseOrderItems[it.purchase_order_id] || []).push(it); });
   const docsRes = await sb.from('cc_documents').select('*').eq('company_id', cid).order('created_at', {ascending:false});
   state.documents = docsRes.data || [];
+  const payLinksRes = await sb.from('cc_payment_links').select('*').eq('company_id', cid).order('created_at', {ascending:false});
+  state.paymentLinks = payLinksRes.data || [];
+  await loadPaymentStatus();
   const stmtLogRes = await sb.from('cc_statement_log').select('*').eq('company_id', cid).order('sent_at', {ascending:false});
   state.statementLog = stmtLogRes.data || [];
 
@@ -1531,19 +1554,1179 @@ async function deleteAttachmentsForEntity(entityType, entityId){
 }
 
 
+/* ========================= RECURRING BILLS ========================= */
+// Supplier bills marked recurring (rent, subscriptions, debit orders) are copied on their next date the
+// first time the app is opened on or after it, exactly like recurring customer invoices.
+async function generateDueRecurringBills(){
+  if(!canApprove() && !hasModule('supplier_invoices')) return 0;
+  const today = todayIso();
+  const due = (state.supplierInvoices||[]).filter(b=>b.is_recurring && b.recurrence_next_date && b.recurrence_next_date <= today &&
+    (!b.recurrence_end_date || b.recurrence_next_date <= b.recurrence_end_date));
+  let made = 0;
+  for(const src of due){
+    if(isPeriodLocked(src.recurrence_next_date)) continue;
+    const {data: srcItems} = await sb.from('cc_supplier_invoice_items').select('*').eq('supplier_invoice_id', src.id);
+    const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const offset = src.due_date ? daysBetween(src.issue_date, src.due_date) : null;
+    const {data: created, error} = await sb.from('cc_supplier_invoices').insert({
+      company_id: state.company.id, supplier_id: src.supplier_id, bill_number: nextSupplierBillNumber(),
+      issue_date: src.recurrence_next_date, due_date: offset === null ? null : shiftIsoDays(src.recurrence_next_date, offset),
+      expense_category: src.expense_category || 'operating', currency: src.currency || 'ZAR', exchange_rate: src.exchange_rate || 1,
+      notes: src.notes, created_by: src.created_by || state.user.id, approval_status: approvalStatus,
+      is_recurring: false, recurrence_frequency: null, recurrence_next_date: null, recurrence_end_date: null
+    }).select().single();
+    if(error || !created) continue;
+    const rows = (srcItems||[]).map(it=>({supplier_invoice_id: created.id, description: it.description, quantity: it.quantity, unit_price: it.unit_price, vat_applicable: it.vat_applicable, stock_item_id: it.stock_item_id || null}));
+    if(rows.length) await sb.from('cc_supplier_invoice_items').insert(rows);
+    if(approvalStatus === 'approved') await recognizeSupplierInvoiceExpense(created, rows);
+    const advanced = nextRecurrenceDate(src.recurrence_next_date, src.recurrence_frequency);
+    const stillActive = !src.recurrence_end_date || advanced <= src.recurrence_end_date;
+    await sb.from('cc_supplier_invoices').update({recurrence_next_date: stillActive ? advanced : null, is_recurring: stillActive}).eq('id', src.id);
+    await logActivity('create', 'supplier_invoice', created.id, `${created.bill_number} — recurring copy of ${src.bill_number}`);
+    state.supplierInvoices.push(created);
+    made++;
+  }
+  return made;
+}
+// Runs once when the company loads: catches recurring invoices and bills up to today (at most 12 periods).
+async function runDueRecurringDocuments(){
+  let made = 0;
+  for(let i=0;i<12;i++){
+    let n = 0;
+    try{ n += (await generateDueRecurringInvoices()) || 0; }catch(e){}
+    try{ n += (await generateDueRecurringBills()) || 0; }catch(e){}
+    if(!n) break;
+    made += n;
+    await refreshAll();
+  }
+  if(made) toast(`${made} recurring invoice${made===1?'':'s'}/bill${made===1?'':'s'} created for today.`);
+  return made;
+}
+
+/* ========================= PURCHASE ORDERS ========================= */
+// An order sent to a supplier before the bill arrives. It is a commitment, not an accounting entry, so it
+// never touches the ledger; "Convert to bill" opens a new supplier invoice pre-filled from the order and
+// links the two once saved.
+function nextPurchaseOrderNumber(){
+  const year = new Date().getFullYear();
+  const nums = (state.purchaseOrders||[]).map(p=>p.po_number).filter(n=>n && n.startsWith('PO-'+year)).map(n=>parseInt(n.split('-').pop())||0);
+  return `PO-${year}-${String((nums.length ? Math.max(...nums) : 0) + 1).padStart(3,'0')}`;
+}
+function poTotal(po){ return docTotal((state.purchaseOrderItems||{})[po.id] || []); }
+function poStatusPill(po){
+  const map = {draft:['status-draft','Draft'], sent:['status-sent','Sent'], billed:['status-paid','Billed'], cancelled:['status-overdue','Cancelled']};
+  const [c, l] = map[po.status] || map.draft;
+  return `<span class="status-pill ${c}">${l}</span>`;
+}
+function purchaseOrdersPanel(){
+  const canEdit = hasModule('supplier_invoices');
+  const pos = (state.purchaseOrders||[]).slice().sort((a,b)=>String(b.order_date).localeCompare(String(a.order_date)));
+  const open = pos.filter(p=>p.status==='draft' || p.status==='sent');
+  return `
+  <div class="panel" id="po-panel">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+      <h3 style="margin:0;">Purchase orders</h3>
+      ${canEdit ? `<button class="btn small" id="add-po-btn">+ New purchase order</button>` : ''}
+    </div>
+    <p style="font-size:.8rem;color:var(--muted);">Orders you have placed with suppliers. They are commitments only (not in the books) until you convert them to a bill. Open orders: ${open.length} worth ${fmt(round2(open.reduce((s,p)=>s + round2(poTotal(p) * (isForeignDoc(p) ? fxDocRate(p) : 1)), 0)))}.</p>
+    ${pos.length ? `<table><thead><tr><th>PO #</th><th>Supplier</th><th>Date</th><th>Expected</th><th>Status</th><th style="text-align:right;">Total</th><th></th></tr></thead><tbody>
+      ${pos.map(p=>`<tr><td>${escHtml(p.po_number)}</td><td>${escHtml(supplierName(p.supplier_id))}</td><td>${p.order_date}</td><td>${p.expected_date||'—'}</td><td>${poStatusPill(p)}</td><td style="text-align:right;">${fmtCurrency(poTotal(p), p.currency)}</td>
+        <td style="white-space:nowrap;"><button class="btn small secondary" data-view-po="${p.id}">View</button></td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty">No purchase orders yet.</div>`}
+  </div>
+  <div class="modal-backdrop hidden" id="po-modal-backdrop"><div class="modal" style="max-width:640px;" id="po-modal-content"></div></div>`;
+}
+function openPoForm(){
+  const host = document.getElementById('po-modal-content');
+  host.innerHTML = `
+    <button class="close-x" id="po-close">✕</button>
+    <h2>New purchase order</h2>
+    <form id="po-form">
+      <div class="row">
+        <div class="field"><label>PO #</label><input type="text" id="po-number" value="${nextPurchaseOrderNumber()}" required></div>
+        <div class="field"><label>Supplier</label><select id="po-supplier">${state.suppliers.map(s=>`<option value="${s.id}">${escHtml(s.name)}</option>`).join('')}</select></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Order date</label><input type="date" id="po-date" value="${todayIso()}" required></div>
+        <div class="field"><label>Expected delivery</label><input type="date" id="po-expected"></div>
+        <div class="field"><label>Currency</label><select id="po-currency">${CURRENCIES.map(c=>`<option value="${c}">${c}</option>`).join('')}</select></div>
+      </div>
+      <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+        <tbody id="po-items-body">${invoiceItemRow()}</tbody></table>
+      <button type="button" class="btn secondary small" id="po-add-item" style="margin-top:8px;">+ Add line</button>
+      <div class="field" style="margin-top:12px;"><label>Notes / delivery instructions</label><textarea id="po-notes" rows="2"></textarea></div>
+      <div class="modal-actions"><button type="button" class="btn secondary" id="po-cancel">Cancel</button><button type="submit" class="btn">Save purchase order</button></div>
+    </form>`;
+  const backdrop = document.getElementById('po-modal-backdrop');
+  const close = ()=>backdrop.classList.add('hidden');
+  document.getElementById('po-close').addEventListener('click', close);
+  document.getElementById('po-cancel').addEventListener('click', close);
+  document.getElementById('po-add-item').addEventListener('click', ()=>document.getElementById('po-items-body').insertAdjacentHTML('beforeend', invoiceItemRow()));
+  document.getElementById('po-items-body').addEventListener('click', e=>{ if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove(); });
+  document.getElementById('po-form').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const supplierId = document.getElementById('po-supplier').value;
+    if(!supplierId){ toast('Add a supplier first.'); return; }
+    const items = [...document.querySelectorAll('#po-items-body tr')].map(tr=>({
+      description: tr.querySelector('.ii-desc').value.trim(), quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
+      unit_price: parseFloat(tr.querySelector('.ii-price').value)||0, vat_applicable: tr.querySelector('.ii-vat').checked
+    })).filter(r=>r.description);
+    if(!items.length){ toast('Add at least one line.'); return; }
+    const cur = document.getElementById('po-currency').value || 'ZAR';
+    const known = cur === 'ZAR' ? null : fxRateOn(cur, document.getElementById('po-date').value);
+    const {data: po, error} = await sb.from('cc_purchase_orders').insert({
+      company_id: state.company.id, supplier_id: supplierId, po_number: document.getElementById('po-number').value.trim(),
+      order_date: document.getElementById('po-date').value, expected_date: document.getElementById('po-expected').value || null,
+      currency: cur, exchange_rate: cur === 'ZAR' ? 1 : (known ? known.rate : 1), status: 'draft',
+      notes: document.getElementById('po-notes').value.trim() || null, created_by: state.user.id
+    }).select().single();
+    if(error || !po){ toast((error && error.message) || 'Could not save.'); return; }
+    const {error: itErr} = await sb.from('cc_purchase_order_items').insert(items.map(it=>({...it, purchase_order_id: po.id})));
+    if(itErr){ toast(itErr.message); return; }
+    await logActivity('create', 'purchase_order', po.id, `${po.po_number} — ${supplierName(supplierId)}`);
+    close(); await refreshAll(); render(); toast('Purchase order saved.');
+  });
+  backdrop.classList.remove('hidden');
+}
+async function buildPurchaseOrderPdf(po){
+  const JsPDF = await ensurePdfLib();
+  const doc = new JsPDF({unit:'mm', format:'a4'});
+  const items = (state.purchaseOrderItems||{})[po.id] || [];
+  const supplier = state.suppliers.find(s=>s.id===po.supplier_id);
+  let y = pdfHeader(doc, 'PURCHASE ORDER', [`Order number: ${po.po_number}`, `Date: ${po.order_date}` + (po.expected_date ? `     Required by: ${po.expected_date}` : '')]);
+  y = pdfBillTo(doc, y, 'Supplier', supplier);
+  doc.autoTable({startY:y, margin:{left:14, right:14}, theme:'striped', headStyles:{fillColor:[124,92,255]}, styles:{fontSize:9},
+    head:[['Description','Qty','Unit price','Amount']], body: items.map(it=>[String(it.description), String(it.quantity), pdfMoney(it.unit_price, po.currency), pdfMoney(it.quantity*it.unit_price, po.currency)]),
+    columnStyles:{1:{halign:'right'},2:{halign:'right'},3:{halign:'right'}}, didParseCell: d=>{ if(d.section==='head' && d.column.index>0) d.cell.styles.halign='right'; }});
+  y = doc.lastAutoTable.finalY + 7;
+  const W = doc.internal.pageSize.getWidth();
+  doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(25);
+  doc.text(`Order total: ${pdfMoney(docTotal(items), po.currency)}`, W - 14, y, {align:'right'});
+  if(po.notes){ y += 8; doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(80); doc.text(doc.splitTextToSize(String(po.notes), W - 28), 14, y); }
+  pdfFooter(doc);
+  return {doc, filename: pdfSafeName(`Purchase_Order_${po.po_number}`) + '.pdf'};
+}
+function openPoView(poId){
+  const po = (state.purchaseOrders||[]).find(p=>p.id===poId);
+  if(!po) return;
+  const items = (state.purchaseOrderItems||{})[po.id] || [];
+  const supplier = state.suppliers.find(s=>s.id===po.supplier_id);
+  const canEdit = hasModule('supplier_invoices');
+  const bill = po.bill_id ? state.supplierInvoices.find(b=>b.id===po.bill_id) : null;
+  const host = document.getElementById('po-modal-content');
+  host.innerHTML = `
+    <button class="close-x" id="po-close">✕</button>
+    <h2>${escHtml(po.po_number)} ${poStatusPill(po)}</h2>
+    <p><strong>Supplier:</strong> ${escHtml(supplier ? supplier.name : '—')}${supplier && supplier.email ? ' (' + escHtml(supplier.email) + ')' : ''}</p>
+    <p style="font-size:.85rem;color:var(--muted);">Ordered ${po.order_date}${po.expected_date ? ' · expected ' + po.expected_date : ''}</p>
+    <table><thead><tr><th>Description</th><th>Qty</th><th>Unit price</th><th>Amount</th></tr></thead><tbody>
+      ${items.map(it=>`<tr><td>${escHtml(it.description)}</td><td>${it.quantity}</td><td>${fmtCurrency(it.unit_price, po.currency)}</td><td>${fmtCurrency(it.quantity*it.unit_price, po.currency)}</td></tr>`).join('')}
+    </tbody></table>
+    <div style="text-align:right;font-weight:700;margin-top:8px;">Total: ${fmtCurrency(docTotal(items), po.currency)}</div>
+    ${po.notes ? `<p style="font-size:.85rem;color:var(--muted);white-space:pre-line;">${escHtml(po.notes)}</p>` : ''}
+    ${bill ? `<p style="font-size:.85rem;">Billed on <strong>${escHtml(bill.bill_number)}</strong>.</p>` : ''}
+    <div class="modal-actions" style="flex-wrap:wrap;">
+      <button type="button" class="btn secondary" id="po-pdf">Download PDF</button>
+      ${canEdit && supplier && supplier.email && hasModule('invoices') && po.status !== 'cancelled' ? `<button type="button" class="btn secondary" id="po-email">Email to supplier</button>` : ''}
+      ${canEdit && po.status === 'draft' ? `<button type="button" class="btn secondary" id="po-mark-sent">Mark as sent</button>` : ''}
+      ${canEdit && (po.status === 'draft' || po.status === 'sent') ? `<button type="button" class="btn secondary" id="po-cancel-po">Cancel order</button><button type="button" class="btn" id="po-convert">Convert to bill</button>` : ''}
+      ${isAdmin() && po.status !== 'billed' ? `<button type="button" class="btn danger" id="po-delete">Delete</button>` : ''}
+    </div>`;
+  const backdrop = document.getElementById('po-modal-backdrop');
+  const reopen = async ()=>{ await refreshAll(); render(); openPoView(po.id); };
+  document.getElementById('po-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('po-pdf').addEventListener('click', async ()=>{ try{ downloadPdf(await buildPurchaseOrderPdf(po)); }catch(e){ toast('Could not create the PDF (' + e.message + ').'); } });
+  document.getElementById('po-mark-sent')?.addEventListener('click', async ()=>{ await sb.from('cc_purchase_orders').update({status:'sent'}).eq('id', po.id); await reopen(); toast('Marked as sent.'); });
+  document.getElementById('po-cancel-po')?.addEventListener('click', async ()=>{ if(!confirm('Cancel this purchase order?')) return; await sb.from('cc_purchase_orders').update({status:'cancelled'}).eq('id', po.id); await logActivity('update', 'purchase_order', po.id, `${po.po_number} cancelled`); await reopen(); });
+  document.getElementById('po-delete')?.addEventListener('click', async ()=>{ if(!confirm('Delete this purchase order?')) return; await sb.from('cc_purchase_orders').delete().eq('id', po.id); backdrop.classList.add('hidden'); await refreshAll(); render(); toast('Deleted.'); });
+  document.getElementById('po-email')?.addEventListener('click', async (e)=>{
+    e.target.disabled = true; e.target.textContent = 'Sending…';
+    const att = await pdfAttachment(()=>buildPurchaseOrderPdf(po));
+    const html = `<div style="font-family:Arial,Helvetica,sans-serif;color:#222;"><p>Dear ${escHtml(supplier.name)},</p><p>Please find our purchase order ${escHtml(po.po_number)} attached${po.expected_date ? `, required by ${escHtml(po.expected_date)}` : ''}. Please quote the order number on your invoice.</p><p>Kind regards,<br>${escHtml(state.company.name)}</p></div>`;
+    let failure = null;
+    try{
+      const {data, error} = await sb.functions.invoke('send-invoice-email', {body:{company_id: state.company.id, to: supplier.email, subject: `Purchase order ${po.po_number} from ${state.company.name}`, html, reply_to: companyReplyTo(), from_name: state.company.name, attachments: att ? [att] : undefined}});
+      if(error) failure = error.message || 'Could not send'; else if(data && data.error) failure = data.error === 'email_not_configured' ? 'Email sending is not set up yet.' : data.error;
+    }catch(err){ failure = err.message; }
+    if(failure){ toast(failure); e.target.disabled = false; e.target.textContent = 'Email to supplier'; return; }
+    if(po.status === 'draft') await sb.from('cc_purchase_orders').update({status:'sent'}).eq('id', po.id);
+    await logActivity('email', 'purchase_order', po.id, `${po.po_number} emailed to ${supplier.email}`);
+    await reopen(); toast('Purchase order emailed to ' + supplier.email + '.');
+  });
+  document.getElementById('po-convert')?.addEventListener('click', ()=>{
+    backdrop.classList.add('hidden');
+    openBillPrefilled({supplierId: po.supplier_id, currency: po.currency, exchangeRate: po.exchange_rate, notes: `From purchase order ${po.po_number}`, items, poId: po.id});
+  });
+  backdrop.classList.remove('hidden');
+}
+async function uploadScannedFile(file, billId){
+  const path = `${state.company.id}/supplier_invoice/${billId}/${Date.now()}_${safeFileName(file.name || 'scan')}`;
+  const {error: upErr} = await sb.storage.from('documents').upload(path, file);
+  if(upErr){ toast('Saved, but the scanned file failed to upload: ' + upErr.message); return; }
+  await sb.from('cc_attachments').insert({company_id: state.company.id, entity_type: 'supplier_invoice', entity_id: billId, file_path: path, file_name: file.name || 'scan', uploaded_by: state.user.email});
+}
+// Opens the New Supplier Invoice form already filled in (used by purchase orders and receipt scanning).
+function openBillPrefilled(p){
+  const btn = document.getElementById('add-supplier-invoice-btn');
+  if(!btn){ toast('Open Supplier Invoices first.'); return; }
+  btn.click();
+  state.billPrefill = {poId: p.poId || null, scanFile: p.scanFile || null};
+  if(p.supplierId) document.getElementById('supplier-invoice-supplier').value = p.supplierId;
+  if(p.billNumber) document.getElementById('supplier-invoice-number').value = p.billNumber;
+  if(p.issueDate) document.getElementById('supplier-invoice-issue-date').value = p.issueDate;
+  if(p.dueDate) document.getElementById('supplier-invoice-due-date').value = p.dueDate;
+  if(p.category) document.getElementById('supplier-invoice-category').value = p.category;
+  if(p.currency && p.currency !== 'ZAR'){
+    document.getElementById('supplier-invoice-currency').value = p.currency;
+    document.getElementById('supplier-invoice-rate-field').classList.remove('hidden');
+    document.getElementById('supplier-invoice-exchange-rate').value = String(p.exchangeRate || 1);
+  }
+  if(p.notes) document.getElementById('supplier-invoice-notes').value = p.notes;
+  const body = document.getElementById('supplier-invoice-items-body');
+  const lines = (p.items||[]).length ? p.items : [null];
+  body.innerHTML = lines.map(()=>invoiceItemRowWithStock(weAreVatRegistered())).join('');
+  [...body.querySelectorAll('tr')].forEach((tr, i)=>{
+    const it = lines[i]; if(!it) return;
+    tr.querySelector('.ii-desc').value = it.description || '';
+    tr.querySelector('.ii-qty').value = String(it.quantity || 1);
+    tr.querySelector('.ii-price').value = String(it.unit_price || 0);
+    const vat = tr.querySelector('.ii-vat'); if(vat && !vat.disabled) vat.checked = !!it.vat_applicable;
+  });
+}
+function attachPurchaseOrderHandlers(){
+  document.getElementById('add-po-btn')?.addEventListener('click', ()=>{ if(!state.suppliers.length){ toast('Add a supplier first.'); return; } openPoForm(); });
+  document.querySelectorAll('[data-view-po]').forEach(b=>b.addEventListener('click', ()=>openPoView(b.dataset.viewPo)));
+}
+
+
+/* ========================= RECEIPT / BILL SCANNING ========================= */
+// "Scan a bill": a photo or PDF of a supplier invoice or till slip is read by the scan-receipt edge function
+// (Claude, using the company's own ANTHROPIC_API_KEY secret) and the New Supplier Invoice form opens
+// pre-filled for a person to check. Nothing is saved until they press Save; the file is attached then.
+const SCAN_MAX_DIM = 1800;
+function readFileAsDataUrl(file){
+  return new Promise((resolve, reject)=>{ const r = new FileReader(); r.onload = ()=>resolve(r.result); r.onerror = ()=>reject(r.error || new Error('Could not read the file')); r.readAsDataURL(file); });
+}
+// Large phone photos are shrunk to a sensible size (and JPEG) before upload; PDFs are sent as they are.
+async function scanPayloadFor(file){
+  const type = (file.type || '').toLowerCase();
+  if(type === 'application/pdf'){
+    if(file.size > 5 * 1024 * 1024) throw new Error('That PDF is over 5 MB.');
+    const url = await readFileAsDataUrl(file);
+    return {media_type: 'application/pdf', data: String(url).split(',')[1]};
+  }
+  if(!/^image\//.test(type)) throw new Error('Choose a photo or a PDF.');
+  const url = await readFileAsDataUrl(file);
+  const img = await new Promise((resolve, reject)=>{ const i = new Image(); i.onload = ()=>resolve(i); i.onerror = ()=>reject(new Error('That image could not be opened.')); i.src = url; });
+  const scale = Math.min(1, SCAN_MAX_DIM / Math.max(img.naturalWidth || img.width, img.naturalHeight || img.height));
+  if(scale >= 1 && file.size < 3 * 1024 * 1024 && /^image\/(jpeg|png|webp)$/.test(type)) return {media_type: type, data: String(url).split(',')[1]};
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round((img.naturalWidth || img.width) * scale); canvas.height = Math.round((img.naturalHeight || img.height) * scale);
+  canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+  return {media_type: 'image/jpeg', data: canvas.toDataURL('image/jpeg', 0.85).split(',')[1]};
+}
+function normaliseName(s){ return String(s||'').toLowerCase().replace(/\b(pty|ltd|limited|cc|inc|\(pty\))\b/g, '').replace(/[^a-z0-9]+/g, ' ').trim(); }
+function matchSupplierByName(name){
+  const n = normaliseName(name);
+  if(!n) return null;
+  return (state.suppliers||[]).find(s=>normaliseName(s.name) === n)
+    || (state.suppliers||[]).find(s=>{ const m = normaliseName(s.name); return m && (m.includes(n) || n.includes(m)); }) || null;
+}
+// Turns the scan result into the pre-fill for openBillPrefilled().
+function billPrefillFromScan(r, supplierId, fileName){
+  const cur = r.currency && CURRENCIES.includes(r.currency) ? r.currency : 'ZAR';
+  const date = r.issue_date || todayIso();
+  const known = cur === 'ZAR' ? null : fxRateOn(cur, date);
+  const vatReg = weAreVatRegistered();
+  const items = (r.line_items||[]).map(l=>({description: l.description || 'Item', quantity: l.quantity || 1, unit_price: l.unit_price || 0, vat_applicable: vatReg && !!l.vat_applicable}));
+  if(!items.length && r.total) items.push({description: r.supplier_name ? `Purchase from ${r.supplier_name}` : 'Purchase', quantity: 1, unit_price: r.total, vat_applicable: vatReg && Number(r.vat_amount) > 0});
+  const linesTotal = round2(items.reduce((s,i)=>s + i.quantity * i.unit_price, 0));
+  const notes = [`Scanned from ${fileName || 'a photo'}`];
+  if(r.currency && !CURRENCIES.includes(r.currency)) notes.push(`currency on the document: ${r.currency}`);
+  if(r.notes) notes.push(r.notes);
+  return {
+    prefill: {supplierId, billNumber: r.invoice_number || undefined, issueDate: date, dueDate: r.due_date || undefined, category: r.category_hint || 'operating',
+      currency: cur, exchangeRate: known ? known.rate : 1, notes: notes.join(' — '), items},
+    linesTotal, total: r.total, mismatch: r.total != null && Math.abs(linesTotal - r.total) >= 0.02
+  };
+}
+async function scanBillFile(file){
+  if(!file) return;
+  if(!hasModule('supplier_invoices')){ toast('You need Supplier Invoices access to capture bills.'); return; }
+  let payload;
+  try{ payload = await scanPayloadFor(file); }catch(e){ toast(e.message); return; }
+  toast('Reading the bill…');
+  let data = null, failure = null;
+  try{
+    const res = await sb.functions.invoke('scan-receipt', {body: {company_id: state.company.id, file_name: file.name, ...payload}});
+    data = res.data;
+    if(res.error) failure = res.error.message || 'Could not read the bill';
+    else if(data && data.error) failure = data.error === 'scan_not_configured' ? 'Bill scanning is not switched on yet: add the ANTHROPIC_API_KEY secret in Supabase (see the setup note).' : data.error;
+  }catch(err){ failure = err.message || 'Could not read the bill'; }
+  if(failure){ toast(failure); return null; }
+  const r = data.result || {};
+  let supplier = matchSupplierByName(r.supplier_name);
+  if(!supplier && r.supplier_name){
+    if(confirm(`"${r.supplier_name}" is not one of your suppliers yet. Add it?`)){
+      const {data: created, error} = await sb.from('cc_suppliers').insert({company_id: state.company.id, name: r.supplier_name}).select().single();
+      if(error){ toast(error.message); return null; }
+      await logActivity('create', 'supplier', created && created.id, `${r.supplier_name} — added from a scanned bill`);
+      await refreshAll(); render();
+      supplier = (state.suppliers||[]).find(s=>s.id === (created && created.id)) || matchSupplierByName(r.supplier_name);
+    }
+  }
+  const p = billPrefillFromScan(r, supplier ? supplier.id : null, file.name);
+  p.prefill.scanFile = file;
+  openBillPrefilled(p.prefill);
+  const dup = supplier && r.invoice_number && (state.supplierInvoices||[]).some(b=>b.supplier_id === supplier.id && String(b.bill_number).trim().toLowerCase() === String(r.invoice_number).trim().toLowerCase());
+  toast((dup ? `Careful: bill ${r.invoice_number} from this supplier is already captured. ` : '') + (p.mismatch ? `The lines add up to ${fmt(p.linesTotal)} but the document total reads ${fmt(p.total)} — check before saving.` : 'Check the details, then Save. The scanned file will be attached.'));
+  return p;
+}
+
+
+/* ========================= EMP501 RECONCILIATION ========================= */
+// Twice a year (interim: Mar–Aug, annual: the full tax year) SARS wants the employer's EMP201 declarations,
+// the payments made and the employees' tax certificates to agree. This puts the three side by side, month by
+// month, flags every difference, and checks the employee details e@syFile needs.
+function emp501Period(label, kind){
+  const y = Number(label);
+  const b = taxYearBounds(y);
+  if(kind === 'interim') return {start: b.start, end: `${y-1}-08-31`, label: `Interim — 1 Mar ${y-1} to 31 Aug ${y-1}`, kind};
+  return {start: b.start, end: b.end, label: `Annual — ${b.label}`, kind: 'annual'};
+}
+function emp501Months(period){
+  const out = [];
+  let y = Number(period.start.slice(0,4)), m = Number(period.start.slice(5,7));
+  const endYm = period.end.slice(0,7);
+  for(let i=0;i<13;i++){
+    const ym = `${y}-${String(m).padStart(2,'0')}`;
+    if(ym > endYm) break;
+    out.push(ym);
+    m++; if(m > 12){ m = 1; y++; }
+  }
+  return out;
+}
+function emp501DefaultSelection(today){
+  const t = today || todayIso();
+  const mo = Number(t.slice(5,7));
+  const ty = currentTaxYearLabel(t);
+  // From March to May the annual reconciliation for the year just ended is due; otherwise the interim one.
+  return (mo >= 3 && mo <= 5) ? {year: ty - 1, kind: 'annual'} : {year: ty, kind: 'interim'};
+}
+function computeEmp501(label, kind){
+  const period = emp501Period(label, kind);
+  const sdlOn = payrollSdlApplicable();
+  const inPeriod = (state.payrollPayments||[]).filter(p=>p.pay_date && p.pay_date >= period.start && p.pay_date <= period.end);
+  const paidSlips = inPeriod.filter(p=>p.paid);
+  const unpaidSlips = inPeriod.filter(p=>!p.paid);
+  const n = v => Number(v)||0;
+  const slipTotals = list => ({
+    paye: round2(list.reduce((s,p)=>s + n(p.paye), 0)),
+    uif: round2(list.reduce((s,p)=>s + n(p.uif_employee) + n(p.uif_employer), 0)),
+    sdl: round2(list.reduce((s,p)=>s + payslipSdl(p, sdlOn), 0)),
+  });
+  const months = emp501Months(period).map(ym=>{
+    const calc = slipTotals(paidSlips.filter(p=>p.pay_date.slice(0,7) === ym));
+    calc.total = round2(calc.paye + calc.uif + calc.sdl);
+    const row = emp201Row(ym);
+    const declared = row && row.submitted ? {paye: round2(n(row.paye)), uif: round2(n(row.uif_employee) + n(row.uif_employer)), sdl: round2(n(row.sdl)), date: row.submitted_date || null} : null;
+    if(declared) declared.total = round2(declared.paye + declared.uif + declared.sdl);
+    const diff = declared ? round2(declared.total - calc.total) : -calc.total;
+    const status = (!declared && calc.total < 0.005) ? 'none' : !declared ? 'missing' : Math.abs(diff) >= 0.01 ? 'diff' : 'ok';
+    return {ym, calc, declared, diff, status};
+  });
+  const sumM = key => round2(months.reduce((s,m)=>s + (key(m)||0), 0));
+  const totals = {
+    calc: {paye: sumM(m=>m.calc.paye), uif: sumM(m=>m.calc.uif), sdl: sumM(m=>m.calc.sdl)},
+    declared: {paye: sumM(m=>m.declared && m.declared.paye), uif: sumM(m=>m.declared && m.declared.uif), sdl: sumM(m=>m.declared && m.declared.sdl)},
+  };
+  totals.calc.total = round2(totals.calc.paye + totals.calc.uif + totals.calc.sdl);
+  totals.declared.total = round2(totals.declared.paye + totals.declared.uif + totals.declared.sdl);
+  totals.paid = totals.declared.total;   // marking an EMP201 submitted records its payment from the bank
+  const employees = (state.employees||[]).map(emp=>{
+    const slips = inPeriod.filter(p=>p.employee_id === emp.id);
+    if(!slips.length) return null;
+    const t = slipTotals(slips);
+    const gross = round2(slips.reduce((s,p)=>s + n(p.gross), 0));
+    const checks = easyFileEmployeeChecks(emp);
+    return {emp, count: slips.length, gross, paye: t.paye, uif: t.uif, sdl: t.sdl, total: round2(t.paye + t.uif + t.sdl), unpaid: slips.filter(p=>!p.paid).length, missing: checks.filter(c=>!c.pass).map(c=>c.label)};
+  }).filter(Boolean);
+  const cert = {paye: round2(employees.reduce((s,e)=>s+e.paye,0)), uif: round2(employees.reduce((s,e)=>s+e.uif,0)), sdl: round2(employees.reduce((s,e)=>s+e.sdl,0))};
+  cert.total = round2(cert.paye + cert.uif + cert.sdl);
+  const companyChecks = easyFileCompanyChecks();
+  const missingMonths = months.filter(m=>m.status === 'missing');
+  const diffMonths = months.filter(m=>m.status === 'diff');
+  const checks = [
+    {label: 'Every month with payroll has an EMP201 submitted', ok: !missingMonths.length,
+      detail: missingMonths.length ? `Not yet submitted: ${missingMonths.map(m=>monthLabel(m.ym)).join(', ')}.` : 'All months declared.'},
+    {label: 'EMP201 declarations agree with the payslips', ok: !diffMonths.length,
+      detail: diffMonths.length ? diffMonths.map(m=>`${monthLabel(m.ym)}: declared ${fmt(m.declared.total)} vs payslips ${fmt(m.calc.total)}`).join('; ') + '. Submit a corrected EMP201 for those months.' : 'Every declared month matches.'},
+    {label: 'Tax certificates agree with the EMP201 totals', ok: Math.abs(cert.total - totals.declared.total) < 0.01,
+      detail: Math.abs(cert.total - totals.declared.total) < 0.01 ? `Both total ${fmt(cert.total)}.` : `Certificates ${fmt(cert.total)} vs EMP201s ${fmt(totals.declared.total)} (difference ${fmt(round2(cert.total - totals.declared.total))}).${unpaidSlips.length ? ` ${unpaidSlips.length} payslip${unpaidSlips.length>1?'s are':' is'} not marked paid yet.` : ''}`},
+    {label: 'Employee details complete for e@syFile', ok: employees.every(e=>!e.missing.length),
+      detail: employees.filter(e=>e.missing.length).map(e=>`${e.emp.name}: ${e.missing.join(', ')}`).join('; ') || 'All employees have the required details.'},
+    {label: 'Employer reference numbers and contact details', ok: companyChecks.every(c=>c.pass),
+      detail: companyChecks.filter(c=>!c.pass).map(c=>c.label).join(', ') || 'Complete.'},
+  ];
+  return {period, months, totals, employees, cert, unpaid: unpaidSlips.length, checks, ready: checks.every(c=>c.ok)};
+}
+function emp501CsvText(r){
+  const q = v => `"${String(v==null?'':v).replace(/"/g,'""')}"`;
+  const lines = [[q('Company Compass EMP501 reconciliation'), q(state.company.name), q(r.period.label)].join(',')];
+  lines.push(['Month','Payslips PAYE','Payslips UIF','Payslips SDL','Payslips total','EMP201 PAYE','EMP201 UIF','EMP201 SDL','EMP201 total','Difference','Status'].map(q).join(','));
+  r.months.forEach(m=>lines.push([m.ym, m.calc.paye, m.calc.uif, m.calc.sdl, m.calc.total, m.declared ? m.declared.paye : '', m.declared ? m.declared.uif : '', m.declared ? m.declared.sdl : '', m.declared ? m.declared.total : '', m.diff, m.status].map(q).join(',')));
+  lines.push('');
+  lines.push(['Employee','ID number','Tax number','Payslips','Gross remuneration','PAYE (4102)','UIF (4141)','SDL (4142)','Total (4149)','Missing details'].map(q).join(','));
+  r.employees.forEach(e=>lines.push([e.emp.name, e.emp.id_number||'', e.emp.tax_number||'', e.count, e.gross, e.paye, e.uif, e.sdl, e.total, e.missing.join('; ')].map(q).join(',')));
+  return lines.join('\r\n') + '\r\n';
+}
+function renderEmp501Panel(){
+  if(!state.emp501) state.emp501 = emp501DefaultSelection();
+  const sel = state.emp501;
+  const r = computeEmp501(sel.year, sel.kind);
+  const cur = currentTaxYearLabel();
+  const pill = st => st==='ok' ? '<span class="status-pill status-paid">Agrees</span>' : st==='diff' ? '<span class="status-pill status-overdue">Difference</span>' : st==='missing' ? '<span class="status-pill status-pending">Not submitted</span>' : '<span class="status-pill status-draft">No payroll</span>';
+  return `
+  <div class="panel" style="border-top:3px solid var(--c-payroll);" id="emp501-panel">
+    <h3 style="margin-top:0;">EMP501 Reconciliation</h3>
+    <p style="color:var(--muted);font-size:.85rem;margin:0 0 10px;">The interim reconciliation (March to August) is due by 31 October; the annual one (the full tax year) by 31 May. It checks that your monthly EMP201s, what you paid SARS and your employees' tax certificates all agree before you submit on e@syFile.</p>
+    <div class="row" style="margin-bottom:10px;">
+      <div class="field"><label>Tax year</label><select id="emp501-year">${[cur, cur-1, cur-2].map(y=>`<option value="${y}" ${Number(sel.year)===y?'selected':''}>${taxYearBounds(y).label}</option>`).join('')}</select></div>
+      <div class="field"><label>Reconciliation</label><select id="emp501-kind"><option value="interim" ${sel.kind==='interim'?'selected':''}>Interim (Mar–Aug)</option><option value="annual" ${sel.kind==='annual'?'selected':''}>Annual (full year)</option></select></div>
+    </div>
+    <div class="grid">
+      <div class="card" style="--accent-c:var(--c-payroll);"><h3>Per payslips</h3><div class="value">${fmt(r.totals.calc.total)}</div><div class="sub">PAYE ${fmt(r.totals.calc.paye)} · UIF ${fmt(r.totals.calc.uif)} · SDL ${fmt(r.totals.calc.sdl)}</div></div>
+      <div class="card" style="--accent-c:var(--c-payroll);"><h3>Declared on EMP201s</h3><div class="value">${fmt(r.totals.declared.total)}</div><div class="sub">Paid to SARS: ${fmt(r.totals.paid)}</div></div>
+      <div class="card" style="--accent-c:var(--c-payroll);"><h3>Difference</h3><div class="value ${Math.abs(r.totals.declared.total - r.totals.calc.total) >= 0.01 ? 'negative' : ''}">${fmt(round2(r.totals.declared.total - r.totals.calc.total))}</div><div class="sub">${r.ready ? 'Ready to submit' : 'Fix the items below first'}</div></div>
+    </div>
+    <table><thead><tr><th>Month</th><th style="text-align:right;">Payslips</th><th style="text-align:right;">EMP201 declared</th><th style="text-align:right;">Difference</th><th>Status</th></tr></thead><tbody>
+      ${r.months.map(m=>`<tr><td>${monthLabel(m.ym)}</td><td style="text-align:right;">${fmt(m.calc.total)}</td><td style="text-align:right;">${m.declared ? fmt(m.declared.total) : '—'}</td><td style="text-align:right;">${m.status==='none' ? '—' : fmt(m.diff)}</td><td>${pill(m.status)}</td></tr>`).join('')}
+    </tbody></table>
+    <h4 style="margin:14px 0 6px;">Employee tax certificates for this period</h4>
+    ${r.employees.length ? `<table><thead><tr><th>Employee</th><th style="text-align:right;">Gross</th><th style="text-align:right;">PAYE 4102</th><th style="text-align:right;">UIF 4141</th><th style="text-align:right;">SDL 4142</th><th style="text-align:right;">Total 4149</th><th>Details</th></tr></thead><tbody>
+      ${r.employees.map(e=>`<tr><td>${escHtml(e.emp.name)}${e.unpaid ? `<div style="font-size:.72rem;color:var(--warn);">${e.unpaid} payslip${e.unpaid>1?'s':''} not marked paid</div>` : ''}</td><td style="text-align:right;">${fmt(e.gross)}</td><td style="text-align:right;">${fmt(e.paye)}</td><td style="text-align:right;">${fmt(e.uif)}</td><td style="text-align:right;">${fmt(e.sdl)}</td><td style="text-align:right;">${fmt(e.total)}</td><td style="font-size:.78rem;">${e.missing.length ? `<span style="color:var(--danger);">Missing: ${escHtml(e.missing.join(', '))}</span>` : 'Complete'}</td></tr>`).join('')}
+      <tr style="font-weight:700;border-top:2px solid var(--border);"><td>Total</td><td></td><td style="text-align:right;">${fmt(r.cert.paye)}</td><td style="text-align:right;">${fmt(r.cert.uif)}</td><td style="text-align:right;">${fmt(r.cert.sdl)}</td><td style="text-align:right;">${fmt(r.cert.total)}</td><td></td></tr>
+    </tbody></table>` : `<div class="empty">No payslips in this period.</div>`}
+    <h4 style="margin:14px 0 6px;">Checklist</h4>
+    <table><tbody>${r.checks.map(c=>`<tr><td style="width:100px;">${c.ok ? '<span class="status-pill status-paid">OK</span>' : '<span class="status-pill status-overdue">Fix</span>'}</td><td>${c.label}</td><td style="font-size:.82rem;color:var(--muted);">${escHtml(c.detail)}</td></tr>`).join('')}</tbody></table>
+    <div class="modal-actions" style="justify-content:flex-start;"><button type="button" class="btn small secondary" id="emp501-csv">Download reconciliation (CSV)</button></div>
+    <p style="color:var(--muted);font-size:.76rem;margin-top:6px;">The certificate export for e@syFile is under the IRP5 / e@syFile section. Not tax advice — check the figures on e@syFile before you submit.</p>
+  </div>`;
+}
+function attachEmp501Handlers(){
+  const change = ()=>{ state.emp501 = {year: Number(document.getElementById('emp501-year').value), kind: document.getElementById('emp501-kind').value}; render(); document.getElementById('emp501-panel')?.scrollIntoView(); };
+  document.getElementById('emp501-year')?.addEventListener('change', change);
+  document.getElementById('emp501-kind')?.addEventListener('change', change);
+  document.getElementById('emp501-csv')?.addEventListener('click', ()=>{
+    const r = computeEmp501(state.emp501.year, state.emp501.kind);
+    downloadCSV(emp501CsvText(r), `EMP501_${r.period.kind}_${state.emp501.year}.csv`);
+  });
+}
+// Health check: EMP201s for completed months (last 12) should be submitted by the 7th and match payslips.
+function emp201HealthIssues(today){
+  const t = today || todayIso();
+  const months = monthlyPayrollActuals();
+  const out = [];
+  months.forEach(m=>{
+    const dueBy = (()=>{ let y = Number(m.ym.slice(0,4)), mo = Number(m.ym.slice(5,7)) + 1; if(mo > 12){ mo = 1; y++; } return `${y}-${String(mo).padStart(2,'0')}-07`; })();
+    if(dueBy > t || daysBetween(dueBy, t) > 365) return;
+    const calc = round2(m.paye + m.uifEmployee + m.uifEmployer + m.sdl);
+    const row = emp201Row(m.ym);
+    if(!row || !row.submitted){ if(calc > 0.005) out.push(`${monthLabel(m.ym)} not submitted`); return; }
+    const declared = round2((Number(row.paye)||0) + (Number(row.uif_employee)||0) + (Number(row.uif_employer)||0) + (Number(row.sdl)||0));
+    if(Math.abs(declared - calc) >= 0.01) out.push(`${monthLabel(m.ym)} declared ${fmt(declared)} vs payslips ${fmt(calc)}`);
+  });
+  return out;
+}
+
+
+/* ========================= PDF INVOICES & STATEMENTS ========================= */
+// jsPDF (+ autoTable) is loaded from cdnjs the first time a PDF is needed, so it costs nothing until then.
+// The same builders feed the "Download PDF" buttons and the attachments on emailed invoices / statements.
+const PDF_LIBS = [
+  'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js'
+];
+let pdfLibPromise = null;
+function loadScriptOnce(src){
+  return new Promise((resolve, reject)=>{
+    if([...document.scripts].some(s=>s.src === src)) return resolve();
+    const el = document.createElement('script');
+    el.src = src; el.async = true;
+    el.onload = ()=>resolve(); el.onerror = ()=>reject(new Error('Could not load ' + src));
+    document.head.appendChild(el);
+  });
+}
+async function ensurePdfLib(){
+  if(window.jspdf && window.jspdf.jsPDF && window.jspdf.jsPDF.API && window.jspdf.jsPDF.API.autoTable) return window.jspdf.jsPDF;
+  if(!pdfLibPromise) pdfLibPromise = (async ()=>{ await loadScriptOnce(PDF_LIBS[0]); await loadScriptOnce(PDF_LIBS[1]); })().catch(e=>{ pdfLibPromise = null; throw e; });
+  await pdfLibPromise;
+  if(!(window.jspdf && window.jspdf.jsPDF)) throw new Error('PDF library unavailable');
+  return window.jspdf.jsPDF;
+}
+// Plain-number money for PDFs (the built-in PDF fonts have no special space characters).
+function pdfMoney(v, cur){
+  const n = Number(v)||0;
+  const s = (n < 0 ? '-' : '') + Math.abs(n).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return (!cur || cur === 'ZAR') ? 'R ' + s : s + ' ' + cur;
+}
+function pdfSafeName(s){ return String(s||'document').replace(/[^\w.\-]+/g, '_').replace(/_+/g, '_').slice(0, 80); }
+function pdfHeader(doc, title, subtitleLines){
+  const co = state.company || {};
+  const W = doc.internal.pageSize.getWidth();
+  let y = 18;
+  if(co.logo_data_url && /^data:image\/(png|jpe?g)/i.test(co.logo_data_url)){
+    try{
+      const fmtImg = /png/i.test(co.logo_data_url.slice(0, 20)) ? 'PNG' : 'JPEG';
+      const props = doc.getImageProperties(co.logo_data_url);
+      const h = 18, w = Math.min(50, props.width * h / props.height);
+      doc.addImage(co.logo_data_url, fmtImg, W - 14 - w, 10, w, h);
+    }catch(e){ /* a logo the PDF engine cannot read is simply left out */ }
+  }
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.setTextColor(25);
+  doc.text(String(co.trading_as || co.name || ''), 14, y); y += 5;
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(90);
+  const lines = [];
+  if(co.trading_as && co.name && co.trading_as !== co.name) lines.push(co.name);
+  if(co.address) String(co.address).split(/\r?\n/).forEach(l=>lines.push(l));
+  if(weAreVatRegistered() && co.vat_number) lines.push('VAT number: ' + co.vat_number);
+  if(co.registration_number) lines.push('Registration: ' + co.registration_number);
+  const contact = [co.contact_email, co.contact_phone].filter(Boolean).join('  ·  ').replace(/·/g, '|');
+  if(contact) lines.push(contact);
+  lines.forEach(l=>{ doc.text(String(l), 14, y); y += 4; });
+  y = Math.max(y, 32) + 4;
+  doc.setDrawColor(220); doc.line(14, y, W - 14, y); y += 9;
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(25);
+  doc.text(title, 14, y); y += 6;
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); doc.setTextColor(80);
+  (subtitleLines||[]).forEach(l=>{ doc.text(String(l), 14, y); y += 4.6; });
+  return y + 2;
+}
+function pdfFooter(doc){
+  const pages = doc.getNumberOfPages();
+  const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight();
+  for(let i=1;i<=pages;i++){
+    doc.setPage(i); doc.setFontSize(8); doc.setTextColor(150);
+    doc.text(`${(state.company && state.company.name) || ''}  |  Page ${i} of ${pages}`, W/2, H - 8, {align:'center'});
+  }
+}
+function pdfBillTo(doc, y, label, client){
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(9.5); doc.setTextColor(25);
+  doc.text(label, 14, y); y += 4.6;
+  doc.setFont('helvetica', 'normal'); doc.setTextColor(60);
+  const lines = [client ? client.name : ''].concat(client && client.address ? String(client.address).split(/\r?\n/) : []).concat(client && client.email ? [client.email] : []);
+  lines.filter(Boolean).forEach(l=>{ doc.text(String(l), 14, y); y += 4.4; });
+  return y + 3;
+}
+async function buildInvoicePdf(inv, items, client){
+  const JsPDF = await ensurePdfLib();
+  const doc = new JsPDF({unit:'mm', format:'a4'});
+  const cur = inv.currency || 'ZAR';
+  const vatReg = weAreVatRegistered();
+  const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
+  const vatTotal = items.reduce((s,it)=>s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
+  const total = items.reduce((s,it)=>s + it.quantity*it.unit_price, 0);
+  const isForeign = isForeignDoc(inv);
+  const bal = invoiceBalance(inv);
+  let y = pdfHeader(doc, vatReg ? 'TAX INVOICE' : 'INVOICE', [
+    `Invoice number: ${inv.invoice_number}`, `Date: ${inv.issue_date}` + (inv.due_date ? `     Due: ${inv.due_date}` : '')
+  ]);
+  y = pdfBillTo(doc, y, 'Bill to', client);
+  doc.autoTable({
+    startY: y, margin:{left:14, right:14}, theme:'striped', headStyles:{fillColor:[124,92,255]}, styles:{fontSize:9},
+    head:[['Description', 'Qty', 'Unit price', vatReg ? 'VAT' : '', 'Amount'].filter((h,i)=>vatReg || i !== 3)],
+    body: items.map(it=>{
+      const row = [String(it.description||''), String(it.quantity), pdfMoney(it.unit_price, cur)];
+      if(vatReg) row.push(it.vat_applicable ? '15%' : '0%');
+      row.push(pdfMoney(it.quantity*it.unit_price, cur));
+      return row;
+    }),
+    columnStyles: vatReg ? {1:{halign:'right'}, 2:{halign:'right'}, 3:{halign:'center'}, 4:{halign:'right'}} : {1:{halign:'right'}, 2:{halign:'right'}, 3:{halign:'right'}},
+    didParseCell: d=>{ if(d.section === 'head' && d.column.index > 0) d.cell.styles.halign = (vatReg && d.column.index === 3) ? 'center' : 'right'; }
+  });
+  y = doc.lastAutoTable.finalY + 6;
+  const W = doc.internal.pageSize.getWidth();
+  const rows = [];
+  if(vatReg){ rows.push(['Subtotal (excl. VAT)', pdfMoney(subtotal, cur)]); rows.push(['VAT (15%)', pdfMoney(vatTotal, cur)]); }
+  rows.push(['Total', pdfMoney(total, cur)]);
+  if(isForeign) rows.push([`Booked at ${inv.exchange_rate} = `, pdfMoney(round2(total * fxDocRate(inv)), 'ZAR')]);
+  const received = round2(bal.paid + (bal.writtenOff||0) + (bal.allocated||0));
+  if(received > 0.005){ rows.push(['Paid / credited (R)', pdfMoney(received, 'ZAR')]); rows.push(['Balance due (R)', pdfMoney(bal.balance, 'ZAR')]); }
+  doc.setFontSize(10);
+  rows.forEach(([l, v], i)=>{
+    const bold = l === 'Total' || /Balance due/.test(l);
+    doc.setFont('helvetica', bold ? 'bold' : 'normal'); doc.setTextColor(bold ? 25 : 70);
+    doc.text(l, W - 70, y); doc.text(v, W - 14, y, {align:'right'}); y += 5.5;
+  });
+  if(inv.notes){
+    y += 4; doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(80);
+    doc.text(doc.splitTextToSize(String(inv.notes), W - 28), 14, y);
+  }
+  pdfFooter(doc);
+  const filename = pdfSafeName(`Invoice_${inv.invoice_number}`) + '.pdf';
+  return {doc, filename};
+}
+async function buildStatementPdf(stmt){
+  const JsPDF = await ensurePdfLib();
+  const doc = new JsPDF({unit:'mm', format:'a4'});
+  addStatementToPdf(doc, stmt, true);
+  pdfFooter(doc);
+  const filename = pdfSafeName(`Statement_${stmt.client ? stmt.client.name : ''}_${stmt.to || todayIso()}`) + '.pdf';
+  return {doc, filename};
+}
+function addStatementToPdf(doc, stmt, first){
+  if(!first) doc.addPage();
+  let y = pdfHeader(doc, 'STATEMENT OF ACCOUNT', [`Period: ${stmtPeriodLabel(stmt.from, stmt.to)}`, `Date: ${todayIso()}`]);
+  y = pdfBillTo(doc, y, 'Customer', stmt.client);
+  const body = [];
+  if(stmt.from) body.push([stmt.from, 'Balance brought forward', '', pdfMoney(stmt.opening)]);
+  stmt.lines.forEach(l=>body.push([l.date, l.label, pdfMoney(l.amount), pdfMoney(l.balance)]));
+  if(!body.length) body.push(['', 'No activity in this period', '', '']);
+  doc.autoTable({startY:y, margin:{left:14, right:14}, theme:'striped', headStyles:{fillColor:[124,92,255]}, styles:{fontSize:9},
+    head:[['Date', 'Description', 'Amount', 'Balance']], body, columnStyles:{2:{halign:'right'}, 3:{halign:'right'}},
+    didParseCell: d=>{ if(d.section === 'head' && d.column.index > 1) d.cell.styles.halign = 'right'; }});
+  y = doc.lastAutoTable.finalY + 7;
+  const W = doc.internal.pageSize.getWidth();
+  doc.setFontSize(9.5); doc.setFont('helvetica', 'normal'); doc.setTextColor(70);
+  doc.text(`Invoiced in period: ${pdfMoney(stmt.invoiced)}    Received / credited: ${pdfMoney(stmt.received)}`, W - 14, y, {align:'right'}); y += 6;
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(12); doc.setTextColor(25);
+  doc.text(`Balance due: ${pdfMoney(stmt.closing)}`, W - 14, y, {align:'right'});
+}
+async function buildStatementPackPdf(stmts){
+  const JsPDF = await ensurePdfLib();
+  const doc = new JsPDF({unit:'mm', format:'a4'});
+  stmts.forEach((s, i)=>addStatementToPdf(doc, s, i === 0));
+  pdfFooter(doc);
+  return {doc, filename: pdfSafeName(`Statements_${stmts.length}_${todayIso()}`) + '.pdf'};
+}
+function pdfBase64(doc){ return doc.output('datauristring').split(',')[1]; }
+function downloadPdf(built){
+  const blob = built.doc.output('blob');
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = built.filename; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 4000);
+}
+// Builds a PDF attachment for an email, or returns null (and the email goes without it) if the PDF
+// library could not load — the email itself is never blocked by the attachment.
+async function pdfAttachment(builder){
+  try{
+    const built = await builder();
+    return {filename: built.filename, content: pdfBase64(built.doc)};
+  }catch(e){ return null; }
+}
+
+
+/* ========================= AUTOMATIC OVERDUE REMINDERS ========================= */
+// The send-reminders edge function does the sending (daily at 07:00 via pg_cron, or on demand). These
+// helpers mirror its rules so the app can show what is due: each invoice gets the highest reminder stage
+// it has reached (e.g. 7, 14, 30 days overdue) once; clients can be opted out; paid invoices are skipped.
+function reminderStagesOf(company){
+  const raw = Array.isArray(company && company.reminder_days) && company.reminder_days.length ? company.reminder_days : [7,14,30];
+  return raw.map(Number).filter(n=>n>0).sort((a,b)=>a-b);
+}
+function companyReplyTo(){ return (state.company && (state.company.contact_email || state.company.email)) || null; }
+function invoiceReminderLog(invId){ return (state.reminderLog||[]).filter(l=>l.invoice_id===invId).sort((a,b)=>String(b.created_at).localeCompare(String(a.created_at))); }
+function reminderDueStage(inv, today){
+  if(!inv || inv.approval_status !== 'approved' || !inv.due_date || inv.due_date >= today) return null;
+  if(inv.status === 'draft' || inv.status === 'paid') return null;
+  const client = state.clients.find(c=>c.id===inv.client_id);
+  if(!client || !client.email || client.no_reminders) return null;
+  if(invoiceBalance(inv).balance <= 0.005) return null;
+  const late = daysBetween(inv.due_date, today);
+  const due = reminderStagesOf(state.company).filter(s=>s <= late);
+  if(!due.length) return null;
+  const stage = due[due.length-1];
+  const already = invoiceReminderLog(inv.id).some(l=>l.trigger==='auto' && Number(l.stage) >= stage && l.status !== 'failed');
+  return already ? null : stage;
+}
+function remindersDueNow(){
+  const today = todayIso();
+  return (state.invoices||[]).map(inv=>({inv, stage: reminderDueStage(inv, today)})).filter(x=>x.stage)
+    .map(x=>({...x, client: state.clients.find(c=>c.id===x.inv.client_id), late: daysBetween(x.inv.due_date, today), balance: invoiceBalance(x.inv).balance}));
+}
+function reminderStageLabel(stage){
+  if(!stage) return 'Sent by hand';
+  const st = reminderStagesOf(state.company);
+  const i = st.indexOf(Number(stage));
+  return i === 0 ? `Friendly (${stage} days)` : (st.length > 1 && i === st.length-1) ? `Final (${stage} days)` : `Second (${stage} days)`;
+}
+async function sendRemindersNow(invoiceId){
+  let failure = null, data = null;
+  try{
+    const res = await sb.functions.invoke('send-reminders', {body: invoiceId ? {company_id: state.company.id, invoice_id: invoiceId} : {company_id: state.company.id}});
+    data = res.data;
+    if(res.error) failure = res.error.message || 'Could not send';
+    else if(data && data.error) failure = data.error === 'email_not_configured' ? 'Email sending is not set up yet (the Resend API key has not been added to Supabase).' : data.error;
+  }catch(err){ failure = err.message || 'Could not send'; }
+  if(failure){ toast(failure); return null; }
+  const {data: log} = await sb.from('cc_reminder_log').select('*').eq('company_id', state.company.id).order('created_at', {ascending:false}).limit(500);
+  state.reminderLog = log || [];
+  return data || {sent:0, failed:0, results:[]};
+}
+function renderReminderSettingsPanel(){
+  const c = state.company;
+  const admin = isAdmin();
+  const due = remindersDueNow();
+  const recent = (state.reminderLog||[]).slice(0, 15);
+  return `
+  <div class="panel" id="reminder-settings-panel">
+    <h3 style="margin-top:0;">Payment reminders</h3>
+    <p style="color:var(--muted);font-size:.85rem;">When this is on, clients are emailed automatically every morning at 07:00 when an invoice reaches each stage overdue: a friendly note first, then a firmer one, then a final reminder. Each stage is sent once, paid invoices are skipped, and you can switch a client off on the Clients page. Replies go to your contact email${c.contact_email ? ` (${escHtml(c.contact_email)})` : ' — add one above so clients can reply'}.</p>
+    <form id="reminder-settings-form" style="display:flex;flex-direction:column;gap:10px;max-width:480px;">
+      <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="reminders-enabled" style="width:auto;" ${c.reminders_enabled?'checked':''} ${admin?'':'disabled'}> Send overdue reminders automatically</label>
+      <div class="field"><label>Days overdue for each reminder</label><input type="text" id="reminder-days" value="${reminderStagesOf(c).join(', ')}" ${admin?'':'disabled'} placeholder="7, 14, 30"></div>
+      <div class="field"><label>Extra line at the end of each reminder (optional)</label><textarea id="reminder-note" rows="2" ${admin?'':'disabled'} placeholder="e.g. Our banking details are on the invoice. Reference: your invoice number.">${escHtml(c.reminder_note||'')}</textarea></div>
+      ${admin ? `<div><button type="submit" class="btn small">Save reminder settings</button></div>` : '<p style="font-size:.78rem;color:var(--muted);">Only management can change these settings.</p>'}
+    </form>
+    <h4 style="margin:16px 0 6px;">Due now (${due.length})</h4>
+    ${due.length ? `<table><thead><tr><th>Invoice</th><th>Client</th><th>Overdue</th><th>Reminder</th><th style="text-align:right;">Owing</th></tr></thead><tbody>
+      ${due.map(d=>`<tr><td>${escHtml(d.inv.invoice_number)}</td><td>${escHtml(d.client ? d.client.name : '—')}</td><td>${d.late} days</td><td>${reminderStageLabel(d.stage)}</td><td style="text-align:right;">${fmt(d.balance)}</td></tr>`).join('')}
+    </tbody></table>
+    ${hasModule('invoices') ? `<button type="button" class="btn small" id="send-due-reminders-btn" style="margin-top:8px;">Send these ${due.length} now</button>` : ''}` : `<div class="empty">Nothing due today.</div>`}
+    <h4 style="margin:16px 0 6px;">Recently sent</h4>
+    ${recent.length ? `<table><thead><tr><th>When</th><th>Invoice</th><th>To</th><th>Reminder</th><th>Status</th></tr></thead><tbody>
+      ${recent.map(l=>{ const inv = state.invoices.find(i=>i.id===l.invoice_id); return `<tr><td>${escHtml(String(l.sent_at||l.created_at).slice(0,16).replace('T',' '))}</td><td>${escHtml(inv ? inv.invoice_number : '—')}</td><td style="font-size:.82rem;">${escHtml(l.sent_to||'')}</td><td>${reminderStageLabel(l.stage)}</td><td>${l.status==='sent' ? '<span class="status-pill status-paid">Sent</span>' : l.status==='failed' ? `<span class="status-pill status-overdue" title="${escHtml(l.error||'')}">Failed</span>` : '<span class="status-pill status-draft">Sending</span>'}</td></tr>`; }).join('')}
+    </tbody></table>` : `<div class="empty">No reminders sent yet.</div>`}
+  </div>`;
+}
+function attachReminderSettingsHandlers(){
+  document.getElementById('reminder-settings-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    if(!isAdmin()) return;
+    const days = [...new Set(document.getElementById('reminder-days').value.split(/[,\s;]+/).map(Number).filter(n=>Number.isInteger(n) && n > 0 && n <= 365))].sort((a,b)=>a-b);
+    if(!days.length){ toast('Enter at least one number of days, e.g. 7, 14, 30.'); return; }
+    const patch = {reminders_enabled: document.getElementById('reminders-enabled').checked, reminder_days: days, reminder_note: document.getElementById('reminder-note').value.trim() || null};
+    const {error} = await sb.from('cc_companies').update(patch).eq('id', state.company.id);
+    if(error){ toast(error.message); return; }
+    Object.assign(state.company, patch);
+    await logActivity('update', 'company', state.company.id, `Payment reminders ${patch.reminders_enabled ? 'on' : 'off'} (${days.join(', ')} days)`);
+    render(); toast('Reminder settings saved.');
+  });
+  document.getElementById('send-due-reminders-btn')?.addEventListener('click', async (e)=>{
+    if(!confirm('Email the reminders that are due now?')) return;
+    e.target.disabled = true; e.target.textContent = 'Sending…';
+    const r = await sendRemindersNow(null);
+    render();
+    if(r) toast(`${r.sent||0} reminder${r.sent===1?'':'s'} sent${r.failed ? `, ${r.failed} failed` : ''}.`);
+  });
+}
+function invoiceReminderPanelHtml(inv, balance){
+  const log = invoiceReminderLog(inv.id);
+  const client = state.clients.find(c=>c.id===inv.client_id);
+  const canSend = hasModule('invoices') && inv.approval_status === 'approved' && balance > 0.005 && client && client.email;
+  if(!log.length && !canSend) return '';
+  return `<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;">
+    <h4 style="margin:0 0 6px;">Reminders</h4>
+    ${log.length ? `<table><tbody>${log.map(l=>`<tr><td>${escHtml(String(l.sent_at||l.created_at).slice(0,10))}</td><td>${reminderStageLabel(l.stage)}</td><td style="font-size:.82rem;">${escHtml(l.sent_to||'')}</td><td>${l.status==='sent'?'Sent':l.status==='failed'?'Failed':'Sending'}</td></tr>`).join('')}</tbody></table>` : '<p style="font-size:.82rem;color:var(--muted);margin:0 0 6px;">No reminders sent yet.</p>'}
+    ${client && client.no_reminders ? '<p style="font-size:.78rem;color:var(--muted);">Automatic reminders are switched off for this client.</p>' : ''}
+    ${canSend ? `<button type="button" class="btn secondary small" id="send-reminder-now-btn">Email a reminder now</button>` : ''}
+  </div>`;
+}
+function attachInvoiceReminderHandlers(inv, reopen){
+  document.getElementById('send-reminder-now-btn')?.addEventListener('click', async (e)=>{
+    e.target.disabled = true; e.target.textContent = 'Sending…';
+    const r = await sendRemindersNow(inv.id);
+    await refreshAll(); render(); reopen();
+    if(r) toast(r.sent ? 'Reminder emailed.' : 'Reminder not sent' + (r.results && r.results[0] && (r.results[0].reason || r.results[0].error) ? ': ' + (r.results[0].reason || r.results[0].error) : '.'));
+  });
+}
+
+
+/* ========================= ONLINE PAYMENTS (YOCO PAY-NOW LINKS) ========================= */
+// A "Pay now" link opens a Yoco card-payment page for the invoice's open Rand balance. When the client
+// pays, Yoco notifies the yoco-webhook edge function, which records the payment on the invoice by itself.
+// The company's Yoco secret key is saved through cc_set_payment_settings() and can never be read back by
+// the app — only its first and last few characters are shown (cc_payment_status()).
+async function loadPaymentStatus(){
+  const cid = state.company && state.company.id;
+  state.paymentStatus = {enabled:false, has_key:false, has_webhook:false};
+  if(!cid || typeof sb.rpc !== 'function') return state.paymentStatus;
+  try{
+    const {data, error} = await sb.rpc('cc_payment_status', {p_company: cid});
+    if(!error && data) state.paymentStatus = data;
+  }catch(e){ /* table not there yet: online payments simply stay off */ }
+  return state.paymentStatus;
+}
+function onlinePaymentsOn(){ const s = state.paymentStatus; return !!(s && s.enabled && s.has_key); }
+function paymentLinksFor(invId){ return (state.paymentLinks||[]).filter(l=>l.invoice_id===invId); }
+// The open link only counts while it still asks for the current balance (a part payment or credit since
+// it was made means a fresh link is needed, which cancels the old one).
+function openPaymentLink(invId, balance){
+  return paymentLinksFor(invId).find(l=>l.status==='open' && l.url && (balance == null || Math.abs(Number(l.amount) - balance) < 0.01)) || null;
+}
+function payNowEligible(inv, balance){
+  return !!inv && inv.approval_status === 'approved' && (!inv.currency || inv.currency === 'ZAR') && balance >= 2 && onlinePaymentsOn();
+}
+async function createPaymentLink(inv){
+  let failure = null, data = null;
+  try{
+    const res = await sb.functions.invoke('payment-link', {body:{company_id: state.company.id, action:'create', invoice_id: inv.id}});
+    data = res.data;
+    if(res.error) failure = res.error.message || 'Could not create the link';
+    else if(data && data.error) failure = data.error === 'payments_not_configured' ? 'Online payments are not set up yet (Settings → Online payments).' : data.error;
+  }catch(err){ failure = err.message || 'Could not create the link'; }
+  if(failure){ toast(failure); return null; }
+  const link = data && data.link;
+  if(link){
+    state.paymentLinks = [link, ...(state.paymentLinks||[]).filter(l=>l.id!==link.id).map(l=>(l.invoice_id===inv.id && l.status==='open') ? {...l, status:'cancelled'} : l)];
+    if(!data.reused) await logActivity('create', 'payment_link', link.id, `Pay-now link for ${inv.invoice_number} (${fmt(link.amount)})`);
+  }
+  return link || null;
+}
+async function copyText(text){
+  try{ await navigator.clipboard.writeText(text); return true; }catch(e){ return false; }
+}
+function payNowEmailButton(link){
+  if(!link || !link.url) return '';
+  return `<div style="text-align:center;margin:18px 0 6px;"><a href="${escHtml(link.url)}" style="display:inline-block;background:#0a7d4f;color:#fff;text-decoration:none;font-weight:700;padding:12px 26px;border-radius:6px;font-size:15px;">Pay ${escHtml(fmt(link.amount))} now by card</a><div style="font-size:12px;color:#777;margin-top:6px;">Secure card payment through Yoco.</div></div>`;
+}
+function invoicePayNowPanelHtml(inv, balance){
+  const links = paymentLinksFor(inv.id);
+  const paid = links.filter(l=>l.status==='paid');
+  const eligible = hasModule('invoices') && payNowEligible(inv, balance);
+  if(!eligible && !paid.length) return '';
+  const open = openPaymentLink(inv.id, balance);
+  return `<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;" id="paynow-panel">
+    <h4 style="margin:0 0 6px;">Pay online</h4>
+    ${paid.map(l=>`<div style="font-size:.82rem;color:var(--accent2);">Paid online by card: ${fmt(l.amount)} on ${escHtml(String(l.paid_at||'').slice(0,10))}${l.payment_ref ? ` (Yoco ${escHtml(l.payment_ref)})` : ''}</div>`).join('')}
+    ${eligible ? (open ? `
+      <p style="font-size:.82rem;color:var(--muted);margin:4px 0 6px;">Send this link to the client. When they pay ${fmt(open.amount)} by card, the payment is recorded here automatically.</p>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+        <input type="text" id="paynow-url" value="${escHtml(open.url)}" readonly style="flex:1;min-width:220px;font-size:.82rem;">
+        <button type="button" class="btn secondary small" id="paynow-copy">Copy link</button>
+        <a class="btn secondary small" href="${escHtml(open.url)}" target="_blank" rel="noopener">Open</a>
+      </div>` : `
+      <p style="font-size:.82rem;color:var(--muted);margin:4px 0 6px;">Create a card-payment link for the ${fmt(balance)} still owing. It is added to the invoice email and to payment reminders.</p>
+      <button type="button" class="btn secondary small" id="paynow-create">Create Pay-now link</button>`) : ''}
+  </div>`;
+}
+function attachPayNowHandlers(inv, reopen){
+  document.getElementById('paynow-create')?.addEventListener('click', async (e)=>{
+    e.target.disabled = true; e.target.textContent = 'Creating…';
+    const link = await createPaymentLink(inv);
+    if(!link){ e.target.disabled = false; e.target.textContent = 'Create Pay-now link'; return; }
+    reopen(); toast('Pay-now link ready.');
+  });
+  document.getElementById('paynow-copy')?.addEventListener('click', async ()=>{
+    const input = document.getElementById('paynow-url');
+    const okCopy = await copyText(input.value);
+    if(!okCopy){ input.select && input.select(); }
+    toast(okCopy ? 'Link copied.' : 'Select the link and copy it.');
+  });
+}
+function renderPaymentSettingsPanel(){
+  const s = state.paymentStatus || {};
+  const admin = isAdmin();
+  const statusLine = s.has_key
+    ? `<p style="font-size:.88rem;margin:6px 0;"><strong>${s.enabled ? 'On' : 'Saved but switched off'}</strong>${s.mode ? ` · ${s.mode === 'live' ? 'Live' : 'Test'} mode` : ''} · key ${escHtml(s.key_hint||'')} · payment notifications ${s.has_webhook ? '<span class="status-pill status-paid">connected</span>' : '<span class="status-pill status-overdue">not connected</span>'}</p>
+       ${s.has_webhook ? '' : `<p style="font-size:.8rem;color:var(--danger);margin:4px 0;">Without payment notifications, card payments will not be recorded automatically. Save again to retry, or paste the webhook secret from the Yoco portal below.</p>`}`
+    : `<p style="font-size:.88rem;color:var(--muted);margin:6px 0;">Not set up.</p>`;
+  return `
+  <div class="panel" id="payment-settings-panel">
+    <h3 style="margin-top:0;">Online payments (Yoco)</h3>
+    <p style="color:var(--muted);font-size:.85rem;">Let clients pay Rand invoices by card from a "Pay now" link in the invoice email and reminders. Payments are recorded on the invoice automatically. You need a Yoco account: copy your <em>secret key</em> from the Yoco business portal (the online payments / API keys section). Yoco deducts its fee before paying out, so your bank deposit will be a little less than the invoice — a bank rule for the fee keeps that tidy.</p>
+    ${statusLine}
+    ${admin ? `<form id="payment-settings-form" style="display:flex;flex-direction:column;gap:10px;max-width:480px;" autocomplete="off">
+      <div class="field"><label>Yoco secret key${s.has_key ? ' (leave blank to keep the saved one)' : ''}</label><input type="password" id="yoco-secret-key" autocomplete="new-password" placeholder="sk_live_… or sk_test_…" spellcheck="false"></div>
+      <details style="font-size:.85rem;"><summary>Advanced: webhook secret</summary>
+        <div class="field" style="margin-top:6px;"><label>Webhook secret (only if Yoco shows you one for a webhook you made yourself)</label><input type="password" id="yoco-webhook-secret" autocomplete="new-password" placeholder="whsec_…" spellcheck="false"></div>
+      </details>
+      <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="yoco-enabled" style="width:auto;" ${(s.enabled || !s.has_key)?'checked':''}> Offer Pay-now links on invoices</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;"><button type="submit" class="btn small" id="payment-settings-save">Save and connect</button>
+      ${s.has_key ? `<button type="button" class="btn small danger" id="payment-settings-clear">Disconnect</button>` : ''}</div>
+    </form>` : '<p style="font-size:.78rem;color:var(--muted);">Only management can change these settings.</p>'}
+  </div>`;
+}
+function attachPaymentSettingsHandlers(){
+  document.getElementById('payment-settings-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    if(!isAdmin()) return;
+    const keyEl = document.getElementById('yoco-secret-key');
+    const hookEl = document.getElementById('yoco-webhook-secret');
+    const key = (keyEl.value||'').trim(), hook = (hookEl && hookEl.value || '').trim();
+    keyEl.value = ''; if(hookEl) hookEl.value = '';
+    const before = state.paymentStatus || {};
+    if(!key && !before.has_key){ toast('Paste your Yoco secret key first.'); return; }
+    if(key && !/^sk_(live|test)_/.test(key)){ toast('That does not look like a Yoco secret key (it starts with sk_live_ or sk_test_). Use the secret key, not the public key.'); return; }
+    if(hook && !/^whsec_/.test(hook)){ toast('A webhook secret starts with whsec_.'); return; }
+    const btn = document.getElementById('payment-settings-save');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    const {error} = await sb.rpc('cc_set_payment_settings', {p_company: state.company.id, p_secret_key: key || null, p_webhook_secret: hook || null, p_enabled: !!document.getElementById('yoco-enabled').checked});
+    if(error){ btn.disabled = false; btn.textContent = 'Save and connect'; toast(error.message); return; }
+    let note = '';
+    if(key || !before.has_webhook){
+      try{
+        const res = await sb.functions.invoke('payment-link', {body:{company_id: state.company.id, action:'connect'}});
+        const d = res.data || {};
+        if(res.error || d.error) note = ' Could not connect payment notifications: ' + ((res.error && res.error.message) || d.error);
+        else if(!d.has_secret) note = ' Yoco did not return a webhook secret — paste it under Advanced so payments are recorded automatically.';
+      }catch(err){ note = ' Could not connect payment notifications: ' + err.message; }
+    }
+    await logActivity('update', 'company', state.company.id, 'Online payment (Yoco) settings updated');
+    await loadPaymentStatus();
+    render(); toast('Online payment settings saved.' + note);
+  });
+  document.getElementById('payment-settings-clear')?.addEventListener('click', async ()=>{
+    if(!confirm('Disconnect Yoco? Existing Pay-now links will stop being recorded automatically.')) return;
+    const {error} = await sb.rpc('cc_clear_payment_settings', {p_company: state.company.id});
+    if(error){ toast(error.message); return; }
+    await logActivity('update', 'company', state.company.id, 'Online payments (Yoco) disconnected');
+    await loadPaymentStatus();
+    render(); toast('Yoco disconnected.');
+  });
+}
+
+/* ========================= BANK RULES ========================= */
+// "Anything containing FNB MONTHLY FEE is a Bank charges expense": a rule matches unmatched bank lines by
+// text (and optionally direction / amount range) and either creates the revenue/expense entry and matches
+// it, or ignores the line (e.g. transfers between your own accounts). Rules marked "auto" run straight
+// after a CSV import; the rest are offered as a one-click button on each matching line.
+function bankRuleKeywords(rule){ return String(rule.match_text||'').split('|').map(k=>k.trim().toLowerCase()).filter(Boolean); }
+function bankRuleMatches(rule, tx){
+  if(!rule || rule.is_active === false) return false;
+  const amt = Number(tx.amount);
+  if(rule.direction === 'in' && amt < 0) return false;
+  if(rule.direction === 'out' && amt >= 0) return false;
+  const abs = Math.abs(amt);
+  if(rule.amount_min != null && rule.amount_min !== '' && abs < Number(rule.amount_min) - 0.005) return false;
+  if(rule.amount_max != null && rule.amount_max !== '' && abs > Number(rule.amount_max) + 0.005) return false;
+  const desc = String(tx.description||'').toLowerCase();
+  const keys = bankRuleKeywords(rule);
+  return keys.length > 0 && keys.some(k=>desc.includes(k));
+}
+function sortedBankRules(){
+  return (state.bankRules||[]).slice().sort((a,b)=>(Number(a.sort_order)||0) - (Number(b.sort_order)||0) || String(a.created_at||'').localeCompare(String(b.created_at||'')));
+}
+function bankRuleFor(tx){ return sortedBankRules().find(r=>bankRuleMatches(r, tx)) || null; }
+function bankRuleActionLabel(rule, tx){
+  if(rule.action === 'ignore') return 'Ignore (own transfer / not business)';
+  const type = Number(tx ? tx.amount : (rule.direction==='in' ? 1 : -1)) >= 0 ? 'revenue' : 'expense';
+  return `${type==='revenue'?'Revenue':'Expense'}${type==='expense' ? (rule.expense_category==='cost_of_sales' ? ' · Cost of Sales' : ' · Operating') : ''}${rule.vat_applicable ? ' · incl. VAT' : ''}${rule.description ? ' · "' + rule.description + '"' : ''}`;
+}
+function canUseBankRules(){ return isAdmin() || hasModule('revenue') || hasModule('expenses'); }
+// Suggests a keyword from a bank description: drops dates, long numbers and card/reference digits.
+function bankRuleKeywordGuess(desc){
+  const words = String(desc||'').replace(/\d{2,}[\/\-.]\d{2,}([\/\-.]\d{2,4})?/g, ' ').replace(/[#*]?\d{4,}/g, ' ').replace(/\s+/g, ' ').trim().split(' ');
+  return words.filter(w=>w && !/^\d+$/.test(w)).slice(0, 3).join(' ');
+}
+// Applies one rule to one line without re-rendering; returns 'entry' | 'ignored' | null.
+async function applyBankRuleToTx(rule, tx){
+  if(!rule || !tx || tx.status !== 'unmatched') return null;
+  if(isPeriodLocked(tx.tx_date)) return null;
+  if(rule.action === 'ignore'){
+    const {error} = await sb.from('cc_bank_transactions').update({status:'ignored', matched_entry_type:null, matched_entry_id:null}).eq('id', tx.id);
+    return error ? null : 'ignored';
+  }
+  const type = Number(tx.amount) >= 0 ? 'revenue' : 'expense';
+  if(!hasModule(type === 'revenue' ? 'revenue' : 'expenses')) return null;
+  const tags = ['bank-import', 'bank-rule'].concat((rule.tags||[]).filter(Boolean));
+  const payload = {
+    company_id: state.company.id, type, description: rule.description || tx.description || (type==='revenue'?'Bank deposit':'Bank payment'),
+    amount: Math.abs(Number(tx.amount)), entry_date: tx.tx_date, tags, vat_applicable: !!rule.vat_applicable,
+    is_recurring: false, recurrence_frequency: null, created_by: state.user.id
+  };
+  if(type === 'expense') payload.expense_category = rule.expense_category === 'cost_of_sales' ? 'cost_of_sales' : 'operating';
+  const {data: entry, error} = await sb.from('cc_entries').insert(payload).select().single();
+  if(error || !entry) return null;
+  const {error: mErr} = await sb.from('cc_bank_transactions').update({status:'matched', matched_entry_type:type, matched_entry_id:entry.id, linked_payment_id:null}).eq('id', tx.id);
+  if(mErr) return null;
+  await logActivity('create', type, entry.id, `${payload.description} (${fmt(payload.amount)}) — bank rule "${rule.name || rule.match_text}"`);
+  return 'entry';
+}
+// Runs every rule over the unmatched lines. onlyAuto = just the rules ticked "apply automatically".
+// Lines that look like an invoice/bill payment (a suggested document match) are left for you to match.
+async function applyBankRules(onlyAuto){
+  let entries = 0, ignored = 0;
+  const lines = (state.bankTransactions||[]).filter(t=>t.status==='unmatched');
+  for(const tx of lines){
+    const rule = bankRuleFor(tx);
+    if(!rule || (onlyAuto && !rule.auto_apply)) continue;
+    if(suggestedMatchesFor(tx).some(s=>s.type==='invoice' || s.type==='supplier_invoice')) continue;
+    const res = await applyBankRuleToTx(rule, tx);
+    if(res === 'entry') entries++; else if(res === 'ignored') ignored++;
+  }
+  return {entries, ignored};
+}
+function bankRulesPanel(){
+  const rules = sortedBankRules();
+  const unmatched = (state.bankTransactions||[]).filter(t=>t.status==='unmatched');
+  const hits = r => unmatched.filter(t=>bankRuleFor(t) === r).length;
+  return `
+  <details class="collapsible" ${state.bankRulesOpen ? 'open' : ''} id="bank-rules-details">
+    <summary>Bank rules (${rules.length})</summary>
+    <div class="panel">
+      <p style="font-size:.82rem;color:var(--muted);margin-top:0;">Teach the feed once: lines whose description contains the text become that entry (or are ignored). Separate alternatives with | — e.g. <em>FNB MONTHLY FEE | SERVICE FEE</em>. The first matching rule wins.</p>
+      ${rules.length ? `<table><thead><tr><th>Name</th><th>Description contains</th><th>Direction</th><th>Becomes</th><th>Auto</th><th>Waiting</th><th></th></tr></thead><tbody>
+        ${rules.map(r=>`<tr${r.is_active===false?' style="opacity:.5;"':''}>
+          <td>${escHtml(r.name||'—')}</td><td><code>${escHtml(r.match_text)}</code>${(r.amount_min!=null&&r.amount_min!=='')||(r.amount_max!=null&&r.amount_max!=='') ? `<div style="font-size:.72rem;color:var(--muted);">${r.amount_min!=null&&r.amount_min!==''?'from '+fmt(r.amount_min):''} ${r.amount_max!=null&&r.amount_max!==''?'up to '+fmt(r.amount_max):''}</div>` : ''}</td>
+          <td>${r.direction==='in'?'Money in':r.direction==='out'?'Money out':'Either'}</td>
+          <td style="font-size:.82rem;">${escHtml(bankRuleActionLabel(r, null))}</td>
+          <td>${r.auto_apply ? 'Yes' : '—'}</td>
+          <td>${hits(r)}</td>
+          <td style="white-space:nowrap;"><button type="button" class="btn small secondary" data-edit-rule="${r.id}">Edit</button> <button type="button" class="btn small danger" data-del-rule="${r.id}">Delete</button></td>
+        </tr>`).join('')}
+      </tbody></table>` : `<div class="empty">No rules yet. Use "Make a rule" on any bank line, or add one here.</div>`}
+      <div class="modal-actions" style="justify-content:flex-start;"><button type="button" class="btn small secondary" id="bank-rule-add">+ New rule</button></div>
+    </div>
+  </details>
+  <div class="modal-backdrop hidden" id="bank-rule-modal-backdrop"><div class="modal" id="bank-rule-modal-content"></div></div>`;
+}
+function openBankRuleModal(ruleId, fromTx){
+  const r = ruleId ? (state.bankRules||[]).find(x=>x.id===ruleId) : null;
+  const dir = r ? r.direction : (fromTx ? (Number(fromTx.amount) >= 0 ? 'in' : 'out') : 'out');
+  const v = {
+    name: r ? r.name : (fromTx ? bankRuleKeywordGuess(fromTx.description) : ''),
+    match_text: r ? r.match_text : (fromTx ? bankRuleKeywordGuess(fromTx.description) : ''),
+    direction: dir, action: r ? r.action : 'entry', description: r ? (r.description||'') : '',
+    expense_category: r ? (r.expense_category||'operating') : 'operating', vat_applicable: r ? !!r.vat_applicable : false,
+    tags: r ? (r.tags||[]).join(', ') : '', amount_min: r && r.amount_min != null ? r.amount_min : '', amount_max: r && r.amount_max != null ? r.amount_max : '',
+    auto_apply: r ? !!r.auto_apply : true, is_active: r ? r.is_active !== false : true, sort_order: r ? (r.sort_order||0) : 0
+  };
+  state.bankRuleEditId = r ? r.id : null;
+  state.bankRuleFromTx = fromTx ? fromTx.id : null;
+  document.getElementById('bank-rule-modal-content').innerHTML = `
+    <button class="close-x" id="bank-rule-close">✕</button>
+    <h2 style="margin-top:0;">${r ? 'Edit bank rule' : 'New bank rule'}</h2>
+    ${fromTx ? `<p style="font-size:.8rem;color:var(--muted);margin-top:-8px;">From: ${escHtml(fromTx.description||'')} (${fmt(Math.abs(Number(fromTx.amount)))} ${Number(fromTx.amount)>=0?'in':'out'})</p>` : ''}
+    <form id="bank-rule-form">
+      <div class="row">
+        <div class="field" style="flex:1;min-width:160px;"><label>Rule name</label><input type="text" id="br-name" value="${escHtml(v.name)}" placeholder="e.g. Bank charges"></div>
+        <div class="field" style="flex:2;min-width:200px;"><label>Description contains</label><input type="text" id="br-match" value="${escHtml(v.match_text)}" required placeholder="e.g. MONTHLY FEE | SERVICE FEE"></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Direction</label><select id="br-direction"><option value="out" ${v.direction==='out'?'selected':''}>Money out</option><option value="in" ${v.direction==='in'?'selected':''}>Money in</option><option value="any" ${v.direction==='any'?'selected':''}>Either</option></select></div>
+        <div class="field"><label>Amount from (optional)</label><input type="number" step="0.01" id="br-min" value="${v.amount_min}"></div>
+        <div class="field"><label>Amount up to (optional)</label><input type="number" step="0.01" id="br-max" value="${v.amount_max}"></div>
+      </div>
+      <div class="field"><label>What to do</label><select id="br-action"><option value="entry" ${v.action==='entry'?'selected':''}>Create the revenue / expense entry and match it</option><option value="ignore" ${v.action==='ignore'?'selected':''}>Ignore the line (own transfer, not business)</option></select></div>
+      <div id="br-entry-fields" class="${v.action==='ignore'?'hidden':''}">
+        <div class="field"><label>Entry description (optional)</label><input type="text" id="br-description" value="${escHtml(v.description)}" placeholder="Leave blank to use the bank description"></div>
+        <div class="row">
+          <div class="field"><label>Expense category</label><select id="br-category"><option value="operating" ${v.expense_category==='operating'?'selected':''}>Operating expense</option><option value="cost_of_sales" ${v.expense_category==='cost_of_sales'?'selected':''}>Cost of sales</option></select></div>
+          <div class="field"><label>Tags (optional)</label><input type="text" id="br-tags" value="${escHtml(v.tags)}" placeholder="e.g. bank charges"></div>
+        </div>
+        <label style="display:flex;gap:8px;align-items:center;font-size:.85rem;margin-bottom:8px;"><input type="checkbox" id="br-vat" style="width:auto;flex:none;" ${v.vat_applicable?'checked':''}> Amount includes VAT (15%)</label>
+      </div>
+      <label style="display:flex;gap:8px;align-items:center;font-size:.85rem;margin-bottom:6px;"><input type="checkbox" id="br-auto" style="width:auto;flex:none;" ${v.auto_apply?'checked':''}> Apply automatically when a statement is imported</label>
+      <label style="display:flex;gap:8px;align-items:center;font-size:.85rem;margin-bottom:6px;"><input type="checkbox" id="br-active" style="width:auto;flex:none;" ${v.is_active?'checked':''}> Rule is active</label>
+      <div class="field"><label>Priority (lower runs first)</label><input type="number" step="1" id="br-order" value="${v.sort_order}"></div>
+      <p id="br-preview" style="font-size:.8rem;color:var(--muted);"></p>
+      <div class="modal-actions"><button type="button" class="btn secondary" id="bank-rule-cancel">Cancel</button><button type="submit" class="btn">Save rule</button></div>
+    </form>`;
+  const backdrop = document.getElementById('bank-rule-modal-backdrop');
+  const close = ()=>backdrop.classList.add('hidden');
+  const read = ()=>({
+    company_id: state.company.id,
+    name: document.getElementById('br-name').value.trim() || null,
+    match_text: document.getElementById('br-match').value.trim(),
+    direction: document.getElementById('br-direction').value,
+    amount_min: document.getElementById('br-min').value === '' ? null : Number(document.getElementById('br-min').value),
+    amount_max: document.getElementById('br-max').value === '' ? null : Number(document.getElementById('br-max').value),
+    action: document.getElementById('br-action').value,
+    description: document.getElementById('br-description').value.trim() || null,
+    expense_category: document.getElementById('br-category').value,
+    vat_applicable: document.getElementById('br-vat').checked,
+    tags: document.getElementById('br-tags').value.split(',').map(t=>t.trim()).filter(Boolean),
+    auto_apply: document.getElementById('br-auto').checked,
+    is_active: document.getElementById('br-active').checked,
+    sort_order: Number(document.getElementById('br-order').value) || 0
+  });
+  const preview = ()=>{
+    const rule = read();
+    const n = (state.bankTransactions||[]).filter(t=>t.status==='unmatched' && bankRuleMatches(rule, t)).length;
+    document.getElementById('br-preview').textContent = rule.match_text ? `${n} unmatched line${n===1?'':'s'} match this rule right now.` : '';
+  };
+  ['br-match','br-direction','br-min','br-max'].forEach(id=>document.getElementById(id).addEventListener('input', preview));
+  document.getElementById('br-action').addEventListener('change', e=>document.getElementById('br-entry-fields').classList.toggle('hidden', e.target.value==='ignore'));
+  document.getElementById('bank-rule-close').addEventListener('click', close);
+  document.getElementById('bank-rule-cancel').addEventListener('click', close);
+  document.getElementById('bank-rule-form').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const row = read();
+    if(!row.match_text){ toast('Enter the text to look for.'); return; }
+    const q = state.bankRuleEditId
+      ? sb.from('cc_bank_rules').update(row).eq('id', state.bankRuleEditId)
+      : sb.from('cc_bank_rules').insert({...row, created_by: state.user.id});
+    const {error} = await q;
+    if(error){ toast(error.message); return; }
+    await logActivity(state.bankRuleEditId ? 'update' : 'create', 'bank_rule', state.bankRuleEditId, `Bank rule "${row.name || row.match_text}"`);
+    close();
+    await refreshAll();
+    state.bankRulesOpen = true;
+    render();
+    const n = (state.bankTransactions||[]).filter(t=>t.status==='unmatched' && bankRuleMatches(row, t)).length;
+    toast(n ? `Rule saved. ${n} line${n===1?'':'s'} match — use "Apply rules" to process them.` : 'Rule saved.');
+  });
+  preview();
+  backdrop.classList.remove('hidden');
+}
+function attachBankRuleHandlers(){
+  document.getElementById('bank-rules-details')?.addEventListener('toggle', e=>{ state.bankRulesOpen = e.target.open; });
+  document.getElementById('bank-rule-add')?.addEventListener('click', ()=>openBankRuleModal(null, null));
+  document.querySelectorAll('[data-edit-rule]').forEach(b=>b.addEventListener('click', ()=>openBankRuleModal(b.dataset.editRule, null)));
+  document.querySelectorAll('[data-del-rule]').forEach(b=>b.addEventListener('click', async ()=>{
+    if(!confirm('Delete this rule? Lines it already processed are not changed.')) return;
+    const {error} = await sb.from('cc_bank_rules').delete().eq('id', b.dataset.delRule);
+    if(error){ toast(error.message); return; }
+    await refreshAll(); state.bankRulesOpen = true; render(); toast('Rule deleted.');
+  }));
+  document.querySelectorAll('[data-make-rule]').forEach(b=>b.addEventListener('click', ()=>{
+    const tx = state.bankTransactions.find(t=>t.id===b.dataset.makeRule);
+    openBankRuleModal(null, tx);
+  }));
+  document.querySelectorAll('[data-apply-rule]').forEach(b=>b.addEventListener('click', async ()=>{
+    const tx = state.bankTransactions.find(t=>t.id===b.dataset.applyRule);
+    const rule = tx && bankRuleFor(tx);
+    if(!rule) return;
+    if(isPeriodLocked(tx.tx_date)){ toast(periodLockMessage()); return; }
+    const res = await applyBankRuleToTx(rule, tx);
+    await refreshAll(); render();
+    toast(res === 'entry' ? 'Entry created and matched.' : res === 'ignored' ? 'Line ignored.' : 'Could not apply the rule (check your access to Revenue/Expenses).');
+  }));
+  document.getElementById('bank-apply-rules-btn')?.addEventListener('click', async (e)=>{
+    e.target.disabled = true;
+    const r = await applyBankRules(false);
+    await refreshAll(); render();
+    toast(`Rules applied: ${r.entries} entr${r.entries===1?'y':'ies'} created, ${r.ignored} ignored.`);
+  });
+}
+
+
 /* ========================= PREPAYMENTS (customer deposits & supplier prepayments) ========================= */
 // A customer who pays before an invoice exists (or before it is due) is held as CREDIT on their account:
 // Dr Bank / Cr Customer Deposits (a liability). Applying the credit to an invoice moves it against
 // receivables with no cash movement: Dr Customer Deposits / Cr Accounts Receivable. Suppliers mirror it:
 // Dr Supplier Prepayments (an asset) / Cr Bank, then Dr Accounts Payable / Cr Supplier Prepayments.
 // cc_party_credits holds the receipts/payments; cc_credit_allocations holds every use of them
-// (kind 'invoice' | 'bill' | 'refund'). Credit is held in Rand, so it applies to Rand documents only.
+// (kind 'invoice' | 'bill' | 'refund').
+// Foreign-currency prepayments (Wave 54): a credit can be held in USD/EUR/...; `amount` is always the Rand
+// banked/paid and `foreign_amount` the currency amount. It can only be applied to documents in the same
+// currency. An allocation records the Rand it uses from the credit (`amount`, at the credit's rate), the
+// foreign amount, and the Rand it clears on the document (`cleared_amount`, at the document's rate); the
+// difference is a realised FX gain/loss. Refunds record the Rand actually paid back in `cleared_amount`.
 function creditAllocs(creditId){ return (state.creditAllocations||[]).filter(a=>a.credit_id===creditId); }
+function creditCurrency(c){ return (c && c.currency) || 'ZAR'; }
+function creditIsForeign(c){ return creditCurrency(c) !== 'ZAR'; }
+function creditRate(c){ return creditIsForeign(c) ? (Number(c.amount) / (Number(c.foreign_amount) || 1)) : 1; }
+// Rand carrying value still unused (this is what sits in Customer Deposits / Supplier Prepayments).
 function creditRemaining(c){ return round2(Number(c.amount) - creditAllocs(c.id).reduce((s,a)=>s+Number(a.amount||0), 0)); }
+function creditForeignRemaining(c){ return round2(Number(c.foreign_amount||0) - creditAllocs(c.id).reduce((s,a)=>s+Number(a.foreign_amount||0), 0)); }
+// Unused credit in the credit's own currency.
+function creditAvail(c){ return creditIsForeign(c) ? creditForeignRemaining(c) : creditRemaining(c); }
 function partyCreditsFor(type, partyId){ return (state.partyCredits||[]).filter(c=>c.party_type===type && c.party_id===partyId); }
 function partyCreditBalance(type, partyId){ return round2(partyCreditsFor(type, partyId).reduce((s,c)=>s+creditRemaining(c), 0)); }
+function partyCreditAvailable(type, partyId, currency){ return round2(partyCreditsFor(type, partyId).filter(c=>creditCurrency(c)===(currency||'ZAR')).reduce((s,c)=>s+creditAvail(c), 0)); }
+function partyCreditCurrencies(type, partyId){ return [...new Set(partyCreditsFor(type, partyId).filter(c=>creditAvail(c) > 0.005).map(creditCurrency))]; }
 function totalUnallocatedCredit(type){ return round2((state.partyCredits||[]).filter(c=>c.party_type===type).reduce((s,c)=>s+creditRemaining(c), 0)); }
-function docAllocated(kind, docId){ return round2((state.creditAllocations||[]).filter(a=>a.kind===kind && a.doc_id===docId).reduce((s,a)=>s+Number(a.amount||0), 0)); }
+function allocCleared(a){ return (a.cleared_amount !== null && a.cleared_amount !== undefined && a.cleared_amount !== '') ? Number(a.cleared_amount) : Number(a.amount||0); }
+// Rand cleared on a document by applied credit (at the document's own rate).
+function docAllocated(kind, docId){ return round2((state.creditAllocations||[]).filter(a=>a.kind===kind && a.doc_id===docId).reduce((s,a)=>s+allocCleared(a), 0)); }
+function docAllocatedForeign(kind, docId, asOf){ return round2((state.creditAllocations||[]).filter(a=>a.kind===kind && a.doc_id===docId && (!asOf || a.alloc_date <= asOf)).reduce((s,a)=>s+Number(a.foreign_amount||0), 0)); }
+function docOwingInCurrency(kind, doc){
+  if(isForeignDoc(doc)) return foreignOpenFor(kind === 'invoice' ? 'invoice' : 'bill', doc);
+  return (kind === 'invoice' ? invoiceBalance(doc) : billBalance(doc)).balance;
+}
 function creditPartyName(type, id){ return type === 'client' ? clientName(id) : supplierName(id); }
 function creditNoun(type){ return type === 'client' ? 'customer' : 'supplier'; }
 function canManageCredits(type){ return type === 'client' ? hasModule('invoices') : hasModule('supplier_invoices'); }
@@ -1560,8 +2743,12 @@ async function savePartyCredit(o){
   if(!(amount > 0)){ toast('Enter an amount.'); return false; }
   if(!o.partyId){ toast(`Choose the ${creditNoun(o.type)}.`); return false; }
   if(!o.date){ toast('Choose a date.'); return false; }
+  const currency = o.currency || 'ZAR';
+  const foreign = currency === 'ZAR' ? null : round2(Number(o.foreignAmount));
+  if(currency !== 'ZAR' && !(foreign > 0)){ toast(`Enter the ${currency} amount.`); return false; }
   const {data: row, error} = await sb.from('cc_party_credits').insert({
     company_id: state.company.id, party_type: o.type, party_id: o.partyId, credit_date: o.date, amount,
+    currency, foreign_amount: foreign, exchange_rate: foreign ? Math.round(amount / foreign * 1e6) / 1e6 : 1,
     reference: o.reference || null, notes: o.notes || null, bank_transaction_id: o.bankTxId || null, created_by: state.user.id
   }).select().single();
   if(error || !row){ toast((error && error.message) || 'Could not save.'); return false; }
@@ -1569,52 +2756,78 @@ async function savePartyCredit(o){
     const {error: bankErr} = await sb.from('cc_bank_transactions').update({status:'matched', matched_entry_type: o.type==='client' ? 'client_credit' : 'supplier_credit', matched_entry_id: row.id, linked_payment_id: null}).eq('id', o.bankTxId);
     if(bankErr) toast(bankErr.message);
   }
-  await logActivity('create', 'prepayment', row.id, `${o.type==='client'?'Prepayment received from':'Prepayment paid to'} ${creditPartyName(o.type, o.partyId)} (${fmt(amount)})`);
+  await logActivity('create', 'prepayment', row.id, `${o.type==='client'?'Prepayment received from':'Prepayment paid to'} ${creditPartyName(o.type, o.partyId)} (${fmt(amount)}${foreign ? ' for ' + fmtCurrency(foreign, currency) : ''})`);
   return true;
 }
-// Applies credit to one invoice/bill, drawing on the oldest credit first (so one document can use several receipts).
+// Applies credit to one invoice/bill, drawing on the oldest credit first (so one document can use several
+// receipts). `amount` is in the document's currency; only credit held in that currency can be used.
 async function allocateCredit(o){
   const type = o.kind === 'invoice' ? 'client' : 'supplier';
   const err = creditGuard(type, o.date);
   if(err){ toast(err); return false; }
   const doc = o.kind === 'invoice' ? state.invoices.find(i=>i.id===o.docId) : state.supplierInvoices.find(b=>b.id===o.docId);
   if(!doc || doc.approval_status !== 'approved'){ toast('Only approved documents can take credit.'); return false; }
-  if(isForeignDoc(doc)){ toast('Credit is held in Rand, so it can only be applied to Rand documents.'); return false; }
+  const cur = doc.currency || 'ZAR';
+  const foreignDoc = isForeignDoc(doc);
   const partyId = o.kind === 'invoice' ? doc.client_id : doc.supplier_id;
-  const owing = (o.kind === 'invoice' ? invoiceBalance(doc) : billBalance(doc)).balance;
-  const avail = partyCreditBalance(type, partyId);
+  const owing = docOwingInCurrency(o.kind, doc);
+  const avail = partyCreditAvailable(type, partyId, cur);
   const amount = round2(Number(o.amount));
+  const money = v => fmtCurrency(v, cur);
   if(!(amount > 0)){ toast('Enter an amount.'); return false; }
-  if(amount > owing + 0.005){ toast(`That is more than the ${fmt(owing)} still owing.`); return false; }
-  if(amount > avail + 0.005){ toast(`Only ${fmt(avail)} of credit is available.`); return false; }
-  const credits = partyCreditsFor(type, partyId).filter(c=>creditRemaining(c) > 0.005)
+  if(amount > owing + 0.005){ toast(`That is more than the ${money(owing)} still owing.`); return false; }
+  if(amount > avail + 0.005){ toast(avail > 0.005 ? `Only ${money(avail)} of credit is available.` : `There is no ${cur} credit for this ${type==='client'?'customer':'supplier'}.`); return false; }
+  const credits = partyCreditsFor(type, partyId).filter(c=>creditCurrency(c)===cur && creditAvail(c) > 0.005)
     .sort((a,b)=> a.credit_date < b.credit_date ? -1 : (a.credit_date > b.credit_date ? 1 : ((a.created_at||'') < (b.created_at||'') ? -1 : 1)));
   let left = amount; const rows = [];
   for(const c of credits){
     if(left <= 0.004) break;
-    const take = round2(Math.min(left, creditRemaining(c)));
+    const avC = creditAvail(c);
+    const take = round2(Math.min(left, avC));
     const allocDate = o.date >= c.credit_date ? o.date : c.credit_date;
     if(isPeriodLocked(allocDate)){ toast(periodLockMessage()); return false; }
-    rows.push({company_id: state.company.id, credit_id: c.id, kind: o.kind, doc_id: o.docId, alloc_date: allocDate, amount: take, created_by: state.user.id});
+    const row = {company_id: state.company.id, credit_id: c.id, kind: o.kind, doc_id: o.docId, alloc_date: allocDate, created_by: state.user.id};
+    if(foreignDoc){
+      row.foreign_amount = take;
+      row.amount = Math.abs(take - avC) < 0.005 ? creditRemaining(c) : round2(take * creditRate(c));   // last bit uses up the exact Rand left
+      row.cleared_amount = round2(take * fxDocRate(doc));
+    } else {
+      row.amount = take;
+    }
+    rows.push(row);
     left = round2(left - take);
   }
   const {error} = await sb.from('cc_credit_allocations').insert(rows);
   if(error){ toast(error.message); return false; }
-  await logActivity('update', 'prepayment', o.docId, `${fmt(amount)} of ${creditPartyName(type, partyId)}'s credit applied to ${o.kind==='invoice'?doc.invoice_number:doc.bill_number}`);
+  await logActivity('update', 'prepayment', o.docId, `${money(amount)} of ${creditPartyName(type, partyId)}'s credit applied to ${o.kind==='invoice'?doc.invoice_number:doc.bill_number}`);
   return true;
 }
-async function refundCredit(creditId, amount, date){
+// amount is in the credit's currency; for a foreign credit, randPaid is the Rand actually paid out
+// (or received back) — the difference to the carrying value is a realised FX gain/loss.
+async function refundCredit(creditId, amount, date, randPaid){
   const c = (state.partyCredits||[]).find(x=>x.id===creditId);
   if(!c) return false;
   if(!canApprove()){ toast('Only a manager or approver can refund credit.'); return false; }
   const err = creditGuard(c.party_type, date);
   if(err){ toast(err); return false; }
   amount = round2(Number(amount));
-  if(!(amount > 0) || amount > creditRemaining(c) + 0.005){ toast(`Enter an amount up to ${fmt(creditRemaining(c))}.`); return false; }
+  const avC = creditAvail(c);
+  const cur = creditCurrency(c);
+  if(!(amount > 0) || amount > avC + 0.005){ toast(`Enter an amount up to ${fmtCurrency(avC, cur)}.`); return false; }
   const when = date >= c.credit_date ? date : c.credit_date;
-  const {error} = await sb.from('cc_credit_allocations').insert({company_id: state.company.id, credit_id: c.id, kind: 'refund', doc_id: null, alloc_date: when, amount, created_by: state.user.id});
+  const row = {company_id: state.company.id, credit_id: c.id, kind: 'refund', doc_id: null, alloc_date: when, created_by: state.user.id};
+  if(creditIsForeign(c)){
+    const paid = round2(Number(randPaid));
+    if(!(paid > 0)){ toast('Enter the Rand amount of the refund.'); return false; }
+    row.foreign_amount = amount;
+    row.amount = Math.abs(amount - avC) < 0.005 ? creditRemaining(c) : round2(amount * creditRate(c));
+    row.cleared_amount = paid;
+  } else {
+    row.amount = amount;
+  }
+  const {error} = await sb.from('cc_credit_allocations').insert(row);
   if(error){ toast(error.message); return false; }
-  await logActivity('create', 'prepayment', c.id, `${fmt(amount)} of ${creditPartyName(c.party_type, c.party_id)}'s credit refunded`);
+  await logActivity('create', 'prepayment', c.id, `${fmtCurrency(amount, cur)} of ${creditPartyName(c.party_type, c.party_id)}'s credit refunded`);
   return true;
 }
 async function removeCreditAllocation(allocId){
@@ -1668,8 +2881,11 @@ function openPrepayModal(o){
       </select></div>
       <div class="row">
         <div class="field"><label>Date</label><input type="date" id="prepay-date" value="${x.date}" required></div>
-        <div class="field"><label>Amount (R)</label><input type="number" step="0.01" min="0.01" id="prepay-amount" value="${x.amount ? Number(x.amount).toFixed(2) : ''}" required></div>
+        <div class="field"><label>Currency</label><select id="prepay-currency">${CURRENCIES.map(c=>`<option value="${c}" ${c===(x.currency||'ZAR')?'selected':''}>${c}</option>`).join('')}</select></div>
+        <div class="field hidden" id="prepay-foreign-field"><label>Amount in <span id="prepay-cur-label">USD</span></label><input type="number" step="0.01" min="0.01" id="prepay-foreign"></div>
+        <div class="field"><label id="prepay-amount-label">Amount (R)</label><input type="number" step="0.01" min="0.01" id="prepay-amount" value="${x.amount ? Number(x.amount).toFixed(2) : ''}" required></div>
       </div>
+      <p id="prepay-rate-note" style="font-size:.76rem;color:var(--muted);margin-top:-4px;"></p>
       <div class="field"><label>Reference (optional)</label><input type="text" id="prepay-ref" value="${escHtml(x.reference||'')}" placeholder="e.g. quote number, deposit for order 123"></div>
       <div class="field"><label>Notes (optional)</label><input type="text" id="prepay-notes"></div>
       ${x.bankTxId ? `<p style="font-size:.78rem;color:var(--muted);">This will match the bank line, so you will not need to record it separately.</p>` : ''}
@@ -1677,11 +2893,25 @@ function openPrepayModal(o){
     </form>`;
   document.getElementById('prepay-close').addEventListener('click', closePrepayModal);
   document.getElementById('prepay-cancel').addEventListener('click', closePrepayModal);
+  const curSel = document.getElementById('prepay-currency');
+  const syncCur = ()=>{
+    const cur = curSel.value, foreign = cur !== 'ZAR';
+    document.getElementById('prepay-foreign-field').classList.toggle('hidden', !foreign);
+    document.getElementById('prepay-cur-label').textContent = cur;
+    document.getElementById('prepay-amount-label').textContent = foreign ? (x.type==='client' ? 'Rand received' : 'Rand paid') : 'Amount (R)';
+    const f = parseFloat(document.getElementById('prepay-foreign').value), r = parseFloat(document.getElementById('prepay-amount').value);
+    document.getElementById('prepay-rate-note').textContent = (foreign && f > 0 && r > 0) ? `Rate: 1 ${cur} = R${(r/f).toFixed(4)}. It can be applied to ${cur} ${x.type==='client'?'invoices':'bills'} only.` : '';
+  };
+  curSel.addEventListener('change', syncCur);
+  document.getElementById('prepay-foreign').addEventListener('input', syncCur);
+  document.getElementById('prepay-amount').addEventListener('input', syncCur);
+  syncCur();
   document.getElementById('prepay-form').addEventListener('submit', async (e)=>{
     e.preventDefault();
     const ok = await savePartyCredit({
       type: x.type, partyId: document.getElementById('prepay-party').value, date: document.getElementById('prepay-date').value,
       amount: document.getElementById('prepay-amount').value, reference: document.getElementById('prepay-ref').value.trim(),
+      currency: curSel.value, foreignAmount: document.getElementById('prepay-foreign').value,
       notes: document.getElementById('prepay-notes').value.trim(), bankTxId: x.bankTxId
     });
     if(!ok) return;
@@ -1697,17 +2927,27 @@ function openCreditsModal(type, partyId){
   document.getElementById('prepay-modal-backdrop').classList.remove('hidden');
 }
 function creditOpenDocs(type, partyId){
-  if(type === 'client') return state.invoices.filter(i=>i.client_id===partyId && i.approval_status==='approved' && !isForeignDoc(i)).map(i=>({id:i.id, label:`Invoice ${i.invoice_number} (${i.issue_date})`, balance: invoiceBalance(i).balance})).filter(d=>d.balance > 0.005);
-  return state.supplierInvoices.filter(b=>b.supplier_id===partyId && b.approval_status==='approved' && !isForeignDoc(b)).map(b=>({id:b.id, label:`Bill ${b.bill_number} (${b.issue_date})`, balance: billBalance(b).balance})).filter(d=>d.balance > 0.005);
+  const curs = partyCreditCurrencies(type, partyId);
+  const list = type === 'client'
+    ? state.invoices.filter(i=>i.client_id===partyId && i.approval_status==='approved').map(i=>({id:i.id, doc:i, label:`Invoice ${i.invoice_number} (${i.issue_date})`, kind:'invoice'}))
+    : state.supplierInvoices.filter(b=>b.supplier_id===partyId && b.approval_status==='approved').map(b=>({id:b.id, doc:b, label:`Bill ${b.bill_number} (${b.issue_date})`, kind:'bill'}));
+  return list.map(d=>({...d, currency: d.doc.currency || 'ZAR', balance: docOwingInCurrency(d.kind, d.doc)}))
+    .filter(d=>d.balance > 0.005 && curs.includes(d.currency));
 }
 function renderCreditsModal(){
   const {type, partyId} = state.creditsCtx;
   const name = creditPartyName(type, partyId);
   const credits = partyCreditsFor(type, partyId);
   const avail = partyCreditBalance(type, partyId);
+  const curs = partyCreditCurrencies(type, partyId);
+  const availLabel = curs.length ? curs.map(c=>fmtCurrency(partyCreditAvailable(type, partyId, c), c)).join(' + ') : fmt(0);
   const docs = creditOpenDocs(type, partyId);
   const manage = canManageCredits(type);
   const allocs = (state.creditAllocations||[]).filter(a=>credits.some(c=>c.id===a.credit_id)).sort((a,b)=> a.alloc_date < b.alloc_date ? 1 : -1);
+  const allocAmt = a => {
+    const c = credits.find(x=>x.id===a.credit_id);
+    return c && creditIsForeign(c) ? `${fmtCurrency(a.foreign_amount, creditCurrency(c))}${Math.abs(allocCleared(a) - Number(a.amount)) >= 0.01 ? `<div style="font-size:.72rem;color:var(--muted);">FX ${fmt(round2(allocCleared(a) - Number(a.amount)))}</div>` : ''}` : fmt(a.amount);
+  };
   const allocLabel = a => {
     if(a.kind === 'refund') return type === 'client' ? 'Refunded to customer' : 'Refund received from supplier';
     const d = a.kind === 'invoice' ? state.invoices.find(i=>i.id===a.doc_id) : state.supplierInvoices.find(b=>b.id===a.doc_id);
@@ -1716,12 +2956,14 @@ function renderCreditsModal(){
   prepayHost().innerHTML = `
     <button class="close-x" id="credits-close">✕</button>
     <h2 style="margin-top:0;">${type==='client'?'Customer credit':'Supplier prepayments'} — ${escHtml(name)}</h2>
-    <p style="font-size:.9rem;">Available to apply: <strong>${fmt(avail)}</strong></p>
+    <p style="font-size:.9rem;">Available to apply: <strong>${availLabel}</strong>${curs.some(c=>c!=='ZAR') ? ` <span style="font-size:.78rem;color:var(--muted);">(carried at ${fmt(avail)})</span>` : ''}</p>
     <table><thead><tr><th>Date</th><th>Reference</th><th style="text-align:right;">Amount</th><th style="text-align:right;">Used</th><th style="text-align:right;">Available</th><th></th></tr></thead><tbody>
       ${credits.length ? credits.map(c=>{
         const rem = creditRemaining(c);
-        return `<tr><td>${c.credit_date}</td><td>${escHtml(c.reference||'—')}${c.bank_transaction_id?'<div style="font-size:.72rem;color:var(--muted);">from bank feed</div>':''}</td><td style="text-align:right;">${fmt(c.amount)}</td><td style="text-align:right;">${fmt(round2(c.amount - rem))}</td><td style="text-align:right;">${fmt(rem)}</td>
-          <td style="white-space:nowrap;">${rem > 0.005 && canApprove() && manage ? `<button type="button" class="btn small secondary" data-refund-credit="${c.id}">${type==='client'?'Refund':'Got refund'}</button>` : ''}${isAdmin() && !creditAllocs(c.id).length ? ` <button type="button" class="btn small danger" data-del-credit="${c.id}">Delete</button>` : ''}</td></tr>`;
+        const cc = creditCurrency(c), fx = creditIsForeign(c);
+        const tot = fx ? Number(c.foreign_amount) : Number(c.amount), av = creditAvail(c);
+        return `<tr><td>${c.credit_date}</td><td>${escHtml(c.reference||'—')}${c.bank_transaction_id?'<div style="font-size:.72rem;color:var(--muted);">from bank feed</div>':''}</td><td style="text-align:right;">${fmtCurrency(tot, cc)}${fx ? `<div style="font-size:.72rem;color:var(--muted);">${fmt(c.amount)} @ ${creditRate(c).toFixed(4)}</div>` : ''}</td><td style="text-align:right;">${fmtCurrency(round2(tot - av), cc)}</td><td style="text-align:right;">${fmtCurrency(av, cc)}</td>
+          <td style="white-space:nowrap;">${av > 0.005 && canApprove() && manage ? `<button type="button" class="btn small secondary" data-refund-credit="${c.id}">${type==='client'?'Refund':'Got refund'}</button>` : ''}${isAdmin() && !creditAllocs(c.id).length ? ` <button type="button" class="btn small danger" data-del-credit="${c.id}">Delete</button>` : ''}</td></tr>`;
       }).join('') : `<tr><td colspan="6"><div class="empty">No prepayments recorded.</div></td></tr>`}
     </tbody></table>
     ${manage ? `<div class="modal-actions" style="justify-content:flex-start;"><button type="button" class="btn small secondary" id="credits-add">+ Record another prepayment</button></div>` : ''}
@@ -1729,17 +2971,17 @@ function renderCreditsModal(){
     <div class="panel" style="margin-top:12px;">
       <h3 style="margin-top:0;">Apply credit to ${type==='client'?'an invoice':'a bill'}</h3>
       ${docs.length ? `<form id="credits-apply-form">
-        <div class="field"><label>${type==='client'?'Invoice':'Bill'}</label><select id="credits-apply-doc">${docs.map(d=>`<option value="${d.id}" data-balance="${d.balance.toFixed(2)}">${escHtml(d.label)} — owing ${fmt(d.balance)}</option>`).join('')}</select></div>
+        <div class="field"><label>${type==='client'?'Invoice':'Bill'}</label><select id="credits-apply-doc">${docs.map(d=>`<option value="${d.id}" data-balance="${d.balance.toFixed(2)}" data-avail="${partyCreditAvailable(type, partyId, d.currency).toFixed(2)}" data-currency="${d.currency}">${escHtml(d.label)} — owing ${fmtCurrency(d.balance, d.currency)}</option>`).join('')}</select></div>
         <div class="row">
           <div class="field"><label>Date</label><input type="date" id="credits-apply-date" value="${todayIso()}" required></div>
-          <div class="field"><label>Amount (R)</label><input type="number" step="0.01" min="0.01" id="credits-apply-amount" value="${Math.min(avail, docs[0].balance).toFixed(2)}" required></div>
+          <div class="field"><label>Amount (<span id="credits-apply-cur">${docs[0].currency==='ZAR'?'R':docs[0].currency}</span>)</label><input type="number" step="0.01" min="0.01" id="credits-apply-amount" value="${Math.min(partyCreditAvailable(type, partyId, docs[0].currency), docs[0].balance).toFixed(2)}" required></div>
         </div>
         <div class="modal-actions"><button type="submit" class="btn small">Apply credit</button></div>
-      </form>` : `<div class="empty">No open Rand ${type==='client'?'invoices':'bills'} for ${escHtml(name)} yet. The credit stays on the account until one exists.</div>`}
+      </form>` : `<div class="empty">No open ${type==='client'?'invoices':'bills'} in ${curs.join(' / ')} for ${escHtml(name)} yet. The credit stays on the account until one exists.</div>`}
     </div>` : ''}
     <h3>History</h3>
     ${allocs.length ? `<table><thead><tr><th>Date</th><th>Used for</th><th style="text-align:right;">Amount</th><th></th></tr></thead><tbody>
-      ${allocs.map(a=>`<tr><td>${a.alloc_date}</td><td>${escHtml(allocLabel(a))}</td><td style="text-align:right;">${fmt(a.amount)}</td><td>${manage ? `<button type="button" class="btn small secondary" data-unapply-credit="${a.id}">Undo</button>` : ''}</td></tr>`).join('')}
+      ${allocs.map(a=>`<tr><td>${a.alloc_date}</td><td>${escHtml(allocLabel(a))}</td><td style="text-align:right;">${allocAmt(a)}</td><td>${manage ? `<button type="button" class="btn small secondary" data-unapply-credit="${a.id}">Undo</button>` : ''}</td></tr>`).join('')}
     </tbody></table>` : `<div class="empty">Nothing applied yet.</div>`}
     <p style="font-size:.74rem;color:var(--muted);">A refund is recorded in the books but not matched to a bank line. When it appears in the Bank Feed, choose Ignore.</p>`;
   const rerun = async ()=>{ await refreshAll(); render(); renderCreditsModal(); };
@@ -1747,8 +2989,9 @@ function renderCreditsModal(){
   document.getElementById('credits-add')?.addEventListener('click', ()=>openPrepayModal({type, partyId}));
   const docSel = document.getElementById('credits-apply-doc');
   docSel?.addEventListener('change', ()=>{
-    const bal = Number(docSel.selectedOptions[0].dataset.balance);
-    document.getElementById('credits-apply-amount').value = Math.min(avail, bal).toFixed(2);
+    const o = docSel.selectedOptions[0];
+    document.getElementById('credits-apply-amount').value = Math.min(Number(o.dataset.avail), Number(o.dataset.balance)).toFixed(2);
+    document.getElementById('credits-apply-cur').textContent = o.dataset.currency === 'ZAR' ? 'R' : o.dataset.currency;
   });
   document.getElementById('credits-apply-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
@@ -1757,9 +3000,17 @@ function renderCreditsModal(){
   });
   document.querySelectorAll('[data-refund-credit]').forEach(b=>b.addEventListener('click', async ()=>{
     const c = state.partyCredits.find(x=>x.id===b.dataset.refundCredit);
-    const answer = prompt(`${type==='client'?'Refund how much to':'How much was refunded by'} ${name}? (up to ${fmt(creditRemaining(c))})`, creditRemaining(c).toFixed(2));
+    const cc = creditCurrency(c), av = creditAvail(c);
+    const answer = prompt(`${type==='client'?'Refund how much to':'How much was refunded by'} ${name}? (up to ${fmtCurrency(av, cc)})`, av.toFixed(2));
     if(answer === null) return;
-    if(await refundCredit(c.id, parseFloat(String(answer).replace(/\s/g,'').replace(',', '.')), todayIso())){ await rerun(); toast('Refund recorded.'); }
+    const amt = parseFloat(String(answer).replace(/\s/g,'').replace(',', '.'));
+    let rand = null;
+    if(creditIsForeign(c)){
+      const r = prompt(`How many Rand ${type==='client'?'were paid out':'came back'} for ${fmtCurrency(amt, cc)}?`, round2(amt * creditRate(c)).toFixed(2));
+      if(r === null) return;
+      rand = parseFloat(String(r).replace(/\s/g,'').replace(',', '.'));
+    }
+    if(await refundCredit(c.id, amt, todayIso(), rand)){ await rerun(); toast('Refund recorded.'); }
   }));
   document.querySelectorAll('[data-del-credit]').forEach(b=>b.addEventListener('click', async ()=>{
     if(!confirm('Delete this prepayment?')) return;
@@ -1778,20 +3029,24 @@ function wireCreditButtons(){
 function docCreditPanelHtml(kind, doc, balance){
   const type = kind === 'invoice' ? 'client' : 'supplier';
   const partyId = kind === 'invoice' ? doc.client_id : doc.supplier_id;
-  const avail = partyCreditBalance(type, partyId);
+  const cur = doc.currency || 'ZAR';
+  const avail = partyCreditAvailable(type, partyId, cur);
+  const otherCurs = partyCreditCurrencies(type, partyId).filter(c=>c!==cur);
   const allocs = (state.creditAllocations||[]).filter(a=>a.kind===kind && a.doc_id===doc.id);
-  if(avail <= 0.005 && !allocs.length) return '';
-  const foreign = isForeignDoc(doc);
-  const canApply = canManageCredits(type) && balance > 0.005 && avail > 0.005 && !foreign;
+  if(avail <= 0.005 && !allocs.length && !otherCurs.length) return '';
+  const owing = isForeignDoc(doc) ? docOwingInCurrency(kind, doc) : balance;
+  const canApply = canManageCredits(type) && owing > 0.005 && avail > 0.005;
+  const shown = a => isForeignDoc(doc) && a.foreign_amount ? fmtCurrency(a.foreign_amount, cur) + (Math.abs(allocCleared(a) - Number(a.amount)) >= 0.01 ? ` <span style="font-size:.72rem;color:var(--muted);">(FX ${fmt(round2(allocCleared(a) - Number(a.amount)))})</span>` : '') : fmt(allocCleared(a));
   return `<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;">
     <h4 style="margin:0 0 6px;">${type==='client'?'Customer credit':'Supplier prepayment'}</h4>
-    ${allocs.length ? `<table><tbody>${allocs.map(a=>`<tr><td>${a.alloc_date}</td><td>Credit applied</td><td style="text-align:right;">${fmt(a.amount)}</td><td>${canManageCredits(type) ? `<button type="button" class="btn small secondary" data-doc-unapply="${a.id}">Undo</button>` : ''}</td></tr>`).join('')}</tbody></table>` : ''}
-    ${avail > 0.005 ? `<p style="font-size:.85rem;margin:6px 0;">${type==='client'?'This customer has':'You have'} <strong>${fmt(avail)}</strong> ${type==='client'?'of credit on account':'prepaid to this supplier'}.${foreign ? ' Credit is held in Rand, so it can only be applied to Rand documents.' : ''}</p>` : ''}
+    ${allocs.length ? `<table><tbody>${allocs.map(a=>`<tr><td>${a.alloc_date}</td><td>Credit applied</td><td style="text-align:right;">${shown(a)}</td><td>${canManageCredits(type) ? `<button type="button" class="btn small secondary" data-doc-unapply="${a.id}">Undo</button>` : ''}</td></tr>`).join('')}</tbody></table>` : ''}
+    ${avail > 0.005 ? `<p style="font-size:.85rem;margin:6px 0;">${type==='client'?'This customer has':'You have'} <strong>${fmtCurrency(avail, cur)}</strong> ${type==='client'?'of credit on account':'prepaid to this supplier'}.</p>` : ''}
+    ${otherCurs.length ? `<p style="font-size:.78rem;color:var(--muted);margin:4px 0;">There is also credit in ${otherCurs.join(', ')}, which can only be applied to documents in that currency.</p>` : ''}
     ${canApply ? `<button type="button" class="btn secondary small" id="doc-apply-credit-btn">Apply credit</button>
     <form id="doc-apply-credit-form" class="hidden" style="margin-top:8px;">
       <div class="row">
         <div class="field"><label>Date</label><input type="date" id="doc-apply-credit-date" value="${todayIso()}" required></div>
-        <div class="field"><label>Amount (R)</label><input type="number" step="0.01" min="0.01" max="${Math.min(avail, balance).toFixed(2)}" id="doc-apply-credit-amount" value="${Math.min(avail, balance).toFixed(2)}" required></div>
+        <div class="field"><label>Amount (${cur==='ZAR'?'R':cur})</label><input type="number" step="0.01" min="0.01" max="${Math.min(avail, owing).toFixed(2)}" id="doc-apply-credit-amount" value="${Math.min(avail, owing).toFixed(2)}" required></div>
       </div>
       <div class="modal-actions"><button type="submit" class="btn small">Apply</button></div>
     </form>` : ''}
@@ -2153,10 +3408,10 @@ function foreignOpenFor(kind, doc){
   const rate = fxDocRate(doc);
   if(kind === 'invoice'){
     const settled = (state.invoicePayments||[]).filter(p=>p.invoice_id===doc.id).reduce((a,p)=>a+settledForeign(p, doc), 0);
-    return Math.max(0, round2(docTotal((state.invoiceItems||{})[doc.id]) - settled - invoiceWrittenOff(doc.id) / rate));
+    return Math.max(0, round2(docTotal((state.invoiceItems||{})[doc.id]) - settled - invoiceWrittenOff(doc.id) / rate - docAllocatedForeign('invoice', doc.id)));
   }
   const settled = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===doc.id).reduce((a,p)=>a+settledForeign(p, doc), 0);
-  return Math.max(0, round2(docTotal((state.supplierInvoiceItems||{})[doc.id]) - settled));
+  return Math.max(0, round2(docTotal((state.supplierInvoiceItems||{})[doc.id]) - settled - docAllocatedForeign('bill', doc.id)));
 }
 function bankAmountMatchesDoc(doc, balance, absAmt){
   if(isForeignDoc(doc)) return balance > 0 && absAmt >= balance * 0.75 && absAmt <= balance * 1.25;
@@ -2251,6 +3506,11 @@ async function unmatchBankTransaction(txId){
   }
   const {error} = await sb.from('cc_bank_transactions').update({status:'unmatched', matched_entry_type:null, matched_entry_id:null, linked_payment_id:null}).eq('id', txId);
   if(error){ toast(error.message); return; }
+  // Entries a bank rule created exist only because of this line, so unmatching removes them too.
+  if(tx && (tx.matched_entry_type === 'revenue' || tx.matched_entry_type === 'expense')){
+    const e = state.entries.find(x=>x.id===tx.matched_entry_id);
+    if(e && (e.tags||[]).includes('bank-rule') && !isPeriodLocked(e.entry_date)) await sb.from('cc_entries').delete().eq('id', e.id);
+  }
   if(tx && tx.linked_payment_id){
     if(tx.matched_entry_type === 'invoice') await sb.from('cc_invoice_payments').delete().eq('id', tx.linked_payment_id);
     else if(tx.matched_entry_type === 'supplier_invoice') await sb.from('cc_supplier_invoice_payments').delete().eq('id', tx.linked_payment_id);
@@ -2327,13 +3587,14 @@ function renderBankFeed(){
   const unmatched = state.bankTransactions.filter(t=>t.status==='unmatched');
   const resolved = state.bankTransactions.filter(t=>t.status!=='unmatched');
   return `
-    <div class="section-header" style="--accent-c:var(--c-team);"><h1>Bank Feed</h1><button class="btn" id="bankfeed-import-btn">Import Bank Statement CSV</button></div>
+    <div class="section-header" style="--accent-c:var(--c-team);"><h1>Bank Feed</h1><div style="display:flex;gap:8px;flex-wrap:wrap;">${(()=>{ const n = unmatched.filter(t=>bankRuleFor(t)).length; return n ? `<button class="btn secondary" id="bank-apply-rules-btn">Apply rules (${n})</button>` : ''; })()}<button class="btn" id="bankfeed-import-btn">Import Bank Statement CSV</button></div></div>
     <p class="section-caption">Import a bank statement export and match each line against what's already recorded, to catch what's missing or duplicated.</p>
     <div class="grid"><div class="card"><h3>Unmatched lines</h3><div class="value">${unmatched.length}</div></div></div>
     <div class="panel">
       <h3 style="margin-top:0;">Unmatched (${unmatched.length})</h3>
       ${unmatched.length ? unmatched.map(t=>{
         const suggestions = suggestedMatchesFor(t);
+        const rule = bankRuleFor(t);
         return `
         <div class="panel" style="margin:0 0 10px;padding:10px 12px;border-top:3px solid ${Number(t.amount)>=0?'var(--c-revenue)':'var(--c-expenses)'};">
           <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
@@ -2346,15 +3607,18 @@ function renderBankFeed(){
             ${suggestions.map(e=>`<button type="button" class="btn small secondary" data-match-tx="${t.id}" data-match-entry-type="${e.type}" data-match-entry-id="${e.id}">${e.date} · ${e.description} (${fmt(e.amount)})</button>`).join('')}
           </div>` : `<div style="margin-top:8px;font-size:.82rem;color:var(--muted);">No matching entry found within 10 days.</div>`}
           <div class="modal-actions" style="justify-content:flex-start;margin-top:8px;">
-            <button type="button" class="btn small" data-create-entry-from-tx="${t.id}">Create ${Number(t.amount)>=0?'revenue':'expense'} entry</button>
+            ${rule ? `<button type="button" class="btn small" data-apply-rule="${t.id}" title="${escHtml(bankRuleActionLabel(rule, t))}">Rule: ${escHtml(rule.name || rule.match_text)} → apply</button>` : ''}
+            <button type="button" class="btn small ${rule ? 'secondary' : ''}" data-create-entry-from-tx="${t.id}">Create ${Number(t.amount)>=0?'revenue':'expense'} entry</button>
             ${canManageCredits(Number(t.amount)>=0 ? 'client' : 'supplier') ? `<button type="button" class="btn small secondary" data-prepay-tx="${t.id}">Record as ${Number(t.amount)>=0?'customer':'supplier'} prepayment</button>` : ''}
             <button type="button" class="btn small secondary" data-find-match-toggle="${t.id}">${state.bankFindMatchOpenTx===t.id?'Hide':'Find & Match'} ${Number(t.amount)>=0?'invoice':'bill'}</button>
             <button type="button" class="btn small secondary" data-ignore-tx="${t.id}">Ignore</button>
+            ${rule ? '' : `<button type="button" class="btn small secondary" data-make-rule="${t.id}">Make a rule</button>`}
           </div>
           ${state.bankFindMatchOpenTx===t.id ? renderFindMatchPanel(t) : ''}
         </div>`;
       }).join('') : `<div class="empty">No unmatched bank lines. Import a statement to get started.</div>`}
     </div>
+    ${bankRulesPanel()}
     <details class="collapsible">
       <summary>Matched &amp; ignored (${resolved.length})</summary>
       <div class="panel">
@@ -2407,6 +3671,7 @@ function renderBankImportMapping(){
   `;
 }
 function attachBankFeedHandlers(){
+  attachBankRuleHandlers();
   document.querySelectorAll('[data-match-tx]').forEach(btn=>{
     btn.addEventListener('click', ()=>matchBankTransaction(btn.dataset.matchTx, btn.dataset.matchEntryType, btn.dataset.matchEntryId));
   });
@@ -2500,8 +3765,11 @@ function attachBankFeedHandlers(){
     const {error} = await sb.from('cc_bank_transactions').insert(payload);
     if(error){ toast(error.message); return; }
     importBackdrop.classList.add('hidden');
-    await refreshAll(); render();
-    toast(`Imported ${payload.length} bank line${payload.length===1?'':'s'}.`);
+    await refreshAll();
+    const auto = (state.bankRules||[]).some(r=>r.auto_apply && r.is_active !== false) ? await applyBankRules(true) : {entries:0, ignored:0};
+    if(auto.entries || auto.ignored) await refreshAll();
+    render();
+    toast(`Imported ${payload.length} bank line${payload.length===1?'':'s'}.` + ((auto.entries || auto.ignored) ? ` Bank rules handled ${auto.entries + auto.ignored} of them.` : ''));
   });
 }
 
@@ -3509,14 +4777,14 @@ function fxPositionsAsOf(asOf){
     const rate = fxDocRate(i);
     const settled = (state.invoicePayments||[]).filter(p=>p.invoice_id===i.id && p.payment_date <= asOf).reduce((a,p)=>a+settledForeign(p,i),0);
     const wo = (state.invoiceWriteoffs||[]).filter(w=>w.invoice_id===i.id && w.write_off_date <= asOf).reduce((a,w)=>a+Number(w.amount||0),0) / rate;
-    const open = docTotal(items) - settled - wo;
+    const open = docTotal(items) - settled - wo - docAllocatedForeign('invoice', i.id, asOf);
     if(open > 0.005) out.push({kind:'AR', doc:i, number:i.invoice_number, party:clientName(i.client_id), currency:i.currency, docRate:rate, open});
   });
   (state.supplierInvoices||[]).filter(b=>isForeignDoc(b) && b.approval_status==='approved' && b.issue_date <= asOf).forEach(b=>{
     const items = (state.supplierInvoiceItems||{})[b.id] || [];
     const rate = fxDocRate(b);
     const settled = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===b.id && p.payment_date <= asOf).reduce((a,p)=>a+settledForeign(p,b),0);
-    const open = docTotal(items) - settled;
+    const open = docTotal(items) - settled - docAllocatedForeign('bill', b.id, asOf);
     if(open > 0.005) out.push({kind:'AP', doc:b, number:b.bill_number, party:supplierName(b.supplier_id), currency:b.currency, docRate:rate, open});
   });
   return out;
@@ -3637,15 +4905,18 @@ function buildLedger(){
     const c = (state.partyCredits||[]).find(x=>x.id===a.credit_id);
     if(!c) return;
     const amt = Number(a.amount)||0;
+    // cleared = Rand cleared on the document (or paid/received on a refund); for a foreign credit it can differ
+    // from amt (the Rand carried in the credit) — that difference is realised FX.
+    const cleared = allocCleared(a);
     if(a.kind === 'invoice'){
       const inv = (state.invoices||[]).find(i=>i.id===a.doc_id);
-      post(a.alloc_date, 'Credit Allocation', `Customer credit applied${inv ? ' — '+inv.invoice_number : ''}`, [['CUSTDEP', amt],['AR', -amt]], a.id);
+      post(a.alloc_date, 'Credit Allocation', `Customer credit applied${inv ? ' — '+inv.invoice_number : ''}`, [['CUSTDEP', amt],['AR', -cleared],['FX', cleared - amt]], a.id);
     } else if(a.kind === 'bill'){
       const bill = (state.supplierInvoices||[]).find(b=>b.id===a.doc_id);
-      post(a.alloc_date, 'Credit Allocation', `Supplier prepayment applied${bill ? ' — '+bill.bill_number : ''}`, [['AP', amt],['SUPPREPAY', -amt]], a.id);
+      post(a.alloc_date, 'Credit Allocation', `Supplier prepayment applied${bill ? ' — '+bill.bill_number : ''}`, [['AP', cleared],['SUPPREPAY', -amt],['FX', amt - cleared]], a.id);
     } else if(a.kind === 'refund'){
-      if(c.party_type === 'client') post(a.alloc_date, 'Customer Refund', `Credit refunded — ${clientName(c.party_id)}`, [['CUSTDEP', amt],['BANK', -amt]], a.id);
-      else post(a.alloc_date, 'Supplier Refund', `Prepayment refunded by ${supplierName(c.party_id)}`, [['BANK', amt],['SUPPREPAY', -amt]], a.id);
+      if(c.party_type === 'client') post(a.alloc_date, 'Customer Refund', `Credit refunded — ${clientName(c.party_id)}`, [['CUSTDEP', amt],['BANK', -cleared],['FX', cleared - amt]], a.id);
+      else post(a.alloc_date, 'Supplier Refund', `Prepayment refunded by ${supplierName(c.party_id)}`, [['BANK', cleared],['SUPPREPAY', -amt],['FX', amt - cleared]], a.id);
     }
   });
 
@@ -4457,7 +5728,7 @@ function renderSupplierInvoices(){
     .filter(b=>b.approval_status==='approved')
     .reduce((s,b)=>s+billBalance(b).balance, 0);
   return `
-    <div class="section-header" style="--accent-c:var(--c-supplierinvoices);"><h1>Supplier Invoices</h1>${canEdit ? `<button class="btn" id="add-supplier-btn">+ Add Supplier</button> <button class="btn" id="add-supplier-invoice-btn">+ New Supplier Invoice</button>` : ''}</div>
+    <div class="section-header" style="--accent-c:var(--c-supplierinvoices);"><h1>Supplier Invoices</h1>${canEdit ? `<div style="display:flex;gap:8px;flex-wrap:wrap;"><button class="btn secondary" id="add-supplier-btn">+ Add Supplier</button><label class="btn secondary" id="scan-bill-btn" title="Photo or PDF of a supplier invoice or till slip" style="cursor:pointer;">Scan a bill<input type="file" id="scan-bill-file" accept="image/*,application/pdf" capture="environment" style="display:none;"></label><button class="btn" id="add-supplier-invoice-btn">+ New Supplier Invoice</button></div>` : ''}</div>
     <p class="section-caption">Bills you've received from suppliers, the payments you've allocated against them, and supplier credit notes.</p>
     <div class="grid"><div class="card" style="--accent-c:var(--c-supplierinvoices);"><h3>Outstanding to Suppliers</h3><div class="value negative">${fmt(totalOutstanding)}</div></div></div>
     ${pendingCount ? `<div class="panel" style="border-top:3px solid var(--warn);"><h3 style="margin-top:0;color:var(--warn);">Pending approval (${pendingCount})</h3><p style="color:var(--muted);font-size:.85rem;margin-bottom:0;">${canApprove() ? 'Open one below to approve or reject it.' : 'Waiting on management or an approver to review.'}</p></div>` : ''}
@@ -4467,13 +5738,14 @@ function renderSupplierInvoices(){
         ${state.suppliers.map(s=>`<tr><td>${s.name}</td><td>${s.email||'—'}</td><td>${s.phone||'—'}</td><td>${partyCreditsFor('supplier', s.id).length ? `<button class="btn small secondary" data-credits="supplier|${s.id}">${fmt(partyCreditBalance('supplier', s.id))}</button>` : '—'}</td>${canEdit?`<td><button class="btn small secondary" data-new-prepay="supplier|${s.id}">Prepayment</button> <button class="btn small danger" data-del-supplier="${s.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No suppliers yet.</div>`}
     </div>
+    ${purchaseOrdersPanel()}
     <div class="panel">
       <h3 style="margin-top:0;">Bills</h3>
       ${state.supplierInvoices.length ? `<table><thead><tr><th>Bill #</th><th>Supplier</th><th>Issue Date</th><th>Due</th><th>Approval</th><th>Total</th><th>Balance</th><th></th></tr></thead><tbody>
         ${state.supplierInvoices.map(b=>{
           const bal = billBalance(b);
           return `<tr>
-          <td>${b.bill_number}</td><td>${supplierName(b.supplier_id)}</td><td>${b.issue_date}</td><td>${b.due_date||'—'}</td>
+          <td>${b.bill_number}${b.is_recurring ? ` <span class="tag-pill" title="Recurring ${b.recurrence_frequency||''} — next ${b.recurrence_next_date||''}">↻ recurring</span>` : ''}</td><td>${supplierName(b.supplier_id)}</td><td>${b.issue_date}</td><td>${b.due_date||'—'}</td>
           <td>${approvalPill(b)}</td>
           <td>${fmt(bal.total)}</td>
           <td class="${bal.balance<=0.005?'positive':''}">${bal.balance<=0.005?'Paid':fmt(bal.balance)}</td>
@@ -4549,6 +5821,11 @@ function supplierInvoiceModal(){
         </table>
         <button type="button" class="btn secondary small" id="supplier-invoice-add-item" style="margin-top:8px;">+ Add line</button>
         <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="supplier-invoice-notes" rows="2"></textarea></div>
+        <label style="display:flex;gap:8px;align-items:center;font-size:.85rem;"><input type="checkbox" id="supplier-invoice-recurring" style="width:auto;flex:none;"> Recurring bill (rent, subscriptions, debit orders)</label>
+        <div class="row hidden" id="supplier-invoice-recurring-fields">
+          <div class="field"><label>Repeats</label><select id="supplier-invoice-recurrence"><option value="weekly">Weekly</option><option value="monthly" selected>Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option></select></div>
+          <div class="field"><label>Stop after (optional)</label><input type="date" id="supplier-invoice-recurrence-end"></div>
+        </div>
         ${attachmentCaptureField('supplier-invoice-attachment-file')}
         <div class="modal-actions">
           <button type="button" class="btn secondary" id="supplier-invoice-cancel">Cancel</button>
@@ -4618,8 +5895,16 @@ function attachSupplierInvoiceHandlers(){
   });
   // ---- Supplier Invoices (bills) ----
   const invBackdrop = document.getElementById('supplier-invoice-modal-backdrop');
+  document.getElementById('supplier-invoice-recurring')?.addEventListener('change', e=>document.getElementById('supplier-invoice-recurring-fields').classList.toggle('hidden', !e.target.checked));
+  attachPurchaseOrderHandlers();
+  document.getElementById('scan-bill-file')?.addEventListener('change', async (e)=>{ const f = e.target.files && e.target.files[0]; e.target.value = ''; if(f) await scanBillFile(f); });
   document.getElementById('add-supplier-invoice-btn')?.addEventListener('click', ()=>{
     if(!state.suppliers.length){ toast('Add a supplier first.'); return; }
+    state.billPrefill = null;
+    document.getElementById('supplier-invoice-recurring').checked = false;
+    document.getElementById('supplier-invoice-recurring-fields').classList.add('hidden');
+    document.getElementById('supplier-invoice-notes').value = '';
+    document.getElementById('supplier-invoice-due-date').value = '';
     document.getElementById('supplier-invoice-number').value = nextSupplierBillNumber();
     document.getElementById('supplier-invoice-issue-date').value = new Date().toISOString().slice(0,10);
     document.getElementById('supplier-invoice-items-body').innerHTML = invoiceItemRowWithStock();
@@ -4669,7 +5954,13 @@ function attachSupplierInvoiceHandlers(){
       exchange_rate: document.getElementById('supplier-invoice-currency').value === 'ZAR' ? 1 : (parseFloat(document.getElementById('supplier-invoice-exchange-rate').value) || 1),
       notes: document.getElementById('supplier-invoice-notes').value.trim() || null,
       created_by: state.user.id,
-      approval_status: approvalStatus
+      approval_status: approvalStatus,
+      ...(document.getElementById('supplier-invoice-recurring')?.checked ? {
+        is_recurring: true,
+        recurrence_frequency: document.getElementById('supplier-invoice-recurrence').value,
+        recurrence_next_date: nextRecurrenceDate(supplierInvoiceIssueDate, document.getElementById('supplier-invoice-recurrence').value),
+        recurrence_end_date: document.getElementById('supplier-invoice-recurrence-end').value || null
+      } : {})
     }).select().single();
     if(error){ toast(error.message); return; }
     const rows = [...document.querySelectorAll('#supplier-invoice-items-body tr')].map(tr=>({
@@ -4686,6 +5977,12 @@ function attachSupplierInvoiceHandlers(){
     }
     await logActivity('create', 'supplier_invoice', bill.id, `${bill.bill_number}`);
     await uploadCapturedAttachment('supplier-invoice-attachment-file', 'supplier_invoice', bill.id);
+    if(state.billPrefill && state.billPrefill.poId){
+      await sb.from('cc_purchase_orders').update({status:'billed', bill_id: bill.id}).eq('id', state.billPrefill.poId);
+      await logActivity('update', 'purchase_order', state.billPrefill.poId, `Converted to bill ${bill.bill_number}`);
+    }
+    if(state.billPrefill && state.billPrefill.scanFile) await uploadScannedFile(state.billPrefill.scanFile, bill.id);
+    state.billPrefill = null;
     await refreshAll(); render();
     toast(approvalStatus === 'pending' ? 'Supplier invoice submitted for approval.' : 'Supplier invoice captured.');
   });
@@ -4796,7 +6093,7 @@ async function openSupplierInvoiceView(billId){
   const totalPaid = round2(payments.reduce((s,p)=>s+paymentCleared(p, bill),0));
   const creditApplied = docAllocated('bill', bill.id);
   const balance = Math.max(0, round2(zarTotal - totalPaid - creditApplied));
-  const foreignOpen = isForeign ? Math.max(0, total - payments.reduce((s,p)=>s+settledForeign(p, bill),0)) : 0;
+  const foreignOpen = isForeign ? Math.max(0, round2(total - payments.reduce((s,p)=>s+settledForeign(p, bill),0) - docAllocatedForeign('bill', bill.id))) : 0;
   const cf = v => fmtCurrency(v, bill.currency);
   const canRecordPayment = hasModule('supplier_invoices') && bill.approval_status === 'approved';
   const backdrop = document.getElementById('supplier-invoice-view-backdrop');
@@ -5114,7 +6411,7 @@ function renderClients(){
     <p class="section-caption">The people and companies you invoice.</p>
     <div class="panel">
       ${state.clients.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Credit</th><th></th></tr></thead><tbody>
-        ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td><td>${partyCreditsFor('client', c.id).length ? `<button class="btn small secondary" data-credits="client|${c.id}">${fmt(partyCreditBalance('client', c.id))}</button>` : '—'}</td><td><button class="btn small secondary" data-statement-client="${c.id}">Statement</button>${hasModule('invoices') ? ` <button class="btn small secondary" data-new-prepay="client|${c.id}">Prepayment</button>` : ''}${canEdit?` <button class="btn small danger" data-del-client="${c.id}">Delete</button>`:''}</td></tr>`).join('')}
+        ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td><td>${partyCreditsFor('client', c.id).length ? `<button class="btn small secondary" data-credits="client|${c.id}">${fmt(partyCreditBalance('client', c.id))}</button>` : '—'}</td><td><button class="btn small secondary" data-statement-client="${c.id}">Statement</button>${hasModule('invoices') ? ` <button class="btn small secondary" data-new-prepay="client|${c.id}">Prepayment</button>` : ''}${canEdit ? ` <label style="display:inline-flex;align-items:center;gap:4px;font-size:.78rem;color:var(--muted);" title="Automatic overdue reminders"><input type="checkbox" style="width:auto;" data-client-reminders="${c.id}" ${c.no_reminders ? '' : 'checked'}> Reminders</label>` : ''}${canEdit?` <button class="btn small danger" data-del-client="${c.id}">Delete</button>`:''}</td></tr>`).join('')}
       </tbody></table>` : `<div class="empty">No clients yet.</div>`}
     </div>
     ${clientStatementModal()}
@@ -5159,6 +6456,12 @@ function attachClientHandlers(){
   });
   attachClientStatementHandlers();
   wireCreditButtons();
+  document.querySelectorAll('[data-client-reminders]').forEach(cb=>cb.addEventListener('change', async ()=>{
+    const {error} = await sb.from('cc_clients').update({no_reminders: !cb.checked}).eq('id', cb.dataset.clientReminders);
+    if(error){ toast(error.message); cb.checked = !cb.checked; return; }
+    const c = state.clients.find(x=>x.id===cb.dataset.clientReminders); if(c) c.no_reminders = !cb.checked;
+    toast(cb.checked ? 'Reminders on for this client.' : 'Automatic reminders off for this client.');
+  }));
   document.getElementById('send-statements-btn')?.addEventListener('click', openStmtDist);
 }
 
@@ -5237,6 +6540,11 @@ function computeClientStatement(clientId, fromDate, toDate){
   partyCreditsFor('client', clientId).forEach(c=>{
     all.push({date:c.credit_date, label:`Prepayment received${c.reference ? ' ('+c.reference+')' : ''}`, amount: -Number(c.amount)});
     creditAllocs(c.id).filter(a=>a.kind==='refund').forEach(a=>{ all.push({date:a.alloc_date, label:'Credit refunded', amount: Number(a.amount)}); });
+    // A foreign credit applied to an invoice booked at a different rate leaves an exchange difference.
+    creditAllocs(c.id).filter(a=>a.kind==='invoice' && Math.abs(allocCleared(a) - Number(a.amount)) >= 0.005).forEach(a=>{
+      const inv = state.invoices.find(i=>i.id===a.doc_id);
+      all.push({date:a.alloc_date, label:`Exchange difference on credit applied${inv ? ' ('+inv.invoice_number+')' : ''}`, amount: -round2(allocCleared(a) - Number(a.amount))});
+    });
   });
   all.sort((a,b)=> a.date < b.date ? -1 : (a.date > b.date ? 1 : 0));
   const opening = fromDate ? round2(all.filter(l=>l.date < fromDate).reduce((s,l)=>s+l.amount, 0)) : 0;
@@ -5307,10 +6615,13 @@ function openClientStatementView(clientId, fromDate, toDate){
       ${stmt.lines.map(l=>`<tr><td>${l.date}</td><td>${l.label}</td><td>${amt(l.amount)}</td><td>${fmt(l.balance)}</td></tr>`).join('')}
     </tbody></table>` : `<div class="empty">No activity in this period.</div>`}
     <div style="text-align:right;margin-top:10px;font-weight:700;font-size:1.1rem;">Balance due: ${amt(stmt.closing)}</div>
-    <div class="modal-actions"><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
+    <div class="modal-actions"><button class="btn secondary" onclick="window.print()">Print / Save PDF</button><button type="button" class="btn secondary" id="statement-download-pdf">Download PDF</button></div>
   `;
   backdrop.classList.remove('hidden');
   document.getElementById('statement-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('statement-download-pdf')?.addEventListener('click', async ()=>{
+    try{ downloadPdf(await buildStatementPdf(stmt)); }catch(e){ toast('Could not create the PDF (' + e.message + '). Use Print / Save PDF instead.'); }
+  });
 }
 
 // ---- Distribute statements to many clients at once ----
@@ -5350,7 +6661,7 @@ function stmtDistModal(){
 function openStmtDist(){
   const r = stmtPresetRange('lastmonth');
   state.stmtDist = {from: r.from, to: r.to, rows: [], sel: {}, results: {}, sending: false,
-    subject: STMT_DEFAULT_SUBJECT, message: STMT_DEFAULT_MESSAGE, archive: hasModule('documents'), preset: 'lastmonth'};
+    subject: STMT_DEFAULT_SUBJECT, message: STMT_DEFAULT_MESSAGE, archive: hasModule('documents'), attachPdf: true, preset: 'lastmonth'};
   stmtDistCompute();
   renderStmtDist();
   document.getElementById('stmt-dist-backdrop').classList.remove('hidden');
@@ -5398,9 +6709,11 @@ function renderStmtDist(){
     <div class="field"><label>Email subject</label><input type="text" id="stmt-dist-subject" value="${escHtml(d.subject)}"></div>
     <div class="field"><label>Email message</label><textarea id="stmt-dist-message" rows="6">${escHtml(d.message)}</textarea>
       <p style="font-size:.72rem;color:var(--muted);margin:2px 0 0;">You can use {client}, {company}, {period} and {balance}. The statement itself is added under your message.</p></div>
+    <label style="display:flex;gap:8px;align-items:center;font-size:.85rem;margin-bottom:6px;"><input type="checkbox" style="width:auto;flex:none;" id="stmt-dist-pdf" ${d.attachPdf?'checked':''}> Attach each statement as a PDF</label>
     <label style="display:flex;gap:8px;align-items:center;font-size:.85rem;margin-bottom:10px;${hasModule('documents')?'':'opacity:.5;'}"><input type="checkbox" style="width:auto;flex:none;" id="stmt-dist-archive" ${d.archive?'checked':''} ${hasModule('documents')?'':'disabled'}> Keep a copy of each emailed statement in Documents</label>
     <div class="modal-actions">
-      <button type="button" class="btn secondary" id="stmt-dist-print" ${picked.length && !d.sending ? '' : 'disabled'}>Print / Save PDF pack (${picked.length})</button>
+      <button type="button" class="btn secondary" id="stmt-dist-print" ${picked.length && !d.sending ? '' : 'disabled'}>Print pack (${picked.length})</button>
+      <button type="button" class="btn secondary" id="stmt-dist-pdfpack" ${picked.length && !d.sending ? '' : 'disabled'}>Download PDF pack</button>
       <button type="button" class="btn" id="stmt-dist-send" ${pickedEmail.length && !d.sending ? '' : 'disabled'}>${d.sending ? 'Sending…' : `Email ${pickedEmail.length} statement${pickedEmail.length===1?'':'s'}`}</button>
     </div>`;
   attachStmtDistHandlers();
@@ -5410,6 +6723,7 @@ function attachStmtDistHandlers(){
   const keepText = ()=>{
     const s = document.getElementById('stmt-dist-subject'), m = document.getElementById('stmt-dist-message'), a = document.getElementById('stmt-dist-archive');
     if(s) d.subject = s.value; if(m) d.message = m.value; if(a && !a.disabled) d.archive = a.checked;
+    const pc = document.getElementById('stmt-dist-pdf'); if(pc) d.attachPdf = pc.checked;
   };
   document.getElementById('stmt-dist-close')?.addEventListener('click', ()=>{ if(!d.sending) document.getElementById('stmt-dist-backdrop').classList.add('hidden'); });
   const dateChanged = ()=>{
@@ -5437,6 +6751,13 @@ function attachStmtDistHandlers(){
   document.getElementById('stmt-dist-subject')?.addEventListener('input', keepText);
   document.getElementById('stmt-dist-message')?.addEventListener('input', keepText);
   document.getElementById('stmt-dist-archive')?.addEventListener('change', keepText);
+  document.getElementById('stmt-dist-pdf')?.addEventListener('change', keepText);
+  document.getElementById('stmt-dist-pdfpack')?.addEventListener('click', async ()=>{
+    keepText();
+    const picked = d.rows.filter(r=>d.sel[r.client.id]);
+    if(!picked.length){ toast('Select at least one client.'); return; }
+    try{ downloadPdf(await buildStatementPackPdf(picked.map(r=>r.stmt))); }catch(e){ toast('Could not create the PDF (' + e.message + '). Use the print pack instead.'); }
+  });
   document.getElementById('stmt-dist-print')?.addEventListener('click', ()=>{
     keepText();
     const picked = d.rows.filter(r=>d.sel[r.client.id]);
@@ -5472,9 +6793,10 @@ async function sendStmtDistEmails(){
     const vars = {client: r.client.name, company: state.company.name, period: stmtPeriodLabel(d.from, d.to), balance: fmtCurrency(r.stmt.closing, 'ZAR')};
     const subject = fillStmtTemplate(d.subject, vars);
     const html = statementDocumentHtml(r.stmt, {message: fillStmtTemplate(d.message, vars)});
+    const pdfAtt = d.attachPdf ? await pdfAttachment(()=>buildStatementPdf(r.stmt)) : null;
     let failure = null, notConfigured = false;
     try{
-      const {data, error} = await sb.functions.invoke('send-invoice-email', {body:{company_id: state.company.id, to: r.client.email.trim(), subject, html, reply_to: state.company.email || null, from_name: state.company.name}});
+      const {data, error} = await sb.functions.invoke('send-invoice-email', {body:{company_id: state.company.id, to: r.client.email.trim(), subject, html, reply_to: companyReplyTo(), from_name: state.company.name, attachments: pdfAtt ? [pdfAtt] : undefined}});
       if(error) failure = error.message || 'Could not send';
       else if(data && data.error){
         notConfigured = data.error === 'email_not_configured';
@@ -5536,7 +6858,7 @@ function nextRecurrenceDate(fromDateStr, frequency){
   }
 }
 async function generateDueRecurringInvoices(){
-  if(!canApprove() && !hasModule('invoices')) return; // only attempt if this user could plausibly create invoices
+  if(!canApprove() && !hasModule('invoices')) return 0; // only attempt if this user could plausibly create invoices
   const today = new Date().toISOString().slice(0,10);
   const due = state.invoices.filter(i=>
     i.is_recurring &&
@@ -5544,8 +6866,10 @@ async function generateDueRecurringInvoices(){
     i.recurrence_next_date <= today &&
     (!i.recurrence_end_date || i.recurrence_next_date <= i.recurrence_end_date)
   );
-  if(!due.length) return;
+  if(!due.length) return 0;
+  let made = 0;
   for(const src of due){
+    if(isPeriodLocked(src.recurrence_next_date)) continue;
     // Fetch the source invoice's line items to copy across.
     const {data: srcItems} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', src.id);
     const approvalStatus = canApprove() ? 'approved' : 'pending';
@@ -5593,7 +6917,9 @@ async function generateDueRecurringInvoices(){
     }).eq('id', src.id);
     state.invoices.push(created);
     state.invoiceItems[created.id] = srcItems || [];
+    made++;
   }
+  return made;
 }
 function canManageDoc(doc){
   return canApprove() || (doc.created_by === state.user.id && doc.approval_status === 'pending');
@@ -5917,6 +7243,7 @@ function invoiceEmailHtml(inv, items, client, message, t){
       <div style="font-size:17px;font-weight:700;margin-top:4px;">Total due: ${fmtCurrency(t.total, cur)}</div>
       ${t.isForeign ? `<div style="color:#666;font-size:12px;">Invoice currency ${escHtml(cur)} (booked at ${escHtml(inv.exchange_rate)} = ${fmt(t.zarTotal)})</div>` : ''}
     </div>
+    ${t.payLink ? payNowEmailButton(t.payLink) : ''}
     ${inv.notes ? `<div style="margin-top:14px;font-size:13px;color:#555;white-space:pre-line;">${escHtml(inv.notes)}</div>` : ''}
   </div></div>`;
 }
@@ -5939,7 +7266,7 @@ async function openInvoiceView(invoiceId){
   const writtenOff = round2(writeoffs.reduce((s,w)=>s+Number(w.amount||0),0));
   const creditApplied = docAllocated('invoice', inv.id);
   const balance = Math.max(0, round2(zarTotal - totalPaid - writtenOff - creditApplied));
-  const foreignOpen = isForeign ? Math.max(0, total - payments.reduce((s,p)=>s+settledForeign(p, inv),0) - writtenOff / docRate) : 0;
+  const foreignOpen = isForeign ? Math.max(0, round2(total - payments.reduce((s,p)=>s+settledForeign(p, inv),0) - writtenOff / docRate - docAllocatedForeign('invoice', inv.id))) : 0;
   const canWriteOff = hasModule('invoices') && inv.approval_status === 'approved';
   const canRecordPayment = hasModule('invoices') && inv.approval_status === 'approved';
   const mailtoSubject = encodeURIComponent(`Invoice ${inv.invoice_number} from ${state.company.name}`);
@@ -5997,6 +7324,8 @@ async function openInvoiceView(invoiceId){
         <div class="modal-actions"><button type="submit" class="btn small">Save Payment</button></div>
       </form>` : ''}
       ${docCreditPanelHtml('invoice', inv, balance)}
+      ${invoiceReminderPanelHtml(inv, balance)}
+      ${invoicePayNowPanelHtml(inv, balance)}
     </div>` : ''}
     ${(inv.approval_status === 'pending' && canApprove()) ? `
     <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
@@ -6014,6 +7343,7 @@ async function openInvoiceView(invoiceId){
     </div>` : ''}
     <div class="modal-actions">
       <button class="btn secondary" onclick="window.print()">Print / Save PDF</button>
+      <button type="button" class="btn secondary" id="invoice-download-pdf">Download PDF</button>
       <a class="btn secondary" href="mailto:${client&&client.email?client.email:''}?subject=${mailtoSubject}&body=${mailtoBody}">✉ Open in my email app</a>
       ${(hasModule('invoices') && inv.approval_status==='approved') ? `<button type="button" class="btn" id="email-invoice-btn">✉ Email invoice</button>` : ''}
     </div>
@@ -6023,6 +7353,8 @@ async function openInvoiceView(invoiceId){
       <div class="field"><label>To</label><input type="email" id="email-invoice-to" value="${client&&client.email?client.email:''}" required></div>
       <div class="field"><label>Subject</label><input type="text" id="email-invoice-subject" value="Invoice ${inv.invoice_number} from ${state.company.name.replace(/"/g,'&quot;')}" required></div>
       <div class="field"><label>Message</label><textarea id="email-invoice-message" rows="4">Hi ${client?client.name:''},\n\nPlease find invoice ${inv.invoice_number} for ${fmtCurrency(total, inv.currency)} below${inv.due_date?(', due '+inv.due_date):''}.\n\nThank you,\n${state.company.name}</textarea></div>
+      <label style="display:flex;gap:8px;align-items:center;font-size:.85rem;margin-bottom:8px;"><input type="checkbox" id="email-invoice-attach" style="width:auto;flex:none;" checked> Attach the invoice as a PDF</label>
+      ${(hasModule('invoices') && payNowEligible(inv, balance)) ? `<label style="display:flex;gap:8px;align-items:center;font-size:.85rem;margin-bottom:8px;"><input type="checkbox" id="email-invoice-paynow" style="width:auto;flex:none;" checked> Include a "Pay now by card" button for ${fmt(balance)}</label>` : ''}
       <div class="modal-actions"><button type="button" class="btn secondary small" id="email-invoice-cancel">Cancel</button><button type="submit" class="btn small" id="email-invoice-send">Send email</button></div>
     </form>
   `;
@@ -6038,6 +7370,11 @@ async function openInvoiceView(invoiceId){
     });
   });
   attachDocCreditHandlers('invoice', inv, ()=>openInvoiceView(inv.id));
+  attachInvoiceReminderHandlers(inv, ()=>openInvoiceView(inv.id));
+  attachPayNowHandlers(inv, ()=>openInvoiceView(inv.id));
+  document.getElementById('invoice-download-pdf')?.addEventListener('click', async ()=>{
+    try{ downloadPdf(await buildInvoicePdf(inv, items, client)); }catch(e){ toast('Could not create the PDF (' + e.message + '). Use Print / Save PDF instead.'); }
+  });
   document.getElementById('email-invoice-btn')?.addEventListener('click', ()=>document.getElementById('email-invoice-form').classList.remove('hidden'));
   document.getElementById('email-invoice-cancel')?.addEventListener('click', ()=>document.getElementById('email-invoice-form').classList.add('hidden'));
   document.getElementById('email-invoice-form')?.addEventListener('submit', async (e)=>{
@@ -6048,10 +7385,17 @@ async function openInvoiceView(invoiceId){
     if(!to){ toast('Enter a recipient.'); return; }
     const btn = document.getElementById('email-invoice-send');
     btn.disabled = true; btn.textContent = 'Sending…';
-    const html = invoiceEmailHtml(inv, items, client, message, {total, subtotal, vatTotal, zarTotal, isForeign});
+    let payLink = null;
+    if(document.getElementById('email-invoice-paynow')?.checked){
+      payLink = openPaymentLink(inv.id, balance) || await createPaymentLink(inv);
+      if(!payLink && !confirm('The Pay-now link could not be created. Send the email without it?')){ btn.disabled = false; btn.textContent = 'Send email'; return; }
+    }
+    const html = invoiceEmailHtml(inv, items, client, message, {total, subtotal, vatTotal, zarTotal, isForeign, payLink});
+    const wantPdf = !!document.getElementById('email-invoice-attach')?.checked;
+    const pdfAtt = wantPdf ? await pdfAttachment(()=>buildInvoicePdf(inv, items, client)) : null;
     let failure = null;
     try{
-      const {data, error} = await sb.functions.invoke('send-invoice-email', {body:{company_id: state.company.id, to, subject, html, reply_to: state.company.email || null, from_name: state.company.name}});
+      const {data, error} = await sb.functions.invoke('send-invoice-email', {body:{company_id: state.company.id, to, subject, html, reply_to: companyReplyTo(), from_name: state.company.name, attachments: pdfAtt ? [pdfAtt] : undefined}});
       if(error) failure = error.message || 'Could not send';
       else if(data && data.error) failure = data.error === 'email_not_configured' ? 'Email sending is not set up yet (the Resend API key has not been added to Supabase).' : data.error;
     }catch(err){ failure = err.message || 'Could not send'; }
@@ -6064,7 +7408,7 @@ async function openInvoiceView(invoiceId){
     if(inv.status === 'draft') patch.status = 'sent';
     await sb.from('cc_invoices').update(patch).eq('id', inv.id);
     await logActivity('email', 'invoice', inv.id, `${inv.invoice_number} emailed to ${to}`);
-    await refreshAll(); render(); openInvoiceView(inv.id); toast('Invoice emailed to ' + to + '.');
+    await refreshAll(); render(); openInvoiceView(inv.id); toast('Invoice emailed to ' + to + '.' + (wantPdf && !pdfAtt ? ' (The PDF could not be created, so it went without an attachment.)' : ''));
   });
   document.getElementById('add-invoice-payment-btn')?.addEventListener('click', ()=>{
     document.getElementById('invoice-payment-date').value = new Date().toISOString().slice(0,10);
@@ -6666,15 +8010,22 @@ function computeIRP5(employeeId, taxYearLabel){
   const bounds = taxYearBounds(taxYearLabel);
   const rows = state.payrollPayments.filter(p => p.employee_id === employeeId && p.pay_date >= bounds.start && p.pay_date <= bounds.end);
   const sum = (key) => round2(rows.reduce((s, r) => s + (Number(r[key]) || 0), 0));
-  return {
+  const out = {
     bounds, count: rows.length,
     income3601: sum('basic_salary'), bonus3605: sum('bonus'), commission3606: sum('commission'),
     travel3701: sum('travel_allowance'), car3802: sum('car_fringe_benefit'), loan3801: sum('loan_fringe_benefit'),
     retirement4001: sum('retirement_deduction'),
     medical4005: sum('medical_deduction'), medicalCredit4116: sum('medical_credit'),
-    paye4102: sum('paye'), uif4141: sum('uif_employee'),
+    paye4102: sum('paye'),
+    // 4141 is the UIF contribution of employee AND employer; 4142 the SDL; 4149 the total of 4102 + 4141 + 4142.
+    uifEmployee: sum('uif_employee'), uifEmployer: sum('uif_employer'),
+    uif4141: round2(sum('uif_employee') + sum('uif_employer')),
+    sdl4142: round2(rows.reduce((s, r) => s + payslipSdl(r, payrollSdlApplicable()), 0)),
+    total4149: 0,
     grossRemuneration: sum('gross'), netPayTotal: sum('net'),
   };
+  out.total4149 = round2(out.paye4102 + out.uif4141 + out.sdl4142);
+  return out;
 }
 function renderIRP5HTML(emp, irp){
   return `
@@ -6696,7 +8047,9 @@ function renderIRP5HTML(emp, irp){
         ${irp.medical4005 ? `<tr><td>4005</td><td>Medical Aid Contributions</td><td style="text-align:right;">${fmt(irp.medical4005)}</td></tr>` : ''}
         ${irp.medicalCredit4116 ? `<tr><td>4116</td><td>Medical Scheme Fees Tax Credit</td><td style="text-align:right;">${fmt(irp.medicalCredit4116)}</td></tr>` : ''}
         <tr><td>4102</td><td>PAYE (Employees' Tax Deducted)</td><td style="text-align:right;">${fmt(irp.paye4102)}</td></tr>
-        <tr><td>4141</td><td>UIF Contribution (employee)</td><td style="text-align:right;">${fmt(irp.uif4141)}</td></tr>
+        <tr><td>4141</td><td>UIF Contributions (employee and employer)</td><td style="text-align:right;">${fmt(irp.uif4141)}</td></tr>
+        ${irp.sdl4142 ? `<tr><td>4142</td><td>SDL Contribution</td><td style="text-align:right;">${fmt(irp.sdl4142)}</td></tr>` : ''}
+        <tr style="font-weight:600;"><td>4149</td><td>Total Tax, SDL and UIF</td><td style="text-align:right;">${fmt(irp.total4149)}</td></tr>
       </tbody></table>
       <div style="text-align:right;margin-top:10px;font-size:.95rem;">
         <div>Gross Remuneration: ${fmt(irp.grossRemuneration)}</div>
@@ -6855,6 +8208,8 @@ function buildEasyFileCSV(taxYearLabel, employeeResults){
     if(irp.medicalCredit4116) lines.push(csvAmount('4116', irp.medicalCredit4116));
     lines.push(csvAmount('4102', irp.paye4102));
     lines.push(csvAmount('4141', irp.uif4141));
+    if(irp.sdl4142) lines.push(csvAmount('4142', irp.sdl4142));
+    lines.push(csvAmount('4149', irp.total4149));
   });
   lines.push('9999');
   return lines.join('\r\n') + '\r\n';
@@ -6998,6 +8353,7 @@ function renderPayroll(){
       <button class="btn" id="open-easyfile-btn">Check &amp; Export IRP5s</button>
     </div>` : ''}
     ${isAdmin() ? renderEmp201Panel() : ''}
+    ${isAdmin() ? renderEmp501Panel() : ''}
     ${isAdmin() ? renderCoidaPanel() : ''}
     <div class="panel">
       <h3 style="margin-top:0;">Employees</h3>
@@ -7184,6 +8540,7 @@ function resetEmployeeForm(){
   document.getElementById('employee-submit').textContent = 'Save';
 }
 function attachPayrollHandlers(){
+  attachEmp501Handlers();
   const empBackdrop = document.getElementById('employee-modal-backdrop');
   document.getElementById('add-employee-btn')?.addEventListener('click', ()=>{
     resetEmployeeForm();
@@ -8787,6 +10144,10 @@ function computeHealthCheckImpl(){
   add('tax-provision', 'Tax & year-end', `Income tax recognised for the year ended ${lastFy.end}`, (lastPl.profitBeforeTax > 0.005 && !provisioned) ? 'warn' : 'ok',
     (lastPl.profitBeforeTax > 0.005 && !provisioned) ? `Profit before tax was ${money(lastPl.profitBeforeTax)} but no tax expense or provision journal exists for that year.` : (lastPl.profitBeforeTax > 0.005 ? 'Tax is recognised.' : 'No taxable profit in that year.'), {view:'reports', tab:'companytax'});
 
+  const empIssues = emp201HealthIssues(today);
+  add('emp201', 'Tax & year-end', 'Monthly EMP201s submitted and matching the payslips', empIssues.length ? 'warn' : 'ok',
+    empIssues.length ? empIssues.slice(0, 4).join('; ') + (empIssues.length > 4 ? ` and ${empIssues.length - 4} more` : '') + '.' : 'All EMP201s for completed months are in and agree.', {view:'payroll'});
+
   // --- Operations ---
   const staleTx = (state.bankTransactions||[]).filter(t=>t.status==='unmatched' && t.tx_date && daysBetween(t.tx_date, today) > 30);
   add('bank-old', 'Operations', 'Bank lines are being reconciled', staleTx.length ? 'warn' : 'ok',
@@ -9686,9 +11047,13 @@ function renderSettingsCompanyDetails(){
         ${state.company.locked_through_date ? `<button type="button" class="btn small secondary" id="period-lock-clear">Clear lock</button>` : ''}
       </form>
     </div>
+    ${renderReminderSettingsPanel()}
+    ${renderPaymentSettingsPanel()}
   `;
 }
 function attachSettingsHandlers(){
+  attachReminderSettingsHandlers();
+  attachPaymentSettingsHandlers();
   document.querySelectorAll('[data-settings-tab]').forEach(btn=>{
     btn.addEventListener('click', ()=>{ state.settingsTab = btn.dataset.settingsTab; render(); });
   });
