@@ -6,6 +6,7 @@
 <title>Company Compass</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'%3E%3Crect width='120' height='120' rx='26' fill='%230FB981'/%3E%3Ccircle cx='60' cy='60' r='46' stroke='%23FAF9F5' stroke-width='7'/%3E%3Cpolygon points='60,20 82,60 60,60' fill='%23FAF9F5'/%3E%3Cpolygon points='60,100 38,60 60,60' fill='%237C5CFF'/%3E%3Ccircle cx='60' cy='60' r='8' fill='%230FB981' stroke='%23FAF9F5' stroke-width='3'/%3E%3C/svg%3E">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script id="chartjs-lib" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js" integrity="sha384-dug+JxfBvklEQdJ4AYuBBAIScUz0bVN73xpy273gcAwHjb3qI0fXmuYNaNfdyYJG" crossorigin="anonymous" defer></script>
 <style>
   :root{
     color-scheme: light;
@@ -87,6 +88,15 @@
   .auth-box .btn{width:100%;padding:11px 16px;font-size:.95rem;}
   .auth-toggle{text-align:center;margin-top:18px;font-size:.85rem;color:var(--muted);}
   .auth-error{color:var(--danger);font-size:.85rem;min-height:18px;}
+  .auth-note{color:var(--accent2);font-size:.85rem;line-height:1.4;}
+  .auth-note:empty{display:none;}
+  .chart-wrap{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:20px;box-shadow:var(--shadow);}
+  .chart-box{position:relative;height:240px;}
+  .chart-empty{height:120px;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--muted);font-size:.88rem;padding:0 12px;}
+  .chart-figures{margin-top:8px;font-size:.82rem;}
+  .chart-figures summary{cursor:pointer;color:var(--muted);}
+  .chart-figures table{margin-top:6px;}
+  .auth-forgot{display:block;text-align:right;font-size:.8rem;margin-top:-4px;color:var(--muted);}
 
   /* App shell */
   #app-shell{display:none;min-height:100vh;}
@@ -219,19 +229,24 @@
       <p class="tagline" id="auth-tagline">Good to see you — let's get your numbers sorted.</p>
       <a href="./intro-video.mp4" target="_blank" rel="noopener" class="intro-video-link">Watch a 60-second intro</a>
       <form id="auth-form">
-        <input type="email" id="auth-email" placeholder="Email" required>
-        <div class="auth-field has-toggle">
-          <input type="password" id="auth-password" placeholder="Password (min 8 characters)" minlength="8" required>
+        <input type="email" id="auth-email" placeholder="Email" required autocomplete="email">
+        <div class="auth-field has-toggle" id="auth-password-wrap">
+          <input type="password" id="auth-password" placeholder="Password (min 8 characters)" minlength="8" required autocomplete="current-password">
           <button type="button" class="pw-toggle" id="auth-pw-toggle">SHOW</button>
         </div>
+        <div id="auth-password2-wrap" class="hidden">
+          <input type="password" id="auth-password2" placeholder="Repeat the new password" minlength="8" autocomplete="new-password">
+        </div>
+        <a href="#" id="auth-forgot-link" class="auth-forgot">Forgot your password?</a>
         <div id="signup-fields" class="hidden" style="display:flex;flex-direction:column;gap:10px;">
           <input type="text" id="auth-company-name" placeholder="Company name">
           <input type="text" id="auth-vat-number" placeholder="VAT number (optional)">
         </div>
         <div class="auth-error" id="auth-error"></div>
+        <div class="auth-note" id="auth-note"></div>
         <button type="submit" class="btn" id="auth-submit">Log In</button>
       </form>
-      <div class="auth-toggle">
+      <div class="auth-toggle" id="auth-toggle-row">
         <span id="auth-toggle-text">Don't have an account?</span>
         <a href="#" id="auth-toggle-link">Sign up</a>
       </div>
@@ -566,6 +581,7 @@ function computeStatutorySummary(){
 /* ========================= THEME (light / dark) =========================
    Defaults to the OS/browser's light-or-dark setting; a manual toggle
    overrides it and is remembered per browser in localStorage. */
+let chartsReady = false;
 function getStoredTheme(){
   try{ return localStorage.getItem('cc_theme'); }catch(e){ return null; }
 }
@@ -589,6 +605,7 @@ function applyTheme(theme){
   }
   const label = currentEffectiveTheme() === 'dark' ? 'Light mode' : 'Dark mode';
   document.querySelectorAll('.theme-toggle-btn, #theme-toggle-global').forEach(b=>{ b.textContent = label; });
+  if(chartsReady) redrawCharts();   // the theme is first applied before the chart code below has loaded
 }
 function toggleTheme(){
   const next = currentEffectiveTheme() === 'dark' ? 'light' : 'dark';
@@ -603,14 +620,83 @@ if(window.matchMedia){
   else if(mq.addListener) mq.addListener(onSystemChange);
 }
 
+// A password-reset link lands here with "type=recovery" in the address; note it before supabase-js reads
+// and clears it, so the app asks for the new password instead of just opening.
+const _loc = window.location || {};
+let passwordRecovery = /(^|[#&?])type=recovery(&|$)/.test(_loc.hash || '') || /(^|[?&])type=recovery(&|$)/.test(_loc.search || '');
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+/* ========================= CHARTS (Chart.js) =========================
+   Chart.js loads after the page (defer); a chart asked for before it arrives is drawn when it lands.
+   Colours: green = money in / what the business owns, orange = money out / what it owes, violet = what is
+   left for the owner. Checked for colour-blind separation and contrast on both the light and dark panels. */
+const CHART_SERIES = {
+  light: {inflow:'#0b9e6e', outflow:'#e8590c', owner:'#7c5cff'},
+  dark:  {inflow:'#0b9e6e', outflow:'#e8590c', owner:'#8f74ff'},
+};
 const chartInstances = {};
-function makeChart(canvasId, config){
+const chartBuilders = {};
+chartsReady = true;
+function chartTheme(){
+  let css = null;
+  try{ css = getComputedStyle(document.documentElement); }catch(e){ /* no styles available (e.g. tests): use the light defaults */ }
+  const v = (name, fallback) => (css && (css.getPropertyValue(name) || '').trim()) || fallback;
+  const mode = typeof currentEffectiveTheme === 'function' ? currentEffectiveTheme() : 'light';
+  return {mode, series: CHART_SERIES[mode] || CHART_SERIES.light, text: v('--muted', '#797e91'), strong: v('--text', '#191a23'), grid: v('--border', '#edecf5'), panel: v('--panel', '#ffffff')};
+}
+function chartMoneyTick(v){
+  const n = Math.abs(v), sign = v < 0 ? '-' : '';
+  const short = (x, d) => x.toFixed(d).replace(/\.0$/, '');
+  if(n >= 1e6) return sign + 'R' + short(n/1e6, n >= 1e7 ? 0 : 1) + 'm';
+  if(n >= 1e3) return sign + 'R' + short(n/1e3, n >= 1e4 ? 0 : 1) + 'k';
+  return sign + 'R' + Math.round(n);
+}
+// Shared look: thin bars with rounded data ends, recessive grid, muted axis text, currency tooltips.
+function chartBaseOptions(t, extra){
+  const axisMoney = {grid:{color:t.grid, drawTicks:false}, border:{display:false}, ticks:{color:t.text, padding:6, callback:(v)=>chartMoneyTick(v)}};
+  const axisCat = {grid:{display:false}, border:{color:t.grid}, ticks:{color:t.text}};
+  const horizontal = extra && extra.indexAxis === 'y';
+  return Object.assign({
+    responsive:true, maintainAspectRatio:false, animation:{duration:250},
+    interaction:{mode:'index', intersect:false},
+    scales: horizontal ? {x:{...axisMoney, beginAtZero:true}, y:axisCat} : {x:axisCat, y:{...axisMoney, beginAtZero:true}},
+    plugins:{
+      legend:{labels:{color:t.text, boxWidth:12, boxHeight:12, useBorderRadius:true, borderRadius:3}},
+      tooltip:{backgroundColor:t.panel, titleColor:t.strong, bodyColor:t.strong, borderColor:t.grid, borderWidth:1, padding:10, boxPadding:4,
+        callbacks:{label:(ctx)=>{ const val = horizontal ? ctx.parsed.x : ctx.parsed.y; return val == null ? null : ` ${ctx.dataset.label ? ctx.dataset.label + ': ' : ''}${fmt(val)}`; }}},
+    },
+  }, extra || {});
+}
+const CHART_BAR = {borderRadius:4, borderSkipped:'start', maxBarThickness:34, categoryPercentage:0.7, barPercentage:0.9};
+// builder(theme) returns a Chart.js config; kept so the chart can be redrawn in the new colours on a theme switch.
+function makeChart(canvasId, builder){
   const canvas = document.getElementById(canvasId);
-  if(!canvas || typeof Chart === 'undefined') return;
+  if(!canvas) return;
+  chartBuilders[canvasId] = builder;
+  if(typeof Chart === 'undefined'){
+    const lib = document.getElementById('chartjs-lib');
+    if(lib && !lib.dataset.waiting){ lib.dataset.waiting = '1'; lib.addEventListener('load', ()=>{ Object.keys(chartBuilders).forEach(id=>makeChart(id, chartBuilders[id])); }, {once:true}); }
+    return;
+  }
   if(chartInstances[canvasId]){ chartInstances[canvasId].destroy(); delete chartInstances[canvasId]; }
+  const config = typeof builder === 'function' ? builder(chartTheme()) : builder;
   chartInstances[canvasId] = new Chart(canvas.getContext('2d'), config);
+}
+function redrawCharts(){
+  Object.keys(chartBuilders).forEach(id=>{
+    if(!document.getElementById(id)){ if(chartInstances[id]){ chartInstances[id].destroy(); delete chartInstances[id]; } delete chartBuilders[id]; return; }
+    makeChart(id, chartBuilders[id]);
+  });
+}
+// Canvas + a "show the figures" table, or a short message when there is nothing to draw yet.
+function chartBlock(canvasId, label, rows, emptyText){
+  const hasData = rows.some(r=>r.values.some(v=>Math.abs(Number(v)||0) > 0.004));
+  if(!hasData) return `<div class="chart-empty">${emptyText}</div>`;
+  const heads = rows[0].heads;
+  return `<div class="chart-box"><canvas id="${canvasId}" role="img" aria-label="${escHtml(label)}"></canvas></div>
+    <details class="chart-figures"><summary>Show the figures</summary><table><thead><tr><th></th>${heads.map(h=>`<th style="text-align:right;">${escHtml(h)}</th>`).join('')}</tr></thead><tbody>
+      ${rows.map(r=>`<tr><td>${escHtml(r.label)}</td>${r.values.map(v=>`<td style="text-align:right;">${fmt(v)}</td>`).join('')}</tr>`).join('')}
+    </tbody></table></details>`;
 }
 function last6MonthsRange(){
   const now = new Date();
@@ -985,16 +1071,46 @@ function moduleLabel(k){ return MODULE_LABELS[k] || k; }
 /* ========================= AUTH ========================= */
 let authMode = 'login';
 
+// Four screens share the one auth box: log in, sign up, "forgot password" (email a reset link) and
+// "choose a new password" (after following that link — Supabase signs the user in with a recovery session).
+const AUTH_MODES = {
+  login:       {heading:'Welcome back', tagline:'Good to see you — let\'s get your numbers sorted.', submit:'Log In', toggleText:"Don't have an account?", toggleLink:'Sign up'},
+  signup:      {heading:'Let\'s get set up', tagline:'A couple of details and your dashboard is ready.', submit:'Sign Up', toggleText:'Already have an account?', toggleLink:'Log in'},
+  forgot:      {heading:'Reset your password', tagline:'Enter your email and we\'ll send you a link to choose a new password.', submit:'Send reset link', toggleText:'Remembered it?', toggleLink:'Back to log in'},
+  newpassword: {heading:'Choose a new password', tagline:'Pick a new password for your account (at least 8 characters).', submit:'Save new password', toggleText:'', toggleLink:''},
+};
+function setAuthMode(mode){
+  authMode = mode;
+  const m = AUTH_MODES[mode];
+  const $ = id => document.getElementById(id);
+  $('signup-fields').classList.toggle('hidden', mode !== 'signup');
+  $('auth-email').classList.toggle('hidden', mode === 'newpassword');
+  $('auth-email').required = mode !== 'newpassword';
+  $('auth-password-wrap').classList.toggle('hidden', mode === 'forgot');
+  $('auth-password').required = mode !== 'forgot';
+  $('auth-password').placeholder = mode === 'newpassword' ? 'New password (min 8 characters)' : 'Password (min 8 characters)';
+  $('auth-password').autocomplete = mode === 'login' ? 'current-password' : 'new-password';
+  $('auth-password2-wrap').classList.toggle('hidden', mode !== 'newpassword');
+  $('auth-password2').required = mode === 'newpassword';
+  $('auth-forgot-link').classList.toggle('hidden', mode !== 'login');
+  $('auth-submit').textContent = m.submit;
+  $('auth-submit').disabled = false;
+  $('auth-heading').textContent = m.heading;
+  $('auth-tagline').textContent = m.tagline;
+  $('auth-toggle-row').classList.toggle('hidden', mode === 'newpassword');
+  $('auth-toggle-text').textContent = m.toggleText;
+  $('auth-toggle-link').textContent = m.toggleLink;
+  $('auth-error').textContent = '';
+  $('auth-note').textContent = '';
+}
 document.getElementById('auth-toggle-link').addEventListener('click', (e)=>{
   e.preventDefault();
-  authMode = authMode === 'login' ? 'signup' : 'login';
-  document.getElementById('signup-fields').classList.toggle('hidden', authMode === 'login');
-  document.getElementById('auth-submit').textContent = authMode === 'login' ? 'Log In' : 'Sign Up';
-  document.getElementById('auth-heading').textContent = authMode === 'login' ? 'Welcome back' : 'Let\'s get set up';
-  document.getElementById('auth-tagline').textContent = authMode === 'login' ? 'Good to see you — let\'s get your numbers sorted.' : 'A couple of details and your dashboard is ready.';
-  document.getElementById('auth-toggle-text').textContent = authMode === 'login' ? "Don't have an account?" : 'Already have an account?';
-  document.getElementById('auth-toggle-link').textContent = authMode === 'login' ? 'Sign up' : 'Log in';
-  document.getElementById('auth-error').textContent = '';
+  setAuthMode(authMode === 'login' ? 'signup' : 'login');
+});
+document.getElementById('auth-forgot-link').addEventListener('click', (e)=>{
+  e.preventDefault();
+  setAuthMode('forgot');
+  document.getElementById('auth-email').focus();
 });
 
 document.getElementById('theme-toggle-global').addEventListener('click', toggleTheme);
@@ -1013,6 +1129,8 @@ document.getElementById('auth-form').addEventListener('submit', async (e)=>{
   const password = document.getElementById('auth-password').value;
   const errEl = document.getElementById('auth-error');
   errEl.textContent = '';
+  if(authMode === 'forgot') return sendPasswordReset(email);
+  if(authMode === 'newpassword') return saveNewPassword(password, document.getElementById('auth-password2').value);
   try{
     if(authMode === 'login'){
       const {error} = await sb.auth.signInWithPassword({email, password});
@@ -1033,6 +1151,53 @@ document.getElementById('auth-form').addEventListener('submit', async (e)=>{
 });
 
 let pendingSignup = null;
+
+// Supabase only sends the reset link to addresses that have an account, and says "ok" either way, so the
+// message never reveals whether an email is registered. The link comes back to this page.
+async function sendPasswordReset(email){
+  const btn = document.getElementById('auth-submit');
+  const note = document.getElementById('auth-note'), errEl = document.getElementById('auth-error');
+  if(!email){ errEl.textContent = 'Enter your email address.'; return; }
+  btn.disabled = true; btn.textContent = 'Sending…';
+  const {error} = await sb.auth.resetPasswordForEmail(email, {redirectTo: appBaseUrl()});
+  if(error){
+    btn.disabled = false; btn.textContent = AUTH_MODES.forgot.submit;
+    errEl.textContent = /rate limit|too many|seconds/i.test(error.message || '') ? 'Too many reset requests — please wait a few minutes and try again.' : (error.message || 'Could not send the reset email.');
+    return;
+  }
+  note.textContent = `If there is an account for ${email}, a reset link is on its way. Check your inbox (and spam folder); the link works once and expires after an hour.`;
+  btn.textContent = 'Link sent';
+  setTimeout(()=>{ if(authMode === 'forgot'){ btn.disabled = false; btn.textContent = 'Send again'; } }, 60000);
+}
+async function saveNewPassword(pw, pw2){
+  const btn = document.getElementById('auth-submit'), errEl = document.getElementById('auth-error');
+  if((pw||'').length < 8){ errEl.textContent = 'Use at least 8 characters.'; return; }
+  if(pw !== pw2){ errEl.textContent = 'The two passwords do not match.'; return; }
+  btn.disabled = true; btn.textContent = 'Saving…';
+  const {error} = await sb.auth.updateUser({password: pw});
+  if(error){
+    btn.disabled = false; btn.textContent = AUTH_MODES.newpassword.submit;
+    if(/session|expired|invalid|jwt/i.test(error.message || '')){
+      passwordRecovery = false;
+      setAuthMode('forgot');
+      document.getElementById('auth-error').textContent = 'This reset link has expired or was already used. Send yourself a new one.';
+    } else errEl.textContent = error.message || 'Could not save the new password.';
+    return;
+  }
+  passwordRecovery = false;
+  document.getElementById('auth-password').value = ''; document.getElementById('auth-password2').value = '';
+  toast('Password updated — you are signed in.');
+  // Start the app fresh on a clean URL (the recovery token is gone from it).
+  setTimeout(()=>window.location.replace(appBaseUrl()), 600);
+}
+function appBaseUrl(){ return window.location.href.split('#')[0].split('?')[0]; }
+function showNewPasswordScreen(){
+  document.getElementById('app-shell').classList.remove('active');
+  document.getElementById('auth-screen').style.display = 'flex';
+  if(authMode === 'newpassword') return;   // already showing (e.g. a token refresh fired again)
+  setAuthMode('newpassword');
+  document.getElementById('auth-password').focus();
+}
 
 document.getElementById('logout-btn').addEventListener('click', async ()=>{
   await sb.auth.signOut();
@@ -1109,6 +1274,8 @@ document.getElementById('attachments-modal-close')?.addEventListener('click', ()
 
 
 sb.auth.onAuthStateChange((event, session)=>{
+  if(event === 'PASSWORD_RECOVERY') passwordRecovery = true;
+  if(passwordRecovery && session && session.user){ showNewPasswordScreen(); return; }
   if(session && session.user){
     onAuthReady(session.user);
   } else {
@@ -3966,21 +4133,30 @@ function attachDashboardHandlers(){
   attachApprovalHandlers();
   document.getElementById('dashboard-bankfeed-btn')?.addEventListener('click', ()=>goToView('bankfeed'));
   document.getElementById('dashboard-health-btn')?.addEventListener('click', ()=>{ state.reportsTab = 'health'; goToView('reports'); });
-  const months = last6MonthsRange();
-  const monthPL = withLedgerMemo(()=>months.map(m=>computePL(m.start, m.end)));
-  const revenueData = monthPL.map(pl=>pl.revenue);
-  const expenseData = monthPL.map(pl=>round2(pl.cos + pl.totalOpex));
-  makeChart('dashboard-trend-chart', {
+  const d = dashboardTrendData();
+  makeChart('dashboard-trend-chart', t => ({
     type: 'bar',
     data: {
-      labels: months.map(m=>m.label),
+      labels: d.labels,
       datasets: [
-        {label:'Revenue', data: revenueData, backgroundColor: '#0fb981'},
-        {label:'Expenses', data: expenseData, backgroundColor: '#f4406a'}
+        {label:'Revenue', data: d.revenue, backgroundColor: t.series.inflow, ...CHART_BAR},
+        {label:'Expenses', data: d.expenses, backgroundColor: t.series.outflow, ...CHART_BAR},
       ]
     },
-    options: {responsive:true, maintainAspectRatio:false, scales:{y:{beginAtZero:true}}}
-  });
+    options: chartBaseOptions(t),
+  }));
+}
+// Revenue and expenses (excl. VAT, from the ledger — the same figures as the P&L) for the last 6 months.
+function dashboardTrendData(){
+  const months = last6MonthsRange();
+  const monthPL = withLedgerMemo(()=>months.map(m=>computePL(m.start, m.end)));
+  return {labels: months.map(m=>m.label), revenue: monthPL.map(pl=>pl.revenue), expenses: monthPL.map(pl=>round2(pl.cos + pl.totalOpex))};
+}
+function dashboardTrendBlock(){
+  const d = dashboardTrendData();
+  return chartBlock('dashboard-trend-chart', 'Bar chart of revenue and expenses for each of the last 6 months',
+    [{label:'Revenue', heads:d.labels, values:d.revenue}, {label:'Expenses', heads:d.labels, values:d.expenses}],
+    'No revenue or expenses in the last 6 months yet — the chart appears once you start capturing them.');
 }
 
 /* ========================= CALCULATIONS ========================= */
@@ -4089,7 +4265,7 @@ function renderDashboard(){
     </div>
     <div class="chart-wrap">
       <h3 style="margin-top:0;">Revenue vs Expenses — last 6 months</h3>
-      <canvas id="dashboard-trend-chart" style="height:220px;"></canvas>
+      ${dashboardTrendBlock()}
     </div>
     <div class="panel">
       <h3 style="margin-top:0;">Outstanding invoices</h3>
@@ -9567,7 +9743,7 @@ function renderPL(pl, prior){
   return `
   <div class="chart-wrap">
     <h3 style="margin-top:0;">P&amp;L breakdown</h3>
-    <canvas id="pl-chart" style="height:220px;"></canvas>
+    ${chartBlock('pl-chart', 'Bar chart of revenue, costs and net profit for the period', [{label:'Amount', heads:PL_CHART_LABELS, values:plChartValues(pl)}], 'Nothing in the Profit &amp; Loss for this period yet.')}
   </div>
   <div class="panel">
     <table class="report-table">${cmp ? `<thead><tr><th></th><th style="text-align:right;">${pl.start} to ${pl.end}</th><th style="text-align:right;">${prior.start} to ${prior.end}</th><th style="text-align:right;">Variance</th><th style="text-align:right;">%</th></tr></thead>` : ''}<tbody>
@@ -9599,8 +9775,8 @@ function renderBS(bs, prior){
   const curEquity = label => { const l = (bs.equityLines||[]).find(x=>x.label===label); return l ? l.amount : 0; };
   return `
   <div class="chart-wrap">
-    <h3 style="margin-top:0;">Assets vs Liabilities vs Equity</h3>
-    <canvas id="bs-chart" style="height:220px;"></canvas>
+    <h3 style="margin-top:0;">Assets = Liabilities + Equity</h3>
+    ${chartBlock('bs-chart', 'Bar chart comparing total assets with liabilities plus equity', [{label:'Total assets', heads:['Amount'], values:[bs.totalAssets]}, {label:'Total liabilities', heads:['Amount'], values:[bs.totalLiabilities]}, {label:"Owner's equity", heads:['Amount'], values:[bs.equity]}], 'Nothing on the Balance Sheet at this date yet.')}
   </div>
   <div class="grid">
     <div class="card" style="--accent-c:var(--c-assets);"><h3>Total Assets</h3><div class="value">${fmt(bs.totalAssets)}</div></div>
@@ -10417,32 +10593,51 @@ function renderCompanyTax(){
   `;
 }
 
+// Costs are shown as positive bars (how much went out); net profit goes below the line when it is a loss.
+const PL_CHART_LABELS = ['Revenue', 'Cost of sales', 'Operating expenses', 'Payroll', 'Net profit'];
+function plChartValues(pl){ return [pl.revenue, pl.cos, pl.opex, pl.payrollCost, pl.netProfit]; }
+const BS_CHART_LABELS = ['What the business owns', 'How it is funded'];
 function attachReportsHandlers(){
   const period = currentPeriod();
   if(state.reportsTab==='pl' || !state.reportsTab){
     const pl = computePL(period.start, period.end);
-    makeChart('pl-chart', {
-      type: 'bar',
-      data: {
-        labels: ['Revenue','Cost of Sales','Operating Exp.','Payroll','Net Profit'],
-        datasets: [{
-          label: 'Amount',
-          data: [pl.revenue, -pl.cos, -pl.opex, -pl.payrollCost, pl.netProfit],
-          backgroundColor: ['#0fb981','#f4406a','#f4406a','#f4406a', pl.netProfit<0?'#f4406a':'#7c5cff']
-        }]
-      },
-      options: {responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}}
+    makeChart('pl-chart', t => {
+      const o = chartBaseOptions(t);
+      o.plugins.legend = {display:false};
+      return {
+        type: 'bar',
+        data: {
+          labels: PL_CHART_LABELS,
+          datasets: [{
+            label: '',
+            data: plChartValues(pl),
+            // money in, the three kinds of cost, then what is left (below the line when it is a loss)
+            backgroundColor: [t.series.inflow, t.series.outflow, t.series.outflow, t.series.outflow, t.series.owner],
+            ...CHART_BAR,
+          }]
+        },
+        options: o,
+      };
     });
   }
   if(state.reportsTab==='bs'){
     const bs = computeBS(period.end);
-    makeChart('bs-chart', {
-      type: 'doughnut',
-      data: {
-        labels: ['Total Assets','Total Liabilities',"Owner's Equity"],
-        datasets: [{data: [bs.totalAssets, bs.totalLiabilities, Math.max(0,bs.equity)], backgroundColor: ['#0fb981','#f4406a','#7c5cff']}]
-      },
-      options: {responsive:true, maintainAspectRatio:false}
+    makeChart('bs-chart', t => {
+      const o = chartBaseOptions(t, {indexAxis:'y'});
+      o.scales.x.stacked = true; o.scales.y.stacked = true;
+      const seg = {borderRadius:4, borderSkipped:false, maxBarThickness:42, categoryPercentage:0.8, barPercentage:0.9, borderColor:t.panel, borderWidth:{right:2}};
+      return {
+        type: 'bar',
+        data: {
+          labels: BS_CHART_LABELS,
+          datasets: [
+            {label:'Assets', data:[bs.totalAssets, null], backgroundColor:t.series.inflow, ...seg},
+            {label:'Liabilities', data:[null, bs.totalLiabilities], backgroundColor:t.series.outflow, ...seg},
+            {label:"Owner's equity", data:[null, bs.equity], backgroundColor:t.series.owner, ...seg},
+          ]
+        },
+        options: o,
+      };
     });
   }
   document.getElementById('gl-account-select')?.addEventListener('change', (e)=>{ state.glAccount = e.target.value; render(); });
