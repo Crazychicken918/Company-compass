@@ -266,7 +266,7 @@
         </div>
         <a href="#" id="auth-forgot-link" class="auth-forgot">Forgot your password?</a>
         <div id="signup-fields" class="hidden" style="display:flex;flex-direction:column;gap:10px;">
-          <input type="text" id="auth-company-name" placeholder="Company name">
+          <input type="text" id="auth-company-name" placeholder="Company name (leave blank if you were invited)">
           <input type="text" id="auth-vat-number" placeholder="VAT number (optional)">
         </div>
         <div class="auth-error" id="auth-error"></div>
@@ -296,6 +296,7 @@
       Company Compass
     </h2>
     <div class="company-name" id="sidebar-company-name">Loading…</div>
+    <div class="hidden" id="sidebar-company-switch" style="margin:-10px 8px 16px;"></div>
     <nav id="nav">
       <button data-view="dashboard" class="active"><span class="dot"></span>Dashboard</button>
       <div class="nav-group" data-nav-group="accounting">
@@ -1136,6 +1137,13 @@ document.getElementById('auth-toggle-link').addEventListener('click', (e)=>{
 });
 // "Start free" on the home page links to app?signup=1.
 if(/[?&]signup=1(&|$)/.test(_loc.search || '')) setAuthMode('signup');
+// Team invite emails link to app?invite=1: sign up (or log in) with the invited address, no company needed.
+if(/[?&]invite=1(&|$)/.test(_loc.search || '')){
+  setAuthMode('signup');
+  document.getElementById('signup-fields').classList.add('hidden');
+  document.getElementById('auth-heading').textContent = 'Join your team';
+  document.getElementById('auth-tagline').textContent = 'Create your login with the email address the invite was sent to. Already have an account? Log in instead.';
+}
 document.getElementById('auth-forgot-link').addEventListener('click', (e)=>{
   e.preventDefault();
   setAuthMode('forgot');
@@ -1167,17 +1175,17 @@ document.getElementById('auth-form').addEventListener('submit', async (e)=>{
     } else {
       const companyName = document.getElementById('auth-company-name').value.trim();
       const vatNumber = document.getElementById('auth-vat-number').value.trim();
-      if(!companyName){ errEl.textContent = 'Company name is required.'; return; }
-      try{ localStorage.setItem('cc_pending_signup_'+email, JSON.stringify({companyName, vatNumber})); }catch(e){}
+      // No company name = joining a team they were invited to (the invite links up after sign-in).
+      if(companyName) try{ localStorage.setItem('cc_pending_signup_'+email, JSON.stringify({companyName, vatNumber})); }catch(e){}
       // The company details also ride along on the account itself, so confirming the email on another
       // device (where this browser's storage isn't available) still sets the company up.
-      const {data, error} = await sb.auth.signUp({email, password, options:{emailRedirectTo: appBaseUrl(), data:{company_name: companyName, vat_number: vatNumber || null}}});
+      const {data, error} = await sb.auth.signUp({email, password, options:{emailRedirectTo: appBaseUrl(), data: companyName ? {company_name: companyName, vat_number: vatNumber || null} : {}}});
       if(error) throw error;
       // Company + membership are created once the session is confirmed (see onAuthReady)
-      pendingSignup = {companyName, vatNumber};
+      pendingSignup = companyName ? {companyName, vatNumber} : null;
       if(!data || !data.session){
         // Email confirmation is switched on: nothing more happens on this screen until the link is clicked.
-        document.getElementById('auth-note').textContent = `Almost there. We've sent a confirmation link to ${email}. Open it to finish setting up ${companyName}. (Check your spam folder if it isn't there in a few minutes.)`;
+        document.getElementById('auth-note').textContent = `Almost there. We've sent a confirmation link to ${email}. Open it to finish ${companyName ? 'setting up ' + companyName : 'joining your team'}. (Check your spam folder if it isn't there in a few minutes.)`;
         document.getElementById('auth-submit').disabled = true;
         document.getElementById('auth-submit').textContent = 'Check your email';
       }
@@ -1318,11 +1326,13 @@ async function onAuthReady(user){
     }
   }
 
-  // Link any pending invite for this email
-  await sb.from('cc_company_members')
-    .update({user_id: user.id, status: 'active'})
-    .eq('email', user.email)
-    .eq('status', 'pending');
+  // Link any pending invites for this email (cc_accept_invites checks the address is confirmed).
+  state.joinedCompanyIds = [];
+  try{
+    const {data: pending} = await sb.from('cc_company_members').select('company_id').eq('status', 'pending').eq('email', String(user.email || '').toLowerCase());
+    const {data: joined, error: jErr} = await sb.rpc('cc_accept_invites');
+    if(!jErr && joined > 0) state.joinedCompanyIds = (pending || []).map(p=>p.company_id);
+  }catch(e){ console.error(e); }
 
   await loadCompany();
 }
@@ -1330,7 +1340,7 @@ async function onAuthReady(user){
 /* ========================= DATA LOADING ========================= */
 async function loadCompany(){
   const {data: memberships} = await sb.from('cc_company_members')
-    .select('*').eq('user_id', state.user.id).eq('status', 'active').limit(1);
+    .select('*').eq('user_id', state.user.id).eq('status', 'active');
 
   if(!memberships || memberships.length === 0){
     document.getElementById('main').innerHTML = `<div class="panel" style="max-width:560px;"><h2>No company found</h2>
@@ -1350,10 +1360,14 @@ async function loadCompany(){
     });
     return;
   }
-  state.membership = memberships[0];
+  state.membership = pickMembership(memberships);
   const {data: company} = await sb.from('cc_companies').select('*').eq('id', state.membership.company_id).single();
   state.company = company;
+  rememberCompany(company.id);
   document.getElementById('sidebar-company-name').textContent = company.name + (isAdmin() ? '' : ' (' + roleLabel(state.membership).toLowerCase() + ')');
+  await renderCompanySwitcher(memberships);
+  const justJoined = (state.joinedCompanyIds || []).includes(company.id);
+  state.joinedCompanyIds = [];
 
   applyNavVisibility();
   if(!canSeeTab(state.view)) state.view = firstAllowedView();
@@ -1363,6 +1377,30 @@ async function loadCompany(){
   // Recurring invoices and bills that fell due since the app was last opened (this never ran before Wave 54).
   await runDueRecurringDocuments();
   render();
+  if(justJoined) toast(`Welcome — you've joined ${company.trading_as || company.name}.`);
+}
+// Someone in more than one company (their own, plus one they were invited to) works in one at a time:
+// the one they picked last, or the one they have just joined.
+function companyPrefKey(){ return 'cc_company_' + (state.user && state.user.id); }
+function rememberCompany(id){ try{ localStorage.setItem(companyPrefKey(), id); }catch(e){} }
+function pickMembership(list){
+  const joined = (state.joinedCompanyIds || []).map(id=>list.find(m=>m.company_id === id)).find(Boolean);
+  if(joined) return joined;
+  let pref = null; try{ pref = localStorage.getItem(companyPrefKey()); }catch(e){}
+  return list.find(m=>m.company_id === pref) || list[0];
+}
+async function renderCompanySwitcher(memberships){
+  const host = document.getElementById('sidebar-company-switch'); if(!host) return;
+  if(!memberships || memberships.length < 2){ host.innerHTML = ''; host.classList.add('hidden'); return; }
+  const {data: cos} = await sb.from('cc_companies').select('id,name,trading_as').in('id', memberships.map(m=>m.company_id));
+  const nameOf = id => { const c = (cos || []).find(x=>x.id === id); return c ? (c.trading_as || c.name) : 'Company'; };
+  host.classList.remove('hidden');
+  host.innerHTML = `<label for="company-switcher" style="display:block;font-size:.7rem;color:var(--muted);margin-bottom:2px;">Switch company</label><select id="company-switcher" style="width:100%;font-size:.8rem;">${memberships.map(m=>`<option value="${m.company_id}" ${m.company_id === state.company.id ? 'selected' : ''}>${escHtml(nameOf(m.company_id))}</option>`).join('')}</select>`;
+  document.getElementById('company-switcher').addEventListener('change', async e=>{
+    rememberCompany(e.target.value);
+    state.view = 'dashboard';
+    await loadCompany();
+  });
 }
 
 async function refreshAll(){
@@ -12183,9 +12221,10 @@ function renderTeam(){
     <p style="color:var(--muted);font-size:.85rem;margin-top:-10px;">Management (owner/admin) has full access everywhere. Staff members only see and edit the modules you grant them below; invoices and credit notes they create wait for approval unless they're also marked as an approver. Company details, data export, and the accounting period lock moved to the Settings tab.</p>
     <div class="panel">
       <h3 style="margin-top:0;">App access</h3>
+      ${inviteNoticeHtml()}
       <table><thead><tr><th>Email</th><th>Role &amp; permissions</th><th>Status</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>
-        ${state.members.map(m=>`<tr><td>${m.email}</td><td><span class="role-badge">${roleLabel(m)}</span></td><td>${m.status}</td>
-        ${isAdmin() && m.role!=='owner' ? `<td><button class="btn small secondary" data-edit-member="${m.id}">Manage</button> <button class="btn small danger" data-del-member="${m.id}">Remove</button></td>` : (isAdmin()?'<td></td>':'')}</tr>`).join('')}
+        ${state.members.map(m=>`<tr><td>${escHtml(m.email)}</td><td><span class="role-badge">${roleLabel(m)}</span></td><td>${m.status === 'pending' ? '<span class="status-pill status-pending">Invited</span><div style="font-size:.72rem;color:var(--muted);">joins when they sign up or log in with this email</div>' : '<span class="status-pill status-paid">Active</span>'}</td>
+        ${isAdmin() && m.role!=='owner' ? `<td>${m.status === 'pending' ? `<button class="btn small secondary" data-resend-invite="${m.id}">Resend invite</button> ` : ''}<button class="btn small secondary" data-edit-member="${m.id}">Manage</button> <button class="btn small danger" data-del-member="${m.id}">Remove</button></td>` : (isAdmin()?'<td></td>':'')}</tr>`).join('')}
       </tbody></table>
     </div>
     <div class="panel">
@@ -12202,7 +12241,7 @@ function renderTeam(){
     <div class="modal-backdrop hidden" id="member-modal-backdrop"><div class="modal">
       <button class="close-x" id="member-modal-close">✕</button>
       <h2 id="member-modal-title">Invite Member</h2>
-      <p style="font-size:.8rem;color:var(--muted);" id="member-modal-hint">Enter the email they'll sign up (or already have an account) with. They'll get access automatically next time they log in.</p>
+      <p style="font-size:.8rem;color:var(--muted);" id="member-modal-hint">We email them a link. They sign up (or log in) with this email address and join straight away.</p>
       <form id="member-form">
         <input type="hidden" id="member-edit-id">
         <div class="field"><label>Email</label><input type="email" id="member-email" required></div>
@@ -12271,13 +12310,53 @@ function resetMemberForm(){
   document.getElementById('member-restrict-tabs').checked = false;
   document.querySelectorAll('.member-tab').forEach(cb=>cb.checked=false);
   document.getElementById('member-modal-title').textContent = 'Invite Member';
-  document.getElementById('member-modal-hint').textContent = "Enter the email they'll sign up (or already have an account) with. They'll get access automatically next time they log in.";
+  document.getElementById('member-modal-hint').textContent = "We email them a link. They sign up (or log in) with this email address and join straight away.";
   document.getElementById('member-submit').textContent = 'Invite';
   toggleMemberPermFields();
   toggleMemberTabsBox();
 }
+function teamInviteLink(){ return appBaseUrl() + '?invite=1'; }
+function teamInviteEmailHtml(m){
+  const co = state.company, name = escHtml(co.trading_as || co.name), link = escHtml(teamInviteLink());
+  const role = m.role === 'admin' ? 'management (full access)' : m.role === 'viewer' ? 'a viewer (read-only)' : 'a team member';
+  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#222;">
+    <h2 style="margin:0 0 10px;">You're invited to join ${name}</h2>
+    <p>${escHtml(state.user.email)} has invited you to ${name} on Company Compass as ${role}.</p>
+    <p style="text-align:center;margin:22px 0;"><a href="${link}" style="display:inline-block;background:#7c5cff;color:#fff;text-decoration:none;font-weight:700;padding:12px 26px;border-radius:6px;">Accept the invite</a></p>
+    <p style="font-size:14px;"><strong>New to Company Compass?</strong> Sign up with this email address (${escHtml(m.email)}). You don't need to enter a company name.<br><strong>Already have an account?</strong> Just log in. ${name} will be in your company list.</p>
+    <p style="font-size:12px;color:#777;">If the button doesn't work, copy this link into your browser: ${link}</p>
+  </div>`;
+}
+// Emails the invite. If email isn't available (not set up, or the sending domain isn't verified yet), the
+// Team page shows the link to send them yourself; the invite still works either way.
+async function sendTeamInvite(m){
+  let failure = null;
+  try{
+    const {data, error} = await sb.functions.invoke('send-invoice-email', {body:{company_id: state.company.id, to: m.email, subject: `You're invited to join ${state.company.trading_as || state.company.name} on Company Compass`, html: teamInviteEmailHtml(m), reply_to: state.user.email, from_name: state.company.trading_as || state.company.name}});
+    if(error) failure = error.message || 'Could not send';
+    else if(data && data.error) failure = data.error === 'email_not_configured' ? 'email sending is not set up yet' : data.error;
+  }catch(err){ failure = err.message || 'Could not send'; }
+  state.inviteNotice = {email: m.email, sent: !failure, error: failure};
+  if(!failure) toast(`Invite emailed to ${m.email}.`);
+  return !failure;
+}
+function inviteNoticeHtml(){
+  const n = state.inviteNotice; if(!n || !isAdmin()) return '';
+  return `<div class="panel" style="margin:0 0 12px;border-top:3px solid ${n.sent ? 'var(--accent2)' : 'var(--warn)'};">
+    <p style="margin:0 0 6px;font-size:.88rem;">${n.sent ? `Invite emailed to <strong>${escHtml(n.email)}</strong>.` : `<strong>${escHtml(n.email)}</strong> is invited, but the email could not be sent (${escHtml(n.error)}). Send them this link yourself, by email or WhatsApp:`} They join as soon as they sign up or log in with that address.</p>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"><input type="text" readonly id="invite-link" value="${escHtml(teamInviteLink())}" style="flex:1;min-width:220px;font-size:.82rem;"><button type="button" class="btn small secondary" id="invite-link-copy">Copy link</button><button type="button" class="btn small secondary" id="invite-notice-close">Done</button></div>
+  </div>`;
+}
 function attachTeamHandlers(){
   const backdrop = document.getElementById('member-modal-backdrop');
+  document.getElementById('invite-link-copy')?.addEventListener('click', async ()=>{ const el = document.getElementById('invite-link'); const ok = await copyText(el.value); if(!ok) el.select && el.select(); toast(ok ? 'Link copied.' : 'Select the link and copy it.'); });
+  document.getElementById('invite-notice-close')?.addEventListener('click', ()=>{ state.inviteNotice = null; render(); });
+  document.querySelectorAll('[data-resend-invite]').forEach(btn=>btn.addEventListener('click', async ()=>{
+    const m = state.members.find(x=>x.id === btn.dataset.resendInvite); if(!m) return;
+    btn.disabled = true; btn.textContent = 'Sending…';
+    await sendTeamInvite(m);
+    render();
+  }));
   document.getElementById('add-member-btn')?.addEventListener('click', ()=>{
     resetMemberForm();
     backdrop.classList.remove('hidden');
@@ -12329,14 +12408,17 @@ function attachTeamHandlers(){
       if(error){ toast(error.message); return; }
       await refreshAll(); render(); toast('Member updated.');
     } else {
-      const {error} = await sb.from('cc_company_members').insert({
-        company_id: state.company.id,
-        email: document.getElementById('member-email').value.trim().toLowerCase(),
-        role, permissions, employee_id,
-        status: 'pending'
-      });
+      const email = document.getElementById('member-email').value.trim().toLowerCase();
+      if(state.members.some(m=>(m.email || '').toLowerCase() === email)){ toast(`${email} is already on your team.`); return; }
+      const {data: row, error} = await sb.from('cc_company_members').insert({
+        company_id: state.company.id, email, role, permissions, employee_id, status: 'pending'
+      }).select().single();
       if(error){ toast(error.message); return; }
-      await refreshAll(); render(); toast('Invited.');
+      await logActivity('create', 'member', row ? row.id : null, `Invited ${email} (${roleLabel({role, permissions})})`);
+      document.getElementById('member-modal-backdrop').classList.add('hidden');
+      await sendTeamInvite(row || {email, role, permissions});
+      await refreshAll(); render();
+      return;
     }
     document.getElementById('member-modal-backdrop').classList.add('hidden');
   });
