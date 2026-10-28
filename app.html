@@ -109,6 +109,9 @@
   .setup-label{font-weight:600;font-size:.92rem;}
   .setup-hint{font-size:.8rem;color:var(--muted);}
   .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;}
+  .header-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:flex-end;}
+  .export-btns{display:inline-flex;gap:8px;flex-wrap:wrap;}
+  @media print{ .export-btns, .header-actions{display:none !important;} }
   .auth-forgot{display:block;text-align:right;font-size:.8rem;margin-top:-4px;color:var(--muted);}
 
   /* App shell */
@@ -190,6 +193,15 @@
   .status-paid{background:#e3faf1;color:#0fb981;}
   .status-overdue{background:#fee9ee;color:var(--danger);}
   .status-pending{background:#fef3de;color:#c9860b;}
+  .status-approved{background:var(--accent-dim);color:var(--accent);}
+  .client-group-head{margin:14px 0 4px;font-size:.92rem;}
+  .color-swatch{width:30px;height:30px;border-radius:50%;border:2px solid var(--border);padding:0;}
+  .color-swatch.selected{box-shadow:0 0 0 2px var(--bg-elev), 0 0 0 4px var(--text);}
+  .invoice-color-preview{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:8px;margin-top:8px;padding:8px 10px;border-radius:8px;font-size:.82rem;font-weight:700;}
+  .tab-count{display:inline-block;min-width:18px;padding:0 5px;border-radius:9px;background:rgba(127,127,160,.18);font-size:.72rem;font-weight:700;margin-left:2px;}
+  .kv-table td{padding:3px 10px 3px 0;border:none;font-size:.88rem;}
+  .kv-table td:first-child{color:var(--muted);white-space:nowrap;}
+  .bank-details{background:var(--panel2);border-radius:10px;padding:12px 14px;}
   .status-rejected{background:#fee9ee;color:var(--danger);}
   .status-issued{background:#e3faf1;color:#0fb981;}
   .perm-box{border:1px solid var(--border);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:6px;margin-top:4px;background:var(--panel2);}
@@ -1452,6 +1464,9 @@ async function refreshAll(){
   (poItemsRes.data||[]).forEach(it=>{ (state.purchaseOrderItems[it.purchase_order_id] = state.purchaseOrderItems[it.purchase_order_id] || []).push(it); });
   const docsRes = await sb.from('cc_documents').select('*').eq('company_id', cid).order('created_at', {ascending:false});
   state.documents = docsRes.data || [];
+  // Budget lines (Reports -> Budget vs Actual). These were saved but never loaded, so that tab could not open.
+  const budgetsRes = await sb.from('cc_budgets').select('*').eq('company_id', cid);
+  state.budgets = budgetsRes.data || [];
   const payLinksRes = await sb.from('cc_payment_links').select('*').eq('company_id', cid).order('created_at', {ascending:false});
   state.paymentLinks = payLinksRes.data || [];
   await loadPaymentStatus();
@@ -2287,53 +2302,237 @@ function pdfBillTo(doc, y, label, client){
   lines.filter(Boolean).forEach(l=>{ doc.text(String(l), 14, y); y += 4.4; });
   return y + 3;
 }
-async function buildInvoicePdf(inv, items, client){
+// Invoices and quotes share one printed layout (modelled on the client's own sample): colour bands top and
+// bottom, logo + name + tagline with the document title on the right, an info bar, FROM and BILL TO, the
+// line items (with a detail line under each), totals with a coloured balance box, two cards (banking
+// details and payment terms), notes and a contact footer with page numbers. The item area stretches so a
+// one-line document still fills the page.
+function partyBlockLines(p, opts){
+  const lines = [];
+  if(!p) return lines;
+  if(opts && opts.contact && p.contact_person) lines.push(p.contact_person);
+  if(p.address) String(p.address).split(/\r?\n/).map(l=>l.trim()).filter(Boolean).forEach(l=>lines.push(l));
+  if(opts && opts.company){
+    if(p.registration_number) lines.push('Reg no: ' + p.registration_number);
+    if(weAreVatRegistered() && p.vat_number) lines.push('VAT no: ' + p.vat_number);
+    const c = [p.contact_email, p.contact_phone].filter(Boolean).join('  |  ');
+    if(c) lines.push(c);
+  } else {
+    if(p.vat_number) lines.push('VAT no: ' + p.vat_number);
+    if(p.email) lines.push(p.email);
+  }
+  return lines;
+}
+async function buildSalesDocPdf(spec){
   const JsPDF = await ensurePdfLib();
   const doc = new JsPDF({unit:'mm', format:'a4'});
-  const cur = inv.currency || 'ZAR';
+  const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight();
+  const M = 14, co = state.company || {};
+  const hex = invoiceColor(), ACCENT = hexRgb(hex), INK = hexRgb(invoiceInk(hex));
+  const ACC_TXT = invoiceInk(hex) === '#ffffff' ? ACCENT : [45, 45, 58];
+  const TINT = tintRgb(ACCENT, 0.9), LINE = [226, 228, 236], GREY = [110, 112, 125], DARK = [25, 26, 35];
+  const cur = spec.currency || 'ZAR';
   const vatReg = weAreVatRegistered();
-  const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
-  const vatTotal = items.reduce((s,it)=>s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
-  const total = items.reduce((s,it)=>s + it.quantity*it.unit_price, 0);
-  const isForeign = isForeignDoc(inv);
-  const bal = invoiceBalance(inv);
-  let y = pdfHeader(doc, vatReg ? 'TAX INVOICE' : 'INVOICE', [
-    `Invoice number: ${inv.invoice_number}`, `Date: ${inv.issue_date}` + (inv.due_date ? `     Due: ${inv.due_date}` : '')
-  ]);
-  y = pdfBillTo(doc, y, 'Bill to', client);
+  // --- Header: logo, name, tagline | title and number
+  let nameX = M;
+  if(co.logo_data_url && /^data:image\/(png|jpe?g)/i.test(co.logo_data_url)){
+    try{
+      const fmtImg = /png/i.test(co.logo_data_url.slice(0, 20)) ? 'PNG' : 'JPEG';
+      const pr = doc.getImageProperties(co.logo_data_url);
+      const h = 17, w = Math.min(40, pr.width * h / pr.height);
+      doc.addImage(co.logo_data_url, fmtImg, M, 11, w, h); nameX = M + w + 5;
+    }catch(e){ /* unreadable logo: left out */ }
+  }
+  const coName = pdfText(co.trading_as || co.name || '');
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(...DARK);
+  doc.text(doc.splitTextToSize(coName, 95)[0] || '', nameX, co.tagline ? 19.5 : 21.5);
+  if(co.tagline){ doc.setFont('helvetica', 'normal'); doc.setFontSize(8.8); doc.setTextColor(...GREY); doc.text(pdfText(co.tagline).slice(0, 80), nameX, 25.5); }
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(spec.title.length > 8 ? 21 : 25); doc.setTextColor(...ACC_TXT);
+  doc.text(spec.title, W - M, 21, {align:'right'});
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); doc.setTextColor(...GREY);
+  doc.text(pdfText(spec.number), W - M, 27.5, {align:'right'});
+  doc.setDrawColor(...LINE); doc.setLineWidth(0.3); doc.line(M, 35, W - M, 35);
+  // --- Info bar
+  const info = spec.info.filter(Boolean);
+  doc.setFillColor(...TINT); doc.roundedRect(M, 40, W - 2*M, 16, 2, 2, 'F');
+  const colW = (W - 2*M - 8) / info.length;
+  info.forEach(([label, value], i)=>{
+    const x = M + 5 + i * colW;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(6.6); doc.setTextColor(...GREY); doc.text(String(label).toUpperCase(), x, 46);
+    doc.setTextColor(...(i === info.length - 1 ? ACC_TXT : DARK));
+    const txt = pdfText(value || '—'); let fs = 9.6;
+    doc.setFontSize(fs); while(fs > 6.5 && doc.getTextWidth(txt) > colW - 3){ fs -= 0.4; doc.setFontSize(fs); }
+    doc.text(doc.splitTextToSize(txt, colW - 3)[0] || '—', x, 52);
+  });
+  // --- FROM / BILL TO
+  const block = (x, label, name, lines) => {
+    let y = 64;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(7.4); doc.setTextColor(...ACC_TXT); doc.text(label, x, y); y += 5.6;
+    doc.setFontSize(11); doc.setTextColor(...DARK); doc.text(doc.splitTextToSize(pdfText(name || ''), 85)[0] || '', x, y); y += 5;
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8.4); doc.setTextColor(...GREY);
+    lines.forEach(l=>{ doc.splitTextToSize(pdfText(l), 85).forEach(t=>{ doc.text(t, x, y); y += 4.1; }); });
+    return y;
+  };
+  const yA = block(M, 'FROM', co.trading_as || co.name, partyBlockLines(co, {company:true}));
+  const yB = block(W / 2 + 4, spec.toLabel || 'BILL TO', spec.client ? spec.client.name : '', partyBlockLines(spec.client, {contact:true}));
+  let y = Math.max(yA, yB) + 5;
+  // --- Bottom block sizes (so the item area can stretch down to it)
+  const cardW = (W - 2*M - 6) / 2;
+  const leftCard = spec.leftCard, rightCard = spec.rightCard;
+  const cards = [leftCard, rightCard].filter(c=>c && ((c.rows && c.rows.length) || c.text));
+  const cw = cards.length === 1 ? W - 2*M : cardW;
+  doc.setFontSize(8.2);
+  const cardH = c => 13 + (c.rows ? c.rows.length * 4.7 : doc.splitTextToSize(pdfText(c.text), cw - 10).length * 4.3) + 3;
+  const cardsH = cards.length ? Math.max(...cards.map(cardH)) : 0;
+  const noteLines = spec.notes ? doc.splitTextToSize(pdfText(spec.notes), W - 2*M) : [];
+  const notesH = noteLines.length ? 8 + noteLines.length * 4 : 0;
+  const totalsH = spec.totals.length * 6 + 16;
+  const FOOTER = 24;
+  const bottomH = totalsH + (cardsH ? cardsH + 7 : 0) + (notesH ? notesH + 4 : 0);
+  // --- Items
+  const showVat = vatReg && spec.showVatColumn !== false;
+  const head = ['#', 'Description', 'Qty', 'Unit price'].concat(showVat ? ['VAT'] : []).concat(['Amount']);
+  const items = spec.items || [];
+  const body = items.map((it, i)=>{
+    const row = [String(i + 1), pdfText(it.description || ''), String(Number(it.quantity)), pdfMoney(it.unit_price, cur)];
+    if(showVat) row.push(it.vat_applicable ? '15%' : '0%');
+    row.push(pdfMoney(Number(it.quantity) * Number(it.unit_price), cur));
+    return row;
+  });
+  const ROW = 9;
+  const detailsOf = i => items[i] && items[i].details ? pdfText(items[i].details) : '';
+  // Estimated table height: header + one row each (taller with a detail line).
+  let est = 9 + items.reduce((s, it, i)=>s + (detailsOf(i) ? 13 : ROW), 0);
+  const room = H - FOOTER - bottomH - y - 4;
+  const fillers = Math.max(0, Math.floor((room - est) / ROW));
+  for(let k = 0; k < fillers; k++) body.push(head.map(()=>''));
+  const aIdx = head.length - 1;
+  const colStyles = {0:{cellWidth:10, halign:'center', textColor:GREY}, 2:{cellWidth:16, halign:'right'}, 3:{cellWidth:28, halign:'right'}};
+  if(showVat) colStyles[4] = {cellWidth:14, halign:'center'};
+  colStyles[aIdx] = {cellWidth:30, halign:'right', fontStyle:'bold'};
   doc.autoTable({
-    startY: y, margin:{left:14, right:14}, theme:'striped', headStyles:{fillColor:[124,92,255]}, styles:{fontSize:9},
-    head:[['Description', 'Qty', 'Unit price', vatReg ? 'VAT' : '', 'Amount'].filter((h,i)=>vatReg || i !== 3)],
-    body: items.map(it=>{
-      const row = [String(it.description||''), String(it.quantity), pdfMoney(it.unit_price, cur)];
-      if(vatReg) row.push(it.vat_applicable ? '15%' : '0%');
-      row.push(pdfMoney(it.quantity*it.unit_price, cur));
-      return row;
-    }),
-    columnStyles: vatReg ? {1:{halign:'right'}, 2:{halign:'right'}, 3:{halign:'center'}, 4:{halign:'right'}} : {1:{halign:'right'}, 2:{halign:'right'}, 3:{halign:'right'}},
-    didParseCell: d=>{ if(d.section === 'head' && d.column.index > 0) d.cell.styles.halign = (vatReg && d.column.index === 3) ? 'center' : 'right'; }
+    startY: y, margin:{left:M, right:M, top:16, bottom:FOOTER}, theme:'plain', head:[head], body,
+    styles:{fontSize:9, cellPadding:{top:2.6, bottom:2.6, left:2.5, right:2.5}, minCellHeight:ROW, valign:'top', textColor:DARK, lineColor:LINE, lineWidth:{bottom:0.2}},
+    headStyles:{fillColor:ACCENT, textColor:INK, fontStyle:'bold', fontSize:8.6, lineWidth:0, minCellHeight:8.5, valign:'middle'},
+    columnStyles: colStyles,
+    didParseCell: d=>{
+      if(d.section === 'head'){ const ci = d.column.index; d.cell.styles.halign = ci === 0 || (showVat && ci === 4) ? 'center' : (ci >= 2 ? 'right' : 'left'); return; }
+      if(d.row.index >= items.length){ d.cell.styles.lineWidth = {bottom:0.1}; d.cell.styles.lineColor = [240, 241, 246]; return; }
+      if(d.column.index === 1){ d.cell.styles.fontStyle = 'bold'; if(detailsOf(d.row.index)) d.cell.styles.minCellHeight = 13; }
+    },
+    didDrawCell: d=>{
+      if(d.section !== 'body' || d.column.index !== 1 || d.row.index >= items.length) return;
+      const det = detailsOf(d.row.index); if(!det) return;
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(7.6); doc.setTextColor(...GREY);
+      doc.text(doc.splitTextToSize(det, d.cell.width - 5)[0], d.cell.x + 2.5, d.cell.y + d.cell.height - 3);
+    },
   });
   y = doc.lastAutoTable.finalY + 6;
-  const W = doc.internal.pageSize.getWidth();
-  const rows = [];
-  if(vatReg){ rows.push(['Subtotal (excl. VAT)', pdfMoney(subtotal, cur)]); rows.push(['VAT (15%)', pdfMoney(vatTotal, cur)]); }
-  rows.push(['Total', pdfMoney(total, cur)]);
-  if(isForeign) rows.push([`Booked at ${inv.exchange_rate} = `, pdfMoney(round2(total * fxDocRate(inv)), 'ZAR')]);
-  const received = round2(bal.paid + (bal.writtenOff||0) + (bal.allocated||0));
-  if(received > 0.005){ rows.push(['Paid / credited (R)', pdfMoney(received, 'ZAR')]); rows.push(['Balance due (R)', pdfMoney(bal.balance, 'ZAR')]); }
-  doc.setFontSize(10);
-  rows.forEach(([l, v], i)=>{
-    const bold = l === 'Total' || /Balance due/.test(l);
-    doc.setFont('helvetica', bold ? 'bold' : 'normal'); doc.setTextColor(bold ? 25 : 70);
-    doc.text(l, W - 70, y); doc.text(v, W - 14, y, {align:'right'}); y += 5.5;
+  if(y + bottomH > H - FOOTER){ doc.addPage(); y = 20; }
+  // --- Totals
+  const tx = W - M - 82, tv = W - M - 3;
+  spec.totals.forEach(([label, value, strong])=>{
+    if(strong){ doc.setDrawColor(...LINE); doc.line(tx, y - 4.2, W - M, y - 4.2); }
+    doc.setFont('helvetica', strong ? 'bold' : 'normal'); doc.setFontSize(strong ? 10 : 9); doc.setTextColor(...(strong ? DARK : GREY));
+    doc.text(pdfText(label), tx + 3, y); doc.text(pdfText(value), tv, y, {align:'right'});
+    y += 6;
   });
-  if(inv.notes){
-    y += 4; doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(80);
-    doc.text(doc.splitTextToSize(String(inv.notes), W - 28), 14, y);
+  y += 1;
+  doc.setFillColor(...ACCENT); doc.roundedRect(tx, y - 1, 82, 11, 1.8, 1.8, 'F');
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(9.5); doc.setTextColor(...INK); doc.text(spec.boxLabel, tx + 4, y + 6);
+  doc.setFontSize(12.5); doc.text(pdfText(spec.boxValue), tv - 1, y + 6.3, {align:'right'});
+  y += 18;
+  // --- Cards
+  if(cards.length){
+    cards.forEach((c, i)=>{
+      const x = M + i * (cardW + 6);
+      doc.setDrawColor(...LINE); doc.setLineWidth(0.3); doc.setFillColor(255, 255, 255);
+      doc.roundedRect(x, y, cw, cardsH, 1.8, 1.8, 'FD');
+      doc.setFillColor(...ACCENT); doc.rect(x, y, cw, 1.3, 'F');
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(7.8); doc.setTextColor(...ACC_TXT); doc.text(c.title.toUpperCase(), x + 5, y + 8);
+      let cy = y + 14;
+      doc.setFontSize(8.2);
+      if(c.rows) c.rows.forEach(([k, v])=>{
+        doc.setFont('helvetica', 'normal'); doc.setTextColor(...GREY); doc.text(pdfText(k), x + 5, cy);
+        doc.setFont('helvetica', 'bold'); doc.setTextColor(...DARK); doc.text(doc.splitTextToSize(pdfText(v), cw - 42)[0] || '', x + 37, cy);
+        cy += 4.7;
+      });
+      else { doc.setFont('helvetica', 'normal'); doc.setTextColor(...DARK); doc.splitTextToSize(pdfText(c.text), cw - 10).forEach(t=>{ doc.text(t, x + 5, cy); cy += 4.3; }); }
+    });
+    y += cardsH + 7;
   }
-  pdfFooter(doc);
-  const filename = pdfSafeName(`Invoice_${inv.invoice_number}`) + '.pdf';
-  return {doc, filename};
+  // --- Notes
+  if(noteLines.length){
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(7.4); doc.setTextColor(...ACC_TXT); doc.text('NOTES', M, y); y += 5;
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8.2); doc.setTextColor(...GREY);
+    noteLines.forEach(t=>{ doc.text(t, M, y); y += 4; });
+  }
+  // --- Bands and footer on every page
+  const contact = [co.trading_as || co.name, co.website, co.contact_email, co.contact_phone].filter(Boolean).map(pdfText).join('  |  ');
+  const pages = doc.getNumberOfPages();
+  for(let i = 1; i <= pages; i++){
+    doc.setPage(i);
+    doc.setFillColor(...ACCENT); doc.rect(0, 0, W, 3.2, 'F'); doc.rect(0, H - 3.2, W, 3.2, 'F');
+    doc.setDrawColor(...LINE); doc.setLineWidth(0.3); doc.line(M, H - 19, W - M, H - 19);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(7.8); doc.setTextColor(...GREY);
+    if(contact) doc.text(doc.splitTextToSize(contact, W - 2*M)[0], W / 2, H - 14, {align:'center'});
+    doc.setFontSize(7.2); doc.setTextColor(150); doc.text(`Page ${i} of ${pages}`, W / 2, H - 9.5, {align:'center'});
+  }
+  return {doc, filename: pdfSafeName(spec.filename) + '.pdf'};
+}
+function salesDocTotals(items, cur){
+  const subtotal = items.reduce((s,it)=>s + it.quantity*it.unit_price/(it.vat_applicable?(1+VAT_RATE):1), 0);
+  const vat = items.reduce((s,it)=>s + (it.vat_applicable ? it.quantity*it.unit_price - it.quantity*it.unit_price/(1+VAT_RATE) : 0), 0);
+  const total = items.reduce((s,it)=>s + it.quantity*it.unit_price, 0);
+  return {subtotal: round2(subtotal), vat: round2(vat), total: round2(total)};
+}
+async function buildInvoicePdf(inv, items, client){
+  const cur = inv.currency || 'ZAR';
+  const vatReg = weAreVatRegistered();
+  const t = salesDocTotals(items, cur);
+  const isForeign = isForeignDoc(inv);
+  const bal = invoiceBalance(inv);
+  const paid = round2((bal.paid || 0) + (bal.writtenOff || 0) + (bal.allocated || 0));
+  const credited = round2(bal.credited || 0);
+  const settledInRand = isForeign || paid + credited > 0.005;
+  const due = settledInRand ? pdfMoney(bal.balance, 'ZAR') : pdfMoney(t.total, cur);
+  const totals = [];
+  if(vatReg){ totals.push(['Subtotal (excl. VAT)', pdfMoney(t.subtotal, cur)]); totals.push(['VAT (15%)', pdfMoney(t.vat, cur)]); }
+  else totals.push(['Subtotal', pdfMoney(t.total, cur)]);
+  totals.push(['Total', pdfMoney(t.total, cur), true]);
+  if(isForeign) totals.push([`At ${inv.exchange_rate} =`, pdfMoney(round2(t.total * fxDocRate(inv)), 'ZAR')]);
+  totals.push(['Amount paid', pdfMoney(paid, settledInRand ? 'ZAR' : cur)]);
+  if(credited > 0.005) totals.push(['Credit notes', pdfMoney(credited, 'ZAR')]);
+  const bankRows = bankDetailsLines(invoiceBankAccount(inv), inv.invoice_number);
+  const ordered = ['Account holder','Bank','Account number','Account type','Branch code','SWIFT code','Payment reference'];
+  bankRows.sort((a,b)=>ordered.indexOf(a[0]) - ordered.indexOf(b[0]));
+  const terms = inv.payment_terms || defaultPaymentTermsText(inv.payment_method, inv.due_date, inv.invoice_number);
+  return buildSalesDocPdf({
+    title: vatReg ? 'TAX INVOICE' : 'INVOICE', number: inv.invoice_number, currency: cur, client,
+    info: [['Invoice date', fmtShortDate(inv.issue_date)], ['Due date', inv.due_date ? fmtShortDate(inv.due_date) : 'On receipt'],
+      ['Billing period', inv.billing_period || '—'], ['Customer ref', inv.customer_ref || (client && client.account_ref) || '—'], ['Amount due', due]],
+    items, totals, boxLabel: 'BALANCE DUE', boxValue: due,
+    leftCard: bankRows.length ? {title:'Our banking details', rows: bankRows.map(([k, v])=>[k === 'Account holder' ? 'Account name' : k, v])} : null,
+    rightCard: terms ? {title:'Payment terms', text: terms} : null,
+    notes: inv.notes, filename: `Invoice_${inv.invoice_number}`,
+  });
+}
+async function buildQuotePdf(q, items, client){
+  const vatReg = weAreVatRegistered();
+  const t = salesDocTotals(items, 'ZAR');
+  const totals = vatReg ? [['Subtotal (excl. VAT)', pdfMoney(t.subtotal)], ['VAT (15%)', pdfMoney(t.vat)], ['Total', pdfMoney(t.total), true]] : [['Total', pdfMoney(t.total), true]];
+  const valid = q.expiry_date ? `This quote is valid until ${fmtLongDate(q.expiry_date)}.` : 'This quote is valid for 30 days.';
+  const pm = client && client.payment_method, days = client ? termsDays(client.payment_terms_days) : null;
+  const termsTxt = [pm ? `Payment by ${paymentMethodLabel(pm).replace(' (bank transfer)', '').toLowerCase()}` : '', days == null ? '' : (days === 0 ? 'due on receipt of the invoice' : `due ${days} days from the invoice date`)].filter(Boolean).join(', ');
+  return buildSalesDocPdf({
+    title: 'QUOTE', number: q.quote_number, currency: 'ZAR', client, toLabel: 'PREPARED FOR',
+    info: [['Quote date', fmtShortDate(q.issue_date)], ['Valid until', q.expiry_date ? fmtShortDate(q.expiry_date) : '30 days'],
+      ['Customer ref', q.customer_ref || (client && client.account_ref) || '—'], ['Quote total', pdfMoney(t.total)]],
+    items, totals, boxLabel: 'QUOTE TOTAL', boxValue: pdfMoney(t.total),
+    leftCard: {title:'Accepting this quote', text: `${valid} To go ahead, reply to the email this quote came with, or sign and return it. Once you accept, we will send you an invoice for the amount above.\n\nAccepted by: _______________   Date: __________`},
+    rightCard: termsTxt ? {title:'Payment terms', text: termsTxt.charAt(0).toUpperCase() + termsTxt.slice(1) + '.'} : null,
+    notes: q.notes, filename: `Quote_${q.quote_number}`,
+  });
 }
 async function buildStatementPdf(stmt){
   const JsPDF = await ensurePdfLib();
@@ -2706,14 +2905,22 @@ function renderBankAccountsPanel(){
   return `<div class="panel" id="bank-accounts-panel">
     <h3 style="margin-top:0;">Bank accounts</h3>
     <p style="color:var(--muted);font-size:.85rem;">Add each business bank account with its <strong>opening balance</strong>: the balance on the day you start capturing transactions in Company Compass. Everything after that comes from your invoices, bills, payments and bank imports.</p>
-    ${accts.length ? `<table><thead><tr><th>Account</th><th>Type</th><th style="text-align:right;">Opening balance</th>${admin?'<th></th>':''}</tr></thead><tbody>
-      ${accts.map(a=>`<tr><td>${escHtml(a.name)}</td><td>${a.type === 'savings' ? 'Savings' : 'Current / cheque'}</td><td style="text-align:right;">${fmt(Number(a.starting_balance)||0)}</td>${admin?`<td style="text-align:right;"><button type="button" class="btn small secondary" data-edit-bank-account="${a.id}">Edit</button></td>`:''}</tr>`).join('')}
+    <p style="color:var(--muted);font-size:.85rem;margin-top:-4px;">Add the <strong>bank, account number and branch code</strong> to show them on your invoices so clients can pay by EFT. Tick "Show on invoices" for the account clients should pay into.</p>
+    ${accts.length ? `<table><thead><tr><th>Account</th><th>Banking details</th><th style="text-align:right;">Opening balance</th>${admin?'<th></th>':''}</tr></thead><tbody>
+      ${accts.map(a=>`<tr><td>${escHtml(a.name)}<div style="font-size:.78rem;color:var(--muted);">${a.type === 'savings' ? 'Savings' : 'Current / cheque'}</div></td><td style="font-size:.85rem;">${a.account_number ? `${escHtml(a.bank_name || '')} ${escHtml(a.account_number)}${a.branch_code ? ' · branch ' + escHtml(a.branch_code) : ''}${a.show_on_invoices ? ' <span class="status-pill status-approved">On invoices</span>' : ''}` : '<span style="color:var(--muted);">Not added</span>'}</td><td style="text-align:right;">${fmt(Number(a.starting_balance)||0)}</td>${admin?`<td style="text-align:right;"><button type="button" class="btn small secondary" data-edit-bank-account="${a.id}">Edit</button></td>`:''}</tr>`).join('')}
     </tbody></table>` : '<div class="empty">No bank account added yet.</div>'}
     ${admin ? `<form id="bank-account-form" class="${accts.length ? 'hidden' : ''}" style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
       <input type="hidden" id="bank-account-id">
       <div class="field" style="margin-bottom:0;flex:2;min-width:180px;"><label>Account name</label><input type="text" id="bank-account-name" placeholder="e.g. FNB Business Cheque" required></div>
       <div class="field" style="margin-bottom:0;flex:1;min-width:130px;"><label>Type</label><select id="bank-account-type"><option value="bank">Current / cheque</option><option value="savings">Savings</option></select></div>
       <div class="field" style="margin-bottom:0;flex:1;min-width:150px;"><label>Opening balance (R)</label><input type="number" step="0.01" id="bank-account-balance" value="0" required></div>
+      <div style="flex-basis:100%;height:0;"></div>
+      <div class="field" style="margin-bottom:0;flex:1;min-width:150px;"><label>Bank</label><input type="text" id="bank-account-bank" placeholder="e.g. FNB"></div>
+      <div class="field" style="margin-bottom:0;flex:1;min-width:150px;"><label>Account number</label><input type="text" id="bank-account-number" inputmode="numeric" autocomplete="off"></div>
+      <div class="field" style="margin-bottom:0;flex:1;min-width:120px;"><label>Branch code</label><input type="text" id="bank-account-branch" inputmode="numeric"></div>
+      <div class="field" style="margin-bottom:0;flex:2;min-width:180px;"><label>Account holder (if not the company name)</label><input type="text" id="bank-account-holder"></div>
+      <div class="field" style="margin-bottom:0;flex:1;min-width:120px;"><label>SWIFT code (for foreign clients)</label><input type="text" id="bank-account-swift"></div>
+      <label style="display:flex;align-items:center;gap:8px;flex-basis:100%;font-size:.88rem;"><input type="checkbox" id="bank-account-show" style="width:auto;flex:none;"> Show on invoices (the account clients pay into)</label>
       <button type="submit" class="btn small" id="bank-account-save">Save account</button>
     </form>
     ${accts.length ? `<button type="button" class="btn small secondary" id="bank-account-add" style="margin-top:10px;">+ Add another account</button>` : ''}` : '<p style="font-size:.78rem;color:var(--muted);">Only management can change bank accounts.</p>'}
@@ -2724,24 +2931,35 @@ function attachBankAccountsHandlers(){
   const form = document.getElementById('bank-account-form');
   document.getElementById('bank-account-add')?.addEventListener('click', ()=>{
     document.getElementById('bank-account-id').value = ''; document.getElementById('bank-account-name').value = ''; document.getElementById('bank-account-balance').value = '0';
+    ['bank','number','branch','holder','swift'].forEach(k=>{ document.getElementById('bank-account-' + k).value = ''; });
+    document.getElementById('bank-account-show').checked = !(state.accounts||[]).some(a=>a.show_on_invoices);
     form.classList.remove('hidden'); document.getElementById('bank-account-name').focus();
   });
   document.querySelectorAll('[data-edit-bank-account]').forEach(b=>b.addEventListener('click', ()=>{
     const a = (state.accounts||[]).find(x=>x.id===b.dataset.editBankAccount); if(!a) return;
     document.getElementById('bank-account-id').value = a.id; document.getElementById('bank-account-name').value = a.name || '';
     document.getElementById('bank-account-type').value = a.type === 'savings' ? 'savings' : 'bank'; document.getElementById('bank-account-balance').value = Number(a.starting_balance||0).toFixed(2);
+    document.getElementById('bank-account-bank').value = a.bank_name || ''; document.getElementById('bank-account-number').value = a.account_number || '';
+    document.getElementById('bank-account-branch').value = a.branch_code || ''; document.getElementById('bank-account-holder').value = a.account_holder || '';
+    document.getElementById('bank-account-swift').value = a.swift_code || ''; document.getElementById('bank-account-show').checked = !!a.show_on_invoices;
     form.classList.remove('hidden'); document.getElementById('bank-account-name').focus();
   }));
   form?.addEventListener('submit', async (e)=>{
     e.preventDefault();
     if(!isAdmin()) return;
     const id = document.getElementById('bank-account-id').value;
-    const row = {name: document.getElementById('bank-account-name').value.trim(), type: document.getElementById('bank-account-type').value, starting_balance: round2(parseFloat(document.getElementById('bank-account-balance').value) || 0)};
+    const val = k => (document.getElementById('bank-account-' + k).value || '').trim();
+    const row = {name: document.getElementById('bank-account-name').value.trim(), type: document.getElementById('bank-account-type').value, starting_balance: round2(parseFloat(document.getElementById('bank-account-balance').value) || 0),
+      bank_name: val('bank') || null, account_number: val('number').replace(/\s+/g, '') || null, branch_code: val('branch') || null, account_holder: val('holder') || null, swift_code: val('swift').toUpperCase() || null,
+      show_on_invoices: !!document.getElementById('bank-account-show').checked};
+    if(row.show_on_invoices && !row.account_number){ toast('Add the account number to show this account on invoices.'); return; }
     if(!row.name){ toast('Give the account a name.'); return; }
     const before = id ? (state.accounts||[]).find(x=>x.id===id) : null;
     if(before && isPeriodLocked(LEDGER_EPOCH) && Number(before.starting_balance) !== row.starting_balance){ toast(periodLockMessage()); return; }
     const res = id ? await sb.from('cc_accounts').update(row).eq('id', id) : await sb.from('cc_accounts').insert({...row, company_id: state.company.id});
     if(res.error){ toast(res.error.message); return; }
+    // only one account is the one shown on invoices
+    if(row.show_on_invoices){ for(const other of (state.accounts||[]).filter(a=>a.show_on_invoices && a.id !== id)) await sb.from('cc_accounts').update({show_on_invoices:false}).eq('id', other.id); }
     await logActivity(id ? 'update' : 'create', 'bank_account', id || null, `${row.name}: opening balance ${fmt(row.starting_balance)}${before ? ` (was ${fmt(Number(before.starting_balance)||0)})` : ''}`);
     await refreshAll(); render(); toast('Bank account saved.');
   });
@@ -2750,6 +2968,450 @@ function attachBankAccountsHandlers(){
     goToView('dashboard');
   });
 }
+
+/* ========================= REPORT EXPORT (PDF / EXCEL) =========================
+   "Download PDF" / "Download Excel" on every Reports tab, the VAT page, the Scenario Planner list, each
+   scenario (including the cash budget's projected cash position and loan schedules) and scenario comparisons.
+   It exports exactly what the page shows: the headings, summary cards and tables inside the export area, in
+   order. Charts, buttons, forms and the "Show the figures" duplicates are left out; money and percentages
+   become real numbers in Excel. New report tabs are covered automatically. */
+const XLSX_LIB = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+let xlsxLibPromise = null;
+async function ensureXlsxLib(){
+  if(window.XLSX && window.XLSX.utils) return window.XLSX;
+  if(!xlsxLibPromise) xlsxLibPromise = loadScriptOnce(XLSX_LIB).catch(e=>{ xlsxLibPromise = null; throw e; });
+  await xlsxLibPromise;
+  if(!(window.XLSX && window.XLSX.utils)) throw new Error('Excel library unavailable');
+  return window.XLSX;
+}
+function exportButtonsHtml(scope){
+  return `<span class="export-btns"><button type="button" class="btn secondary small" data-export="pdf" data-export-scope="${scope}">Download PDF</button><button type="button" class="btn secondary small" data-export="xlsx" data-export-scope="${scope}">Download Excel</button></span>`;
+}
+// Text of a table cell as the reader sees it: typed values of inputs, chosen option of selects; buttons and icons dropped.
+function exportCellText(node){
+  let out = '';
+  node.childNodes.forEach(ch=>{
+    if(ch.nodeType === 3){ out += ch.nodeValue; return; }
+    if(ch.nodeType !== 1) return;
+    const tag = ch.tagName;
+    if(/^(BUTTON|SCRIPT|STYLE|SVG|CANVAS|TEMPLATE)$/.test(tag) || ch.classList.contains('sr-only')) return;
+    if(tag === 'INPUT'){ if(!/^(checkbox|radio|hidden|button|submit|file)$/i.test(ch.type)) out += ' ' + ch.value + ' '; return; }
+    if(tag === 'SELECT'){ const o = ch.options[ch.selectedIndex]; if(o) out += ' ' + o.textContent + ' '; return; }
+    if(tag === 'TEXTAREA'){ out += ' ' + ch.value + ' '; return; }
+    if(tag === 'BR'){ out += ' '; return; }
+    const block = /^(DIV|P|LI)$/.test(tag);
+    out += (block ? ' ' : '') + exportCellText(ch) + (block ? ' ' : '');
+  });
+  return out.replace(/[\s  ]+/g, ' ').trim();
+}
+// "R1,234.56", "R-4 369,57", "(R250.00)", "12.5%", "1,200" -> {n, kind}; anything else -> null.
+function exportNumber(text){
+  let t = String(text || '').replace(/[  \s]/g, '').replace(/−/g, '-');
+  if(!t || /[a-qs-zA-QS-Z]/.test(t.replace(/^R/i, ''))) return null;
+  let neg = false;
+  if(/^\(.*\)$/.test(t)){ neg = true; t = t.slice(1, -1); }
+  let kind = 'num';
+  if(/%$/.test(t)){ kind = 'pct'; t = t.slice(0, -1); }
+  if(/^-?R/.test(t)){ kind = 'money'; if(t[0] === '-'){ neg = !neg; t = t.slice(2); } else t = t.slice(1); }
+  if(t[0] === '-'){ neg = !neg; t = t.slice(1); }
+  const bare = t;
+  if(/^\d{1,3}(,\d{3})*(\.\d+)?$/.test(t) || /^\d+(\.\d+)?$/.test(t)) t = t.replace(/,/g, '');
+  else if(/^\d{1,3}(\.\d{3})*,\d+$/.test(t) || /^\d+,\d+$/.test(t)) t = t.replace(/\./g, '').replace(',', '.');
+  else return null;
+  if(kind === 'num' && /^\d{4}$/.test(bare) && !neg) return null;   // a bare year such as 2026 stays text
+  let n = Number(t); if(!isFinite(n)) return null;
+  if(neg) n = -n;
+  if(kind === 'pct') n = n / 100;
+  return {n, kind};
+}
+function exportSkip(el){ return !!el.closest('.chart-wrap, .chart-figures, .chart-box, .chart-empty, form, .modal-backdrop, .hidden, [data-export-skip], .tabbar, .period-bar, .section-header, .export-btns'); }
+function exportTableBlock(table){
+  const rows = [];
+  table.querySelectorAll('tr').forEach(tr=>{
+    if(tr.closest('table') !== table || exportSkip(tr)) return;
+    const head = !!tr.closest('thead') || (tr.children.length && [...tr.children].every(c=>c.tagName === 'TH'));
+    const cells = [];
+    [...tr.children].forEach(c=>{ cells.push(exportCellText(c)); for(let i=1;i<(Number(c.colSpan)||1);i++) cells.push(''); });
+    const first = tr.querySelector('td');
+    let bold = false;
+    try{ bold = !head && !!first && (parseInt(getComputedStyle(first).fontWeight, 10) >= 600 || parseInt(getComputedStyle(tr).fontWeight, 10) >= 600); }catch(e){}
+    rows.push({cells, head, bold});
+  });
+  if(!rows.length) return null;
+  const width = Math.max(...rows.map(r=>r.cells.length));
+  rows.forEach(r=>{ while(r.cells.length < width) r.cells.push(''); });
+  // drop columns that are empty everywhere (e.g. the column that only held Edit / Delete buttons)
+  const keep = [...Array(width).keys()].filter(i=>rows.some(r=>r.cells[i] !== ''));
+  rows.forEach(r=>{ r.cells = keep.map(i=>r.cells[i]); });
+  const body = rows.filter(r=>!r.head);
+  const numeric = keep.map((_, i)=>{ const vals = body.map(r=>r.cells[i]).filter(v=>v && v !== '—' && v !== '-'); return vals.length > 0 && vals.filter(v=>exportNumber(v)).length / vals.length >= 0.6; });
+  return {type:'table', head: rows.filter(r=>r.head).map(r=>r.cells), body, numeric, cols: keep.length};
+}
+function collectExportBlocks(root){
+  const blocks = [];
+  if(!root) return blocks;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {acceptNode(el){
+    if(exportSkip(el)) return NodeFilter.FILTER_REJECT;
+    if(el.tagName === 'TABLE' || (el.classList.contains('grid') && el.querySelector('.card')) || /^H[1-4]$/.test(el.tagName)) return NodeFilter.FILTER_ACCEPT;
+    return NodeFilter.FILTER_SKIP;
+  }});
+  let el;
+  while((el = walker.nextNode())){
+    if(el.tagName === 'TABLE'){ const t = exportTableBlock(el); if(t) blocks.push(t); }
+    else if(el.classList.contains('grid')){
+      const rows = [...el.querySelectorAll('.card')].filter(c=>!exportSkip(c)).map(c=>{
+        const h = c.querySelector('h3'), v = c.querySelector('.value'), sub = c.querySelector('.sub');
+        return [h ? exportCellText(h) : '', v ? exportCellText(v) : '', sub ? exportCellText(sub) : ''];
+      }).filter(r=>r[0] || r[1]);
+      if(rows.length) blocks.push({type:'cards', rows});
+    } else {
+      if(el.closest('table, .card')) continue;
+      const text = exportCellText(el);
+      if(text) blocks.push({type:'heading', text, level: Number(el.tagName[1])});
+    }
+  }
+  // a heading straight after another heading of the same text adds nothing
+  return blocks.filter((b, i)=>!(b.type === 'heading' && blocks[i+1] && blocks[i+1].type === 'heading' && blocks[i+1].text === b.text));
+}
+function reportTabLabel(){ const b = document.querySelector('.tabbar .btn[data-report-tab]:not(.secondary)'); return b ? b.textContent.trim() : 'Profit & Loss'; }
+function exportScopeMeta(scope){
+  const p = (typeof currentPeriod === 'function') ? currentPeriod() : null;
+  if(scope === 'report'){
+    const tab = state.reportsTab || 'pl';
+    const sub = tab === 'monthly' ? `Month: ${monthLabel(state.monthlyAccountsMonth)}`
+      : (tab === 'bs' || tab === 'bankrec') ? `As at ${p.end}`
+      : /^(companytax|afs|health|financials|yearend)$/.test(tab) ? ''
+      : `${p.start} to ${p.end}`;
+    return {title: reportTabLabel(), subtitle: sub, root: document.getElementById('report-body')};
+  }
+  if(scope === 'scenario'){
+    const sc = (state.scenarios||[]).find(s=>s.id===state.scenarioDetailId) || {};
+    return {title: `Scenario: ${sc.name || ''}`, subtitle: `${scenarioCategoryLabel(sc.category)} · discount rate ${Number(sc.discount_rate||0).toFixed(1)}% · ${sc.period_unit || 'month'}ly periods`, root: document.getElementById('scenario-detail-body')};
+  }
+  if(scope === 'compare') return {title: 'Scenario comparison', subtitle: '', root: document.getElementById('scenario-compare-body')};
+  if(scope === 'scenarios') return {title: 'Scenarios', subtitle: '', root: document.getElementById('scenario-list-body')};
+  if(scope === 'vat') return {title: 'VAT', subtitle: '', root: document.getElementById('main')};
+  return {title: 'Report', subtitle: '', root: document.getElementById('main')};
+}
+// The PDF's built-in fonts only cover Western European characters.
+function pdfText(s){
+  return String(s == null ? '' : s).replace(/[   ]/g, ' ').replace(/−/g, '-').replace(/[→⟶]/g, '->').replace(/[←]/g, '<-').replace(/≈/g, '~').replace(/[≤]/g, '<=').replace(/[≥]/g, '>=')
+    .replace(/[✓✔]/g, 'OK').replace(/[✗✕✖]/g, 'X').replace(/[⚠]/g, '!').replace(/[^\x09\x0a\x0d\x20-\x7e -ÿ–—‘’“”•…€]/g, '').trim();
+}
+function exportFileBase(meta){ return pdfSafeName(`${(state.company && state.company.name) || 'Company'} ${meta.title} ${todayIso()}`); }
+async function buildReportPdf(meta, blocks){
+  const jsPDF = await ensurePdfLib();
+  const wide = blocks.some(b=>(b.type === 'table' && b.cols > 5));
+  const doc = new jsPDF({orientation: wide ? 'landscape' : 'portrait', unit:'mm', format:'a4'});
+  const H = doc.internal.pageSize.getHeight();
+  let y = pdfHeader(doc, pdfText(meta.title), [meta.subtitle, `Prepared ${todayIso()}`].filter(Boolean).map(pdfText));
+  const table = (opts)=>{ doc.autoTable(Object.assign({startY: y, margin:{left:14, right:14}, styles:{fontSize: wide ? 7.5 : 8.5, cellPadding: 1.6, overflow:'linebreak'}, headStyles:{fillColor:[124, 92, 255], textColor:255}}, opts)); y = doc.lastAutoTable.finalY + 7; };
+  for(const b of blocks){
+    if(y > H - 24){ doc.addPage(); y = 18; }
+    if(b.type === 'heading'){
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(b.level <= 2 ? 12.5 : 11); doc.setTextColor(25);
+      doc.text(doc.splitTextToSize(pdfText(b.text), doc.internal.pageSize.getWidth() - 28), 14, y + 1); y += 7;
+    } else if(b.type === 'cards'){
+      table({body: b.rows.map(r=>[pdfText(r[0]), pdfText(r[1]), pdfText(r[2])]), theme:'plain', columnStyles:{0:{fontStyle:'bold'}, 1:{halign:'right'}, 2:{textColor:110}}});
+    } else {
+      const colStyles = {};
+      b.numeric.forEach((isNum, i)=>{ if(isNum) colStyles[i] = {halign:'right'}; });
+      table({
+        head: b.head.length ? b.head.map(r=>r.map(pdfText)) : undefined,
+        body: b.body.map(r=>r.cells.map(pdfText)),
+        theme:'striped', columnStyles: colStyles,
+        didParseCell: (d)=>{
+          if(d.section === 'head' && b.numeric[d.column.index]) d.cell.styles.halign = 'right';
+          if(d.section === 'body'){ const r = b.body[d.row.index]; if(r && r.bold) d.cell.styles.fontStyle = 'bold'; }
+        },
+      });
+    }
+  }
+  pdfFooter(doc);
+  return {doc, filename: exportFileBase(meta) + '.pdf'};
+}
+const XLSX_FORMATS = {money:'"R"#,##0.00;-"R"#,##0.00', pct:'0.0%', num:'#,##0.##'};
+async function buildReportWorkbook(meta, blocks){
+  const X = await ensureXlsxLib();
+  const aoa = [], fmtCells = [];
+  const push = (row, numericMask)=>{
+    const r = aoa.length;
+    aoa.push(row.map((v, c)=>{
+      if(numericMask && numericMask[c] !== false && typeof v === 'string'){
+        const p = exportNumber(v);
+        if(p){ fmtCells.push([r, c, XLSX_FORMATS[p.kind]]); return p.n; }
+      }
+      return v;
+    }));
+  };
+  push([(state.company && (state.company.trading_as || state.company.name)) || '']);
+  push([meta.title]);
+  if(meta.subtitle) push([meta.subtitle]);
+  push([`Prepared ${todayIso()}`]);
+  push([]);
+  for(const b of blocks){
+    if(b.type === 'heading'){ push([b.text]); continue; }
+    if(b.type === 'cards'){ b.rows.forEach(r=>push(r, [false, true, false])); push([]); continue; }
+    b.head.forEach(h=>push(h));
+    b.body.forEach(r=>push(r.cells, r.cells.map((_, i)=>i > 0 || b.numeric[i])));
+    push([]);
+  }
+  const ws = X.utils.aoa_to_sheet(aoa);
+  fmtCells.forEach(([r, c, z])=>{ const ref = X.utils.encode_cell({r, c}); if(ws[ref]) ws[ref].z = z; });
+  const widths = [];
+  aoa.forEach((row, ri)=>row.forEach((v, c)=>{ if(ri < 4 && c === 0) return; const len = String(v == null ? '' : (typeof v === 'number' ? v.toFixed(2) : v)).length + 2; widths[c] = Math.min(60, Math.max(widths[c] || 10, len)); }));
+  ws['!cols'] = widths.map(w=>({wch: w}));
+  const wb = X.utils.book_new();
+  X.utils.book_append_sheet(wb, ws, String(meta.title).replace(/[\[\]:*?\/\\]/g, ' ').slice(0, 31) || 'Report');
+  return {wb, X, filename: exportFileBase(meta) + '.xlsx'};
+}
+async function runReportExport(scope, kind, btn){
+  const meta = exportScopeMeta(scope);
+  const blocks = collectExportBlocks(meta.root);
+  if(!blocks.some(b=>b.type !== 'heading')){ toast('There is nothing to export on this page yet.'); return null; }
+  const label = btn ? btn.textContent : '';
+  if(btn){ btn.disabled = true; btn.textContent = 'Preparing…'; }
+  try{
+    if(kind === 'pdf'){ const built = await buildReportPdf(meta, blocks); downloadPdf(built); return built.filename; }
+    const built = await buildReportWorkbook(meta, blocks);
+    built.X.writeFile(built.wb, built.filename);
+    return built.filename;
+  }catch(e){
+    toast(`Could not create the ${kind === 'pdf' ? 'PDF' : 'Excel file'} (${e.message}). Check your internet connection and try again.`);
+    return null;
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = label; }
+  }
+}
+document.addEventListener('click', (e)=>{
+  const b = e.target.closest && e.target.closest('[data-export]');
+  if(!b) return;
+  e.preventDefault();
+  runReportExport(b.dataset.exportScope, b.dataset.export, b);
+});
+
+/* ========================= INVOICE STAGES, BANKING DETAILS, CREDITING AN INVOICE ========================= */
+// Stages an invoice moves through: draft (saved, not yet sent for approval) -> awaiting approval -> approved
+// -> sent -> paid. A draft is an unapproved invoice with no submitted_at; rejected invoices sit apart.
+const INVOICE_STAGES = [
+  {key:'all', label:'All'}, {key:'draft', label:'Drafts'}, {key:'awaiting', label:'Awaiting approval'},
+  {key:'approved', label:'Approved'}, {key:'sent', label:'Sent'}, {key:'paid', label:'Paid'}, {key:'rejected', label:'Rejected'},
+];
+const INVOICE_STAGE_PILL = {draft:['status-draft','Draft'], awaiting:['status-pending','Awaiting approval'], approved:['status-approved','Approved'], sent:['status-sent','Sent'], overdue:['status-overdue','Overdue'], paid:['status-paid','Paid'], credited:['status-paid','Credited'], rejected:['status-overdue','Rejected']};
+// After an invoice changes stage, a filtered list follows it to its new tab ("All" stays on All).
+function followInvoiceTo(stage){ if(state.invoiceTab && state.invoiceTab !== 'all' && state.invoiceTab !== stage) state.invoiceTab = stage; }
+
+// Sales accounts: each invoice / credit note line can be booked to its own revenue account from the
+// Chart of Accounts (default Sales Revenue 4000). The ledger splits the invoice's net revenue across the
+// accounts in proportion to the lines; VAT and the receivable are unchanged.
+function salesAccounts(){ return chartAccountList().filter(a=>a.type === 'revenue' && a.key && a.active !== false); }
+function validSalesKey(k){ return (k && salesAccounts().some(a=>a.key === k)) ? k : 'REV'; }
+function salesAccountName(k){ const a = salesAccounts().find(x=>x.key === validSalesKey(k)); return a ? `${a.code} ${a.name}` : 'Sales Revenue'; }
+function salesAccountSelect(selected){
+  const key = validSalesKey(selected);
+  return `<select class="ii-account" aria-label="Sales account">${salesAccounts().map(a=>`<option value="${escHtml(a.key)}" ${a.key === key ? 'selected' : ''}>${escHtml(a.code)} ${escHtml(a.name)}</option>`).join('')}</select>`;
+}
+function revenueSplit(items, net){
+  const lines = (items||[]).map(it=>({key: validSalesKey(it.account_key), w: (Number(it.quantity)||0) * (Number(it.unit_price)||0)})).filter(l=>l.w > 0);
+  const totalW = lines.reduce((a,l)=>a + l.w, 0);
+  if(!lines.length || totalW <= 0) return [['REV', net]];
+  const byKey = {};
+  lines.forEach(l=>{ byKey[l.key] = (byKey[l.key] || 0) + l.w; });
+  const keys = Object.keys(byKey);
+  if(keys.length === 1) return [[keys[0], net]];
+  let left = net;
+  return keys.map((k, i)=>{ const amt = i === keys.length - 1 ? round2(left) : round2(net * byKey[k] / totalW); left = round2(left - amt); return [k, amt]; });
+}
+
+// Invoice colour: the company's choice for the line-item header row ("Description, Qty, ..."), the balance-due
+// highlight and accents on invoices (PDF, email and the on-screen invoice). Text on it is white or dark,
+// whichever reads better.
+const INVOICE_COLOR_PRESETS = [['#7c5cff','Violet'],['#0fb981','Teal'],['#0b7a3e','Green'],['#1d4ed8','Blue'],['#0e7490','Ocean'],['#1f2937','Charcoal'],['#000000','Black'],['#b91c1c','Red'],['#ea580c','Orange'],['#a16207','Gold']];
+function invoiceColor(){ const c = state.company && state.company.invoice_color; return /^#[0-9a-f]{6}$/i.test(c || '') ? c.toLowerCase() : '#7c5cff'; }
+function hexRgb(h){ const n = parseInt(String(h).slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+function invoiceInk(h){
+  const lin = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  const [r, g, b] = hexRgb(h); const L = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+  return (1.05 / (L + 0.05)) >= 3 ? '#ffffff' : '#191a23';   // white whenever it is readable (3:1, bold text), else dark
+}
+function tintRgb(rgb, t){ return rgb.map(c=>Math.round(c + (255 - c) * t)); }
+function isDraftInvoice(inv){ return !!inv && inv.approval_status === 'pending' && !inv.submitted_at; }
+function invoiceStage(inv){
+  if(!inv) return 'draft';
+  if(inv.approval_status === 'rejected') return 'rejected';
+  if(inv.approval_status === 'pending') return inv.submitted_at ? 'awaiting' : 'draft';
+  const b = invoiceBalance(inv);
+  if(inv.status === 'paid' || (b.total > 0.005 && b.balance <= 0.005)) return 'paid';
+  if(inv.status === 'sent' || inv.status === 'overdue' || inv.emailed_at || b.paid > 0.005 || b.credited > 0.005) return 'sent';
+  return 'approved';
+}
+function invoiceStagePill(inv){
+  let st = invoiceStage(inv);
+  if(st === 'sent' && inv.due_date && inv.due_date < todayIso()) st = 'overdue';
+  if(st === 'paid'){ const b = invoiceBalance(inv); if(b.credited > 0.005 && b.paid < 0.005) st = 'credited'; }
+  const [cls, label] = INVOICE_STAGE_PILL[st];
+  return `<span class="status-pill ${cls}">${label}</span>`;
+}
+function invoicesInStage(key){ return key === 'all' ? state.invoices : state.invoices.filter(i=>invoiceStage(i) === key); }
+
+// Issued, approved credit notes raised against this invoice (Rand, and in the invoice's own currency).
+function invoiceCreditNotes(inv){ return (state.creditNotes||[]).filter(cn=>cn.invoice_id === inv.id && cn.approval_status === 'approved' && cn.status === 'issued'); }
+function invoiceCredited(inv){ return round2(invoiceCreditNotes(inv).reduce((a,cn)=>a + docTotalZAR(cn, (state.creditNoteItems||{})[cn.id]), 0)); }
+function invoiceCreditedForeign(inv){
+  return round2(invoiceCreditNotes(inv).reduce((a,cn)=>{
+    const items = (state.creditNoteItems||{})[cn.id];
+    return a + ((cn.currency || 'ZAR') === (inv.currency || 'ZAR') ? docTotal(items) : docTotalZAR(cn, items) / fxDocRate(inv));
+  }, 0));
+}
+
+// Banking details: kept on the company's bank accounts (Settings -> Bank accounts). An invoice shows its
+// chosen account, or the account marked "show on invoices", unless banking details are switched off for it.
+function defaultInvoiceBankAccount(){ return (state.accounts||[]).find(a=>a.show_on_invoices && a.account_number) || null; }
+function invoiceBankAccount(inv){
+  if(inv && inv.hide_bank_details) return null;
+  const chosen = inv && inv.bank_account_id ? (state.accounts||[]).find(a=>a.id === inv.bank_account_id) : null;
+  const acct = chosen || defaultInvoiceBankAccount();
+  return acct && acct.account_number ? acct : null;
+}
+function bankDetailsLines(acct, reference){
+  if(!acct) return [];
+  return [
+    ['Bank', acct.bank_name], ['Account holder', acct.account_holder || (state.company && (state.company.trading_as || state.company.name))],
+    ['Account number', acct.account_number], ['Branch code', acct.branch_code], ['Account type', acct.type === 'savings' ? 'Savings' : 'Current / cheque'],
+    ['SWIFT code', acct.swift_code], ['Payment reference', reference],
+  ].filter(([, v])=>v);
+}
+function bankDetailsHtml(acct, reference, style){
+  const lines = bankDetailsLines(acct, reference);
+  if(!lines.length) return '';
+  if(style === 'email') return `<div style="margin-top:16px;padding:12px 14px;background:#f6f6fb;border-radius:6px;font-size:13px;"><div style="font-weight:700;margin-bottom:6px;">Banking details for EFT payments</div>${lines.map(([k, v])=>`<div><span style="color:#666;display:inline-block;min-width:130px;">${escHtml(k)}</span>${escHtml(v)}</div>`).join('')}</div>`;
+  return `<div class="bank-details" style="margin-top:14px;"><h4 style="margin:0 0 6px;">Banking details for EFT payments</h4><table class="kv-table"><tbody>${lines.map(([k, v])=>`<tr><td>${escHtml(k)}</td><td>${escHtml(v)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+function bankAccountOptions(selectedId, hide){
+  const accts = (state.accounts||[]).filter(a=>a.account_number);
+  const def = defaultInvoiceBankAccount();
+  return `<option value="" ${!selectedId && !hide ? 'selected' : ''}>${def ? `Default: ${escHtml(def.name)}` : 'Default (none set yet)'}</option>`
+    + accts.map(a=>`<option value="${a.id}" ${selectedId === a.id && !hide ? 'selected' : ''}>${escHtml(a.name)}${a.bank_name ? ' · ' + escHtml(a.bank_name) : ''} · ••••${escHtml(String(a.account_number).slice(-4))}</option>`).join('')
+    + `<option value="__none" ${hide ? 'selected' : ''}>Don't show banking details</option>`;
+}
+
+// "Credit note this invoice": the Credit Notes page opens with a credit note filled in from the invoice.
+async function openCreditNoteForInvoice(inv){
+  const {data: items} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', inv.id);
+  state.creditNotePrefill = {invoice: inv, items: items || [], balance: invoiceBalance(inv).balance};
+  document.getElementById('invoice-view-backdrop')?.classList.add('hidden');
+  goToView('creditnotes');
+}
+function applyCreditNotePrefill(){
+  const p = state.creditNotePrefill;
+  if(!p) return;
+  state.creditNotePrefill = null;
+  const inv = p.invoice;
+  const btn = document.getElementById('add-creditnote-btn');
+  if(!btn) return;
+  btn.click();
+  document.getElementById('creditnote-client').value = inv.client_id;
+  document.getElementById('creditnote-invoice').value = inv.id;
+  document.getElementById('creditnote-currency').value = inv.currency || 'ZAR';
+  document.getElementById('creditnote-exchange-rate').value = String(inv.exchange_rate || 1);
+  document.getElementById('creditnote-exchange-rate-field').classList.toggle('hidden', (inv.currency || 'ZAR') === 'ZAR');
+  document.getElementById('creditnote-reason').value = `Credit against invoice ${inv.invoice_number}`;
+  const body = document.getElementById('creditnote-items-body');
+  const vatEditable = weAreVatRegistered();
+  body.innerHTML = (p.items.length ? p.items : [{description:'', quantity:1, unit_price:0, vat_applicable:vatEditable}]).map(it=>invoiceItemRow(vatEditable, {salesAccount:true, accountKey: it.account_key})).join('');
+  [...body.querySelectorAll('tr')].forEach((tr, i)=>{
+    const it = p.items[i]; if(!it) return;
+    tr.querySelector('.ii-desc').value = it.description || '';
+    tr.querySelector('.ii-qty').value = it.quantity;
+    tr.querySelector('.ii-price').value = it.unit_price;
+    const vat = tr.querySelector('.ii-vat'); if(vat && !vat.disabled) vat.checked = !!it.vat_applicable;
+  });
+  const issueBox = document.getElementById('creditnote-issue-now-wrap');
+  if(issueBox) issueBox.classList.toggle('hidden', !canApprove());
+  const note = document.getElementById('creditnote-prefill-note');
+  if(note) note.textContent = `Filled in from invoice ${inv.invoice_number} (${fmt(p.balance)} still owing). Change the lines or amounts to credit only part of it.`;
+}
+
+
+// Clients and suppliers: how they pay or get paid (EFT, debit order, card, cash) and their credit terms in days.
+// Terms set the due date on new invoices and bills; the method fills the invoice's "Payment terms" wording.
+const PAYMENT_METHODS = [['eft','EFT (bank transfer)'],['debit_order','Debit order'],['card','Card'],['cash','Cash']];
+function paymentMethodLabel(m){ const f = PAYMENT_METHODS.find(x=>x[0]===m); return f ? f[1] : ''; }
+function paymentMethodOptions(sel, blankLabel){ return `<option value="">${blankLabel || 'Not set'}</option>` + PAYMENT_METHODS.map(([v,l])=>`<option value="${v}" ${v===sel?'selected':''}>${l}</option>`).join(''); }
+function addDaysIso(iso, n){ if(!iso) return ''; const d = new Date(iso + 'T00:00:00Z'); if(isNaN(d)) return ''; d.setUTCDate(d.getUTCDate() + Number(n || 0)); return d.toISOString().slice(0,10); }
+function termsDays(v){ const n = parseInt(v, 10); return Number.isFinite(n) && n >= 0 && n <= 365 ? n : null; }
+function partyTermsLabel(p){
+  if(!p) return '—';
+  const m = paymentMethodLabel(p.payment_method), d = termsDays(p.payment_terms_days);
+  const t = d == null ? '' : (d === 0 ? 'on receipt' : `${d} days`);
+  return [m, t].filter(Boolean).join(', ') || '—';
+}
+function clientGroups(){ return [...new Set((state.clients||[]).map(c=>(c.client_group||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b)); }
+function partyFieldsHtml(kind){   // shared extra fields on the client and supplier forms
+  const k = kind;
+  return `
+    <div class="field"><label>Contact person</label><input type="text" id="${k}-contact"></div>
+    ${k==='client' ? `<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+      <div class="field"><label>Customer reference <span style="font-weight:400;color:var(--muted);">(shown on invoices)</span></label><input type="text" id="client-ref" maxlength="40" placeholder="e.g. CUST-0042"></div>
+      <div class="field"><label>Group</label><input type="text" id="client-group" list="client-group-list" maxlength="60" placeholder="e.g. Retail, Monthly retainers"><datalist id="client-group-list">${clientGroups().map(g=>`<option value="${escHtml(g)}">`).join('')}</datalist></div>
+    </div>` : `<div class="field"><label>Company registration number</label><input type="text" id="supplier-reg" maxlength="40" placeholder="e.g. 2019/123456/07"></div>`}
+    <div class="field"><label>VAT number</label><input type="text" id="${k}-vat" maxlength="20"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+      <div class="field"><label>${k==='client' ? 'How they pay you' : 'How you pay them'}</label><select id="${k}-paymethod">${paymentMethodOptions('')}</select></div>
+      <div class="field"><label>Credit terms (days)</label><input type="number" id="${k}-terms" min="0" max="365" step="1" placeholder="e.g. 30"></div>
+    </div>
+    <p style="font-size:.78rem;color:var(--muted);margin:-4px 0 8px;">Credit terms set the due date on new ${k==='client' ? 'invoices' : 'bills'} (0 = due on receipt).</p>`;
+}
+function fillPartyForm(kind, p){
+  const v = (id, val) => { const el = document.getElementById(id); if(el) el.value = val == null ? '' : String(val); };
+  v(`${kind}-name`, p && p.name); v(`${kind}-email`, p && p.email); v(`${kind}-phone`, p && p.phone); v(`${kind}-address`, p && p.address);
+  v(`${kind}-contact`, p && p.contact_person); v(`${kind}-vat`, p && p.vat_number);
+  v(`${kind}-paymethod`, (p && p.payment_method) || ''); v(`${kind}-terms`, p && p.payment_terms_days != null ? p.payment_terms_days : '');
+  if(kind==='client'){ v('client-ref', p && p.account_ref); v('client-group', p && p.client_group); }
+  else v('supplier-reg', p && p.registration_number);
+}
+function readPartyForm(kind){
+  const g = id => { const el = document.getElementById(id); return el ? String(el.value || '').trim() : ''; };
+  const o = {
+    name: g(`${kind}-name`), email: g(`${kind}-email`) || null, phone: g(`${kind}-phone`) || null, address: g(`${kind}-address`) || null,
+    contact_person: g(`${kind}-contact`) || null, vat_number: g(`${kind}-vat`) || null,
+    payment_method: g(`${kind}-paymethod`) || null, payment_terms_days: termsDays(g(`${kind}-terms`))
+  };
+  if(kind==='client'){ o.account_ref = g('client-ref') || null; o.client_group = g('client-group') || null; }
+  else o.registration_number = g('supplier-reg') || null;
+  return o;
+}
+
+
+// Invoice header extras: customer reference (from the client), billing period, and the "Payment terms" text
+// printed on the invoice. The wording is filled in from the payment method and due date until someone edits it.
+const MONTHS_LONG = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function fmtLongDate(iso){ const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || ''); return m ? `${Number(m[3])} ${MONTHS_LONG[Number(m[2]) - 1]} ${m[1]}` : ''; }
+function fmtShortDate(iso){ const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || ''); return m ? `${Number(m[3])} ${MONTHS_LONG[Number(m[2]) - 1].slice(0,3)} ${m[1]}` : ''; }
+function defaultPaymentTermsText(method, dueIso, reference){
+  const by = dueIso ? ` by ${fmtLongDate(dueIso)}` : '';
+  const ref = reference ? ` Please use ${reference} as your payment reference.` : '';
+  switch(method){
+    case 'debit_order': return `Payment will be collected by debit order${dueIso ? ` on ${fmtLongDate(dueIso)}` : ''} from the bank account you authorised. Please make sure enough funds are available on that date.`;
+    case 'eft': return `Please pay by EFT${by} into the bank account shown on this invoice.${ref}`;
+    case 'card': return `Please pay by card${by}.${ref}`;
+    case 'cash': return `Payment in cash${by}. Please ask for a receipt.`;
+    default: return dueIso ? `Payment is due${by}.${ref}` : '';
+  }
+}
+// Calendar period an invoice covers, from its issue date: the week, month, quarter or year it falls in.
+function billingPeriodFor(issueIso, freq){
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(issueIso || ''); if(!m) return '';
+  const y = Number(m[1]), mo = Number(m[2]) - 1;
+  const iso = d => d.toISOString().slice(0,10);
+  let a, b;
+  if(freq === 'weekly'){ a = new Date(Date.UTC(y, mo, Number(m[3]))); b = new Date(a); b.setUTCDate(b.getUTCDate() + 6); }
+  else if(freq === 'quarterly'){ const q0 = mo - (mo % 3); a = new Date(Date.UTC(y, q0, 1)); b = new Date(Date.UTC(y, q0 + 3, 0)); }
+  else if(freq === 'annually'){ a = new Date(Date.UTC(y, mo, 1)); b = new Date(Date.UTC(y + 1, mo, 0)); }
+  else { a = new Date(Date.UTC(y, mo, 1)); b = new Date(Date.UTC(y, mo + 1, 0)); }
+  return `${fmtShortDate(iso(a))} – ${fmtShortDate(iso(b))}`;
+}
+function invoiceClient(id){ return (state.clients || []).find(c=>c.id===id) || null; }
 
 /* ========================= BANK RULES ========================= */
 // "Anything containing FNB MONTHLY FEE is a Bank charges expense": a rule matches unmatched bank lines by
@@ -3682,7 +4344,7 @@ function foreignOpenFor(kind, doc){
   const rate = fxDocRate(doc);
   if(kind === 'invoice'){
     const settled = (state.invoicePayments||[]).filter(p=>p.invoice_id===doc.id).reduce((a,p)=>a+settledForeign(p, doc), 0);
-    return Math.max(0, round2(docTotal((state.invoiceItems||{})[doc.id]) - settled - invoiceWrittenOff(doc.id) / rate - docAllocatedForeign('invoice', doc.id)));
+    return Math.max(0, round2(docTotal((state.invoiceItems||{})[doc.id]) - settled - invoiceWrittenOff(doc.id) / rate - docAllocatedForeign('invoice', doc.id) - invoiceCreditedForeign(doc)));
   }
   const settled = (state.supplierInvoicePayments||[]).filter(p=>p.supplier_invoice_id===doc.id).reduce((a,p)=>a+settledForeign(p, doc), 0);
   return Math.max(0, round2(docTotal((state.supplierInvoiceItems||{})[doc.id]) - settled - docAllocatedForeign('bill', doc.id)));
@@ -4220,7 +4882,7 @@ function render(){
     case 'clients': main.innerHTML = renderClients(); attachClientHandlers(); break;
     case 'quotes': main.innerHTML = renderQuotes(); attachQuoteHandlers(); break;
     case 'invoices': main.innerHTML = renderInvoices(); attachInvoiceHandlers(); break;
-    case 'creditnotes': main.innerHTML = renderCreditNotes(); attachCreditNoteHandlers(); break;
+    case 'creditnotes': main.innerHTML = renderCreditNotes(); attachCreditNoteHandlers(); applyCreditNotePrefill(); break;
     case 'payroll': main.innerHTML = renderPayroll(); attachPayrollHandlers(); break;
     case 'tasks': main.innerHTML = renderTasks(); attachTasksHandlers(); break;
     case 'vat': main.innerHTML = renderVat(); attachVatHandlers(); break;
@@ -5131,7 +5793,7 @@ function buildLedger(){
     const tags = e.tags || [];
     const {gross, net, vat} = ledgerSplitVat(e.amount, e.vat_applicable);
     if(e.type === 'revenue'){
-      if(e.source_invoice_id) post(e.entry_date, 'Invoice', e.description, [['AR', gross],['REV', -net],['VAT', -vat]]);
+      if(e.source_invoice_id) post(e.entry_date, 'Invoice', e.description, [['AR', gross], ...revenueSplit((state.invoiceItems||{})[e.source_invoice_id], net).map(([k, v])=>[k, -v]), ['VAT', -vat]]);
       else post(e.entry_date, 'Revenue', e.description, [['BANK', gross],['REV', -net],['VAT', -vat]], e.id);
     } else {
       if(tags.includes('depreciation')){
@@ -5165,7 +5827,7 @@ function buildLedger(){
   (state.creditNotes||[]).filter(cn=>cn.approval_status==='approved' && cn.status==='issued').forEach(cn=>{
     const items = (state.creditNoteItems||{})[cn.id] || [];
     const {gross, net, vat} = ledgerSplitVat(docTotal(items), items.some(it=>it.vat_applicable));
-    post(cn.issue_date, 'Credit Note', `Credit note ${cn.credit_note_number}`, [['REV', net],['VAT', vat],['AR', -gross]]);
+    post(cn.issue_date, 'Credit Note', `Credit note ${cn.credit_note_number}`, [...revenueSplit(items, net), ['VAT', vat], ['AR', -gross]]);
   });
 
   // Supplier invoice payments & supplier credit notes.
@@ -5966,7 +6628,8 @@ function invoiceBalance(inv){
   const paid = round2((state.invoicePayments||[]).filter(p=>p.invoice_id===inv.id).reduce((s,p)=>s+paymentCleared(p, inv),0));
   const writtenOff = invoiceWrittenOff(inv.id);
   const allocated = docAllocated('invoice', inv.id);
-  return {total, paid, writtenOff, allocated, balance: Math.max(0, round2(total - paid - writtenOff - allocated))};
+  const credited = invoiceCredited(inv);   // issued credit notes raised against this invoice
+  return {total, paid, writtenOff, allocated, credited, balance: Math.max(0, round2(total - paid - writtenOff - allocated - credited))};
 }
 // Liability (loan) equivalent of billBalance()/invoiceBalance(). Only the principal portion of a
 // payment reduces the balance — interest is a P&L expense, posted separately as a cc_entries row
@@ -6019,8 +6682,8 @@ function renderSupplierInvoices(){
     ${pendingCount ? `<div class="panel" style="border-top:3px solid var(--warn);"><h3 style="margin-top:0;color:var(--warn);">Pending approval (${pendingCount})</h3><p style="color:var(--muted);font-size:.85rem;margin-bottom:0;">${canApprove() ? 'Open one below to approve or reject it.' : 'Waiting on management or an approver to review.'}</p></div>` : ''}
     <div class="panel">
       <h3 style="margin-top:0;">Suppliers</h3>
-      ${state.suppliers.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Prepaid</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.suppliers.map(s=>`<tr><td>${s.name}</td><td>${s.email||'—'}</td><td>${s.phone||'—'}</td><td>${partyCreditsFor('supplier', s.id).length ? `<button class="btn small secondary" data-credits="supplier|${s.id}">${fmt(partyCreditBalance('supplier', s.id))}</button>` : '—'}</td>${canEdit?`<td><button class="btn small secondary" data-new-prepay="supplier|${s.id}">Prepayment</button> <button class="btn small danger" data-del-supplier="${s.id}">Delete</button></td>`:''}</tr>`).join('')}
+      ${state.suppliers.length ? `<table><thead><tr><th>Name</th><th>Reg no / VAT</th><th>Email</th><th>Phone</th><th>Terms</th><th>Prepaid</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.suppliers.map(s=>`<tr><td>${escHtml(s.name)}${s.contact_person ? `<div style="font-size:.75rem;color:var(--muted);">${escHtml(s.contact_person)}</div>` : ''}</td><td style="font-size:.82rem;">${escHtml(s.registration_number||'—')}${s.vat_number ? `<div style="color:var(--muted);">VAT ${escHtml(s.vat_number)}</div>` : ''}</td><td>${s.email||'—'}</td><td>${s.phone||'—'}</td><td style="font-size:.82rem;">${escHtml(partyTermsLabel(s))}</td><td>${partyCreditsFor('supplier', s.id).length ? `<button class="btn small secondary" data-credits="supplier|${s.id}">${fmt(partyCreditBalance('supplier', s.id))}</button>` : '—'}</td>${canEdit?`<td><button class="btn small secondary" data-edit-supplier="${s.id}">Edit</button> <button class="btn small secondary" data-new-prepay="supplier|${s.id}">Prepayment</button> <button class="btn small danger" data-del-supplier="${s.id}">Delete</button></td>`:''}</tr>`).join('')}
       </tbody></table>` : `<div class="empty">No suppliers yet.</div>`}
     </div>
     ${purchaseOrdersPanel()}
@@ -6062,12 +6725,13 @@ function renderSupplierInvoices(){
     ${canEdit ? `
     <div class="modal-backdrop hidden" id="supplier-modal-backdrop"><div class="modal">
       <button class="close-x" id="supplier-modal-close">✕</button>
-      <h2>Add Supplier</h2>
+      <h2 id="supplier-modal-title">Add Supplier</h2>
       <form id="supplier-form">
         <div class="field"><label>Name</label><input type="text" id="supplier-name" required></div>
         <div class="field"><label>Email</label><input type="email" id="supplier-email"></div>
         <div class="field"><label>Phone</label><input type="text" id="supplier-phone"></div>
         <div class="field"><label>Address</label><textarea id="supplier-address" rows="2"></textarea></div>
+        ${partyFieldsHtml('supplier')}
         <div class="modal-actions"><button type="button" class="btn secondary" id="supplier-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
       </form>
     </div></div>
@@ -6151,24 +6815,42 @@ function supplierCreditNoteModal(){
     </div>
   </div>`;
 }
+// A bill's due date follows the supplier's credit terms unless someone typed a due date themselves.
+function billDueFromTerms(force){
+  const due = document.getElementById('supplier-invoice-due-date'); if(!due) return;
+  if(!force && due.value && due.dataset.auto !== '1') return;
+  const sp = state.suppliers.find(x=>x.id===document.getElementById('supplier-invoice-supplier').value);
+  const d = sp ? termsDays(sp.payment_terms_days) : null;
+  const iss = document.getElementById('supplier-invoice-issue-date').value;
+  if(d == null || !iss){ if(due.dataset.auto === '1'){ due.value = ''; due.dataset.auto = ''; } return; }
+  due.value = addDaysIso(iss, d); due.dataset.auto = '1';
+}
 function attachSupplierInvoiceHandlers(){
   const canEdit = hasModule('supplier_invoices');
   wireCreditButtons();
   // ---- Suppliers ----
   const supplierBackdrop = document.getElementById('supplier-modal-backdrop');
-  document.getElementById('add-supplier-btn')?.addEventListener('click', ()=>supplierBackdrop.classList.remove('hidden'));
+  const openSupplierForm = (sp) => {
+    const form = document.getElementById('supplier-form'); if(!form) return;
+    form.dataset.editId = sp ? sp.id : '';
+    document.getElementById('supplier-modal-title').textContent = sp ? 'Edit Supplier' : 'Add Supplier';
+    fillPartyForm('supplier', sp || null);
+    supplierBackdrop.classList.remove('hidden');
+  };
+  document.getElementById('add-supplier-btn')?.addEventListener('click', ()=>openSupplierForm(null));
+  document.querySelectorAll('[data-edit-supplier]').forEach(b=>b.addEventListener('click', ()=>openSupplierForm(state.suppliers.find(x=>x.id===b.dataset.editSupplier))));
   document.getElementById('supplier-cancel')?.addEventListener('click', ()=>supplierBackdrop.classList.add('hidden'));
   document.getElementById('supplier-modal-close')?.addEventListener('click', ()=>supplierBackdrop.classList.add('hidden'));
   document.getElementById('supplier-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
-    const {error} = await sb.from('cc_suppliers').insert({
-      company_id: state.company.id,
-      name: document.getElementById('supplier-name').value.trim(),
-      email: document.getElementById('supplier-email').value.trim() || null,
-      phone: document.getElementById('supplier-phone').value.trim() || null,
-      address: document.getElementById('supplier-address').value.trim() || null
-    });
+    const editId = e.target.dataset.editId || '';
+    const o = readPartyForm('supplier');
+    const {error} = editId
+      ? await sb.from('cc_suppliers').update(o).eq('id', editId)
+      : await sb.from('cc_suppliers').insert({company_id: state.company.id, ...o});
     if(error){ toast(error.message); return; }
+    await logActivity(editId ? 'update' : 'create', 'supplier', editId || null, `${editId ? 'Updated' : 'Added'} supplier ${o.name}`);
+    e.target.dataset.editId = '';
     await refreshAll(); render(); toast('Supplier saved.');
   });
   document.querySelectorAll('[data-del-supplier]').forEach(btn=>{
@@ -6194,11 +6876,15 @@ function attachSupplierInvoiceHandlers(){
     document.getElementById('supplier-invoice-issue-date').value = new Date().toISOString().slice(0,10);
     document.getElementById('supplier-invoice-items-body').innerHTML = invoiceItemRowWithStock();
     document.getElementById('supplier-invoice-attachment-file').value = '';
+    billDueFromTerms(true);
     document.getElementById('supplier-invoice-currency').value = 'ZAR';
     document.getElementById('supplier-invoice-exchange-rate').value = '1';
     document.getElementById('supplier-invoice-rate-field').classList.add('hidden');
     invBackdrop.classList.remove('hidden');
   });
+  document.getElementById('supplier-invoice-supplier')?.addEventListener('change', ()=>billDueFromTerms(false));
+  document.getElementById('supplier-invoice-issue-date')?.addEventListener('change', ()=>billDueFromTerms(false));
+  document.getElementById('supplier-invoice-due-date')?.addEventListener('input', e=>{ e.target.dataset.auto = ''; });
   document.getElementById('supplier-invoice-currency')?.addEventListener('change', async (e)=>{
     const cur = e.target.value;
     document.getElementById('supplier-invoice-rate-field').classList.toggle('hidden', cur==='ZAR');
@@ -6634,18 +7320,20 @@ function attachStockHandlers(){
 // A line item row with an extra "Stock item" column — used only on Invoices (selling, decrements
 // qty and posts cost of sales) and Supplier Invoices (buying, increments qty). Quotes, customer
 // credit notes and supplier credit notes keep the plain invoiceItemRow() with no stock linkage.
-function invoiceItemRowWithStock(vatEditable){
+function invoiceItemRowWithStock(vatEditable, opts){
   if(vatEditable === undefined) vatEditable = true;
+  const accountCell = (opts && opts.salesAccount) ? `<td>${salesAccountSelect(opts.accountKey)}</td>` : '';
   const vatCell = vatEditable
     ? `<input type="checkbox" class="ii-vat" checked style="width:auto;">`
     : `<input type="checkbox" class="ii-vat" disabled title="Not VAT registered" style="width:auto;">`;
   const stockOptions = state.stockItems.map(s=>`<option value="${s.id}">${s.name}</option>`).join('');
   const stockCell = tracksInventory() ? `<td><select class="ii-stock"><option value="">— none —</option>${stockOptions}</select></td>` : '';
   return `<tr>
-    <td><input type="text" class="ii-desc" required></td>
+    <td><input type="text" class="ii-desc" required>${(opts && opts.details) ? `<input type="text" class="ii-details" placeholder="Details (optional), e.g. period or scope" style="margin-top:4px;font-size:.82rem;">` : ''}</td>
     <td><input type="number" class="ii-qty" value="1" step="0.01"></td>
     <td><input type="number" class="ii-price" value="0" step="0.01"></td>
     <td style="text-align:center;">${vatCell}</td>
+    ${accountCell}
     ${stockCell}
     <td><button type="button" class="btn small danger ii-remove">✕</button></td>
   </tr>`;
@@ -6689,27 +7377,43 @@ async function applyStockPurchaseMovements(items){
 
 
 /* ========================= CLIENTS ========================= */
+function clientTableSections(){
+  const f = state.clientGroupFilter || '';
+  const list = state.clients.filter(c=>!f || (f==='__none' ? !c.client_group : c.client_group===f));
+  const groups = clientGroups();
+  if(!groups.length) return [[null, list]];
+  const out = groups.filter(g=>!f || f===g).map(g=>[g, list.filter(c=>c.client_group===g)]).filter(([,l])=>l.length);
+  const none = list.filter(c=>!c.client_group);
+  if(none.length) out.push(['', none]);
+  return out.length ? out : [[null, []]];
+}
+function clientGroupFilterHtml(){
+  const groups = clientGroups(); if(!groups.length) return '';
+  const f = state.clientGroupFilter || '';
+  return `<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;"><label style="font-size:.85rem;color:var(--muted);">Group</label><select id="client-group-filter" style="width:auto;"><option value="">All groups</option>${groups.map(g=>`<option value="${escHtml(g)}" ${g===f?'selected':''}>${escHtml(g)}</option>`).join('')}<option value="__none" ${f==='__none'?'selected':''}>No group</option></select></div>`;
+}
 function renderClients(){
   const canEdit = hasModule('clients');
   return `
     <div class="section-header" style="--accent-c:var(--c-clients);"><h1>Clients</h1><div style="display:flex;gap:8px;flex-wrap:wrap;">${hasModule('invoices') ? `<button class="btn secondary" id="send-statements-btn">Send statements</button>` : ''}${canEdit ? `<button class="btn" id="add-client-btn">+ Add Client</button>` : ''}</div></div>
     <p class="section-caption">The people and companies you invoice.</p>
     <div class="panel">
-      ${state.clients.length ? `<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Credit</th><th></th></tr></thead><tbody>
-        ${state.clients.map(c=>`<tr><td>${c.name}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td><td>${partyCreditsFor('client', c.id).length ? `<button class="btn small secondary" data-credits="client|${c.id}">${fmt(partyCreditBalance('client', c.id))}</button>` : '—'}</td><td><button class="btn small secondary" data-statement-client="${c.id}">Statement</button>${hasModule('invoices') ? ` <button class="btn small secondary" data-new-prepay="client|${c.id}">Prepayment</button>` : ''}${canEdit ? ` <label style="display:inline-flex;align-items:center;gap:4px;font-size:.78rem;color:var(--muted);" title="Automatic overdue reminders"><input type="checkbox" style="width:auto;" data-client-reminders="${c.id}" ${c.no_reminders ? '' : 'checked'}> Reminders</label>` : ''}${canEdit?` <button class="btn small danger" data-del-client="${c.id}">Delete</button>`:''}</td></tr>`).join('')}
-      </tbody></table>` : `<div class="empty">No clients yet.</div>`}
+      ${state.clients.length ? clientGroupFilterHtml() + clientTableSections().map(([grp, list])=>`${grp!==null ? `<h4 class="client-group-head">${grp ? escHtml(grp) : 'No group'} <span style="color:var(--muted);font-weight:400;">(${list.length})</span></h4>` : ''}<table><thead><tr><th>Name</th><th>Ref</th><th>Email</th><th>Phone</th><th>Terms</th><th>Credit</th><th></th></tr></thead><tbody>
+        ${list.map(c=>`<tr><td>${escHtml(c.name)}${c.contact_person ? `<div style="font-size:.75rem;color:var(--muted);">${escHtml(c.contact_person)}</div>` : ''}</td><td>${escHtml(c.account_ref||'—')}</td><td>${c.email||'—'}</td><td>${c.phone||'—'}</td><td style="font-size:.82rem;">${escHtml(partyTermsLabel(c))}</td><td>${partyCreditsFor('client', c.id).length ? `<button class="btn small secondary" data-credits="client|${c.id}">${fmt(partyCreditBalance('client', c.id))}</button>` : '—'}</td><td><button class="btn small secondary" data-statement-client="${c.id}">Statement</button>${hasModule('invoices') ? ` <button class="btn small secondary" data-new-prepay="client|${c.id}">Prepayment</button>` : ''}${canEdit ? ` <label style="display:inline-flex;align-items:center;gap:4px;font-size:.78rem;color:var(--muted);" title="Automatic overdue reminders"><input type="checkbox" style="width:auto;" data-client-reminders="${c.id}" ${c.no_reminders ? '' : 'checked'}> Reminders</label>` : ''}${canEdit?` <button class="btn small secondary" data-edit-client="${c.id}">Edit</button> <button class="btn small danger" data-del-client="${c.id}">Delete</button>`:''}</td></tr>`).join('')}
+      </tbody></table>`).join('') : `<div class="empty">No clients yet.</div>`}
     </div>
     ${clientStatementModal()}
     ${stmtDistModal()}
     ${canEdit ? `
     <div class="modal-backdrop hidden" id="client-modal-backdrop"><div class="modal">
       <button class="close-x" id="client-modal-close">✕</button>
-      <h2>Add Client</h2>
+      <h2 id="client-modal-title">Add Client</h2>
       <form id="client-form">
         <div class="field"><label>Name</label><input type="text" id="client-name" required></div>
         <div class="field"><label>Email</label><input type="email" id="client-email"></div>
         <div class="field"><label>Phone</label><input type="text" id="client-phone"></div>
-        <div class="field"><label>Address</label><textarea id="client-address" rows="2"></textarea></div>
+        <div class="field"><label>Address</label><textarea id="client-address" rows="3"></textarea></div>
+        ${partyFieldsHtml('client')}
         <div class="modal-actions"><button type="button" class="btn secondary" id="client-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
       </form>
     </div></div>` : ''}
@@ -6717,19 +7421,28 @@ function renderClients(){
 }
 function attachClientHandlers(){
   const backdrop = document.getElementById('client-modal-backdrop');
-  document.getElementById('add-client-btn')?.addEventListener('click', ()=>backdrop.classList.remove('hidden'));
+  const openClientForm = (c) => {
+    const form = document.getElementById('client-form'); if(!form) return;
+    form.dataset.editId = c ? c.id : '';
+    document.getElementById('client-modal-title').textContent = c ? 'Edit Client' : 'Add Client';
+    fillPartyForm('client', c || null);
+    backdrop.classList.remove('hidden');
+  };
+  document.getElementById('add-client-btn')?.addEventListener('click', ()=>openClientForm(null));
+  document.querySelectorAll('[data-edit-client]').forEach(b=>b.addEventListener('click', ()=>openClientForm(state.clients.find(c=>c.id===b.dataset.editClient))));
+  document.getElementById('client-group-filter')?.addEventListener('change', e=>{ state.clientGroupFilter = e.target.value; render(); });
   document.getElementById('client-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('client-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('client-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
-    const {error} = await sb.from('cc_clients').insert({
-      company_id: state.company.id,
-      name: document.getElementById('client-name').value.trim(),
-      email: document.getElementById('client-email').value.trim() || null,
-      phone: document.getElementById('client-phone').value.trim() || null,
-      address: document.getElementById('client-address').value.trim() || null
-    });
+    const editId = e.target.dataset.editId || '';
+    const o = readPartyForm('client');
+    const {error} = editId
+      ? await sb.from('cc_clients').update(o).eq('id', editId)
+      : await sb.from('cc_clients').insert({company_id: state.company.id, ...o});
     if(error){ toast(error.message); return; }
+    await logActivity(editId ? 'update' : 'create', 'client', editId || null, `${editId ? 'Updated' : 'Added'} client ${o.name}`);
+    e.target.dataset.editId = '';
     await refreshAll(); render(); toast('Saved.');
   });
   document.querySelectorAll('[data-del-client]').forEach(btn=>{
@@ -7147,6 +7860,7 @@ async function generateDueRecurringInvoices(){
   const today = new Date().toISOString().slice(0,10);
   const due = state.invoices.filter(i=>
     i.is_recurring &&
+    i.approval_status === 'approved' &&   // a draft, unapproved or rejected template doesn't repeat yet
     i.recurrence_next_date &&
     i.recurrence_next_date <= today &&
     (!i.recurrence_end_date || i.recurrence_next_date <= i.recurrence_end_date)
@@ -7158,21 +7872,25 @@ async function generateDueRecurringInvoices(){
     // Fetch the source invoice's line items to copy across.
     const {data: srcItems} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', src.id);
     const approvalStatus = canApprove() ? 'approved' : 'pending';
+    // Same gap between issue and due date as the template (whole days, calendar-safe).
+    const newDue = src.due_date ? addDaysIso(src.recurrence_next_date, Math.round((Date.parse(src.due_date + 'T00:00:00Z') - Date.parse(src.issue_date + 'T00:00:00Z')) / 86400000)) : null;
+    const newNumber = nextInvoiceNumber();
     const {data: created, error} = await sb.from('cc_invoices').insert({
       company_id: state.company.id,
       client_id: src.client_id,
-      invoice_number: nextInvoiceNumber(),
+      invoice_number: newNumber,
       issue_date: src.recurrence_next_date,
-      due_date: src.due_date ? (()=>{
-        const dayOffset = Math.round((new Date(src.due_date+'T00:00:00') - new Date(src.issue_date+'T00:00:00')) / (1000*60*60*24));
-        const d = new Date(src.recurrence_next_date + 'T00:00:00');
-        d.setDate(d.getDate() + dayOffset);
-        return d.toISOString().slice(0,10);
-      })() : null,
+      due_date: newDue,
       status: 'draft',
       notes: src.notes,
       created_by: src.created_by,
       approval_status: approvalStatus,
+      submitted_at: new Date().toISOString(),
+      customer_ref: src.customer_ref || null,
+      payment_method: src.payment_method || null,
+      billing_period: (src.billing_period && src.billing_period === billingPeriodFor(src.issue_date, src.recurrence_frequency)) ? billingPeriodFor(src.recurrence_next_date, src.recurrence_frequency) : (src.billing_period || null),
+      payment_terms: (src.payment_terms && src.payment_terms === defaultPaymentTermsText(src.payment_method, src.due_date, src.invoice_number)) ? defaultPaymentTermsText(src.payment_method, newDue, newNumber) : (src.payment_terms || null),
+      bank_account_id: src.bank_account_id || null, hide_bank_details: !!src.hide_bank_details,
       currency: src.currency || 'ZAR',
       exchange_rate: src.exchange_rate || 1,
       is_recurring: false,
@@ -7185,9 +7903,11 @@ async function generateDueRecurringInvoices(){
       await sb.from('cc_invoice_items').insert(srcItems.map(it=>({
         invoice_id: created.id,
         description: it.description,
+        details: it.details || null,
         quantity: it.quantity,
         unit_price: it.unit_price,
-        vat_applicable: it.vat_applicable
+        vat_applicable: it.vat_applicable,
+        account_key: it.account_key || null
       })));
     }
     if(approvalStatus === 'approved'){
@@ -7213,6 +7933,52 @@ function canManageDoc(doc){
 // linked cc_entries row (accrual) dated the invoice's issue date. Cash Flow and the
 // Balance Sheet exclude this entry from cash and use actual cc_invoice_payments
 // instead (see isNonCashEntry / computeCashFlow / computeBS).
+// Saving the edit form over a draft or an invoice still awaiting approval: the header is updated and the
+// lines replaced. Approving at the same time (approvers) recognises the revenue, as for a new invoice.
+async function saveEditedInvoice(inv, o){
+  const $ = id => document.getElementById(id);
+  const issueDate = $('invoice-issue-date').value;
+  if(isPeriodLocked(issueDate)){ toast(periodLockMessage()); return; }
+  if(inv.approval_status === 'approved'){ toast('Approved invoices cannot be edited. Raise a credit note instead.'); return; }
+  const currency = $('invoice-currency').value || 'ZAR';
+  const isRecurring = $('invoice-recurring').checked;
+  const frequency = $('invoice-recurrence-frequency').value;
+  const patch = {
+    client_id: $('invoice-client').value, invoice_number: $('invoice-number').value.trim(), issue_date: issueDate,
+    due_date: $('invoice-due-date').value || null, notes: $('invoice-notes').value.trim() || null,
+    currency, exchange_rate: currency === 'ZAR' ? 1 : (parseFloat($('invoice-exchange-rate').value) || 1),
+    is_recurring: isRecurring, recurrence_frequency: isRecurring ? frequency : null,
+    recurrence_next_date: isRecurring ? nextRecurrenceDate(issueDate, frequency) : null,
+    recurrence_end_date: isRecurring ? ($('invoice-recurrence-end').value || null) : null,
+    ...o.bankFields,
+  };
+  if(o.asDraft) patch.submitted_at = null;
+  else if(!inv.submitted_at || inv.approval_status === 'rejected') patch.submitted_at = new Date().toISOString();
+  if(inv.approval_status === 'rejected') patch.approval_status = 'pending';
+  const rows = [...document.querySelectorAll('#invoice-items-body tr')].map(tr=>({
+    invoice_id: inv.id, description: tr.querySelector('.ii-desc').value.trim(), details: (tr.querySelector('.ii-details')?.value || '').trim() || null, quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
+    unit_price: parseFloat(tr.querySelector('.ii-price').value)||0, vat_applicable: tr.querySelector('.ii-vat').checked, stock_item_id: tr.querySelector('.ii-stock')?.value || null,
+    account_key: tr.querySelector('.ii-account') ? validSalesKey(tr.querySelector('.ii-account').value) : null,
+  })).filter(r=>r.description);
+  if(!rows.length){ toast('Add at least one line.'); return; }
+  const {error} = await sb.from('cc_invoices').update(patch).eq('id', inv.id);
+  if(error){ toast(error.message); return; }
+  const del = await sb.from('cc_invoice_items').delete().eq('invoice_id', inv.id);
+  if(del.error){ toast(del.error.message); return; }
+  const ins = await sb.from('cc_invoice_items').insert(rows);
+  if(ins.error){ toast(ins.error.message); return; }
+  let approved = false;
+  if(!o.asDraft && canApprove()){
+    const {error: apErr} = await sb.from('cc_invoices').update({approval_status:'approved', approved_by: state.user.id, approved_at: new Date().toISOString()}).eq('id', inv.id);
+    if(!apErr){ approved = true; await recognizeInvoiceRevenue({...inv, ...patch, approval_status:'approved'}, rows); }
+  }
+  await logActivity('update', 'invoice', inv.id, `${patch.invoice_number} ${o.asDraft ? 'saved as draft' : approved ? 'edited and approved' : 'edited and submitted'}`);
+  document.getElementById('invoice-modal-backdrop').classList.add('hidden');
+  state.invoiceEditId = null;
+  followInvoiceTo(o.asDraft ? 'draft' : approved ? 'approved' : 'awaiting');
+  await refreshAll(); render();
+  toast(o.asDraft ? 'Draft saved.' : approved ? 'Invoice approved.' : 'Invoice submitted for approval.');
+}
 async function recognizeInvoiceRevenue(invoice, items){
   const docCurrencyTotal = docTotal(items);
   if(docCurrencyTotal <= 0) return;
@@ -7251,19 +8017,28 @@ function overdueReminderLink(i, today){
 }
 function renderInvoices(){
   const canCreate = hasModule('invoices');
-  const pendingCount = state.invoices.filter(i=>i.approval_status==='pending').length;
+  const pendingCount = state.invoices.filter(i=>i.approval_status==='pending' && !isDraftInvoice(i)).length;
+  const invTab = INVOICE_STAGES.some(t=>t.key === state.invoiceTab) ? state.invoiceTab : 'all';
+  const grp = state.invoiceGroupFilter || '';
+  const inGroup = i => { if(!grp) return true; const c = invoiceClient(i.client_id); return grp === '__none' ? !(c && c.client_group) : !!(c && c.client_group === grp); };
+  const shown = invoicesInStage(invTab).filter(inGroup);
+  const groups = clientGroups();
   const today = todayIso();
   return `
     <div class="section-header" style="--accent-c:var(--c-invoices);"><h1>Invoices</h1>${canCreate ? `<button class="btn" id="add-invoice-btn">+ New Invoice</button>` : ''}</div>
     <p class="section-caption">Bills sent to clients — including recurring invoices and approval status.</p>
     ${pendingCount ? `<div class="panel" style="border-top:3px solid var(--warn);"><h3 style="margin-top:0;color:var(--warn);">Pending approval (${pendingCount})</h3><p style="color:var(--muted);font-size:.85rem;margin-bottom:0;">${canApprove() ? 'Open one below to approve or reject it.' : 'Waiting on management or an approver to review.'}</p></div>` : ''}
+    <div class="tabbar invoice-tabs" role="tablist" aria-label="Invoice stages">
+      ${INVOICE_STAGES.filter(t=>t.key !== 'rejected' || invoicesInStage('rejected').length).map(t=>{ const n = invoicesInStage(t.key).length; return `<button type="button" role="tab" aria-selected="${invTab===t.key}" class="btn ${invTab===t.key?'':'secondary'} small" data-invoice-tab="${t.key}">${t.label}${t.key==='all' ? '' : ` <span class="tab-count">${n}</span>`}</button>`; }).join('')}
+    </div>
     <div class="panel">
-      ${state.invoices.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Due</th><th>Status</th><th>Approval</th><th>Total</th><th></th></tr></thead><tbody>
-        ${state.invoices.map(i=>`<tr>
-          <td>${i.invoice_number}${i.is_recurring?` <span class="tag-pill" title="Recurring ${i.recurrence_frequency||''}">↻ recurring</span>`:''}</td><td>${clientName(i.client_id)}</td><td>${i.issue_date}</td><td>${i.due_date||'—'}</td>
-          <td><span class="status-pill status-${i.status}">${i.status}</span></td>
-          <td>${approvalPill(i)}</td>
-          <td id="inv-total-${i.id}">…</td>
+      ${groups.length ? `<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;"><label style="font-size:.85rem;color:var(--muted);">Client group</label><select id="invoice-group-filter" style="width:auto;"><option value="">All groups</option>${groups.map(g=>`<option value="${escHtml(g)}" ${g===grp?'selected':''}>${escHtml(g)}</option>`).join('')}<option value="__none" ${grp==='__none'?'selected':''}>No group</option></select></div>` : ''}
+      ${shown.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Due</th><th>Stage</th><th style="text-align:right;">Total</th><th style="text-align:right;">Owing</th><th></th></tr></thead><tbody>
+        ${shown.map(i=>`<tr>
+          <td>${i.invoice_number}${i.is_recurring?` <span class="tag-pill" title="Recurring ${i.recurrence_frequency||''}">↻ recurring</span>`:''}</td><td>${clientName(i.client_id)}${(i.customer_ref || (invoiceClient(i.client_id)||{}).account_ref) ? `<div style="font-size:.75rem;color:var(--muted);">Ref ${escHtml(i.customer_ref || invoiceClient(i.client_id).account_ref)}</div>` : ''}</td><td>${i.issue_date}</td><td>${i.due_date||'—'}</td>
+          <td>${invoiceStagePill(i)}</td>
+          <td id="inv-total-${i.id}" style="text-align:right;">…</td>
+          <td style="text-align:right;">${i.approval_status === 'approved' ? fmt(invoiceBalance(i).balance) : '—'}</td>
           <td>
             <button class="btn small secondary" data-view-invoice="${i.id}">View</button>
             <button type="button" class="btn small secondary" data-attachments="invoice|${i.id}" data-attachments-label="Invoice ${i.invoice_number}">${attachmentCountFor('invoice',i.id) ? attachmentCountFor('invoice',i.id)+' file'+(attachmentCountFor('invoice',i.id)>1?'s':'') : 'Attach'}</button>
@@ -7271,7 +8046,7 @@ function renderInvoices(){
             ${canManageDoc(i)?`<button class="btn small danger" data-del-invoice="${i.id}">Delete</button>`:''}
           </td>
         </tr>`).join('')}
-      </tbody></table>` : `<div class="empty">No invoices yet.</div>`}
+      </tbody></table>` : `<div class="empty">${state.invoices.length ? grp && invoicesInStage(invTab).length ? 'No invoices for this client group here.' : `No invoices in ${escHtml((INVOICE_STAGES.find(t=>t.key===invTab)||{}).label || 'this stage').toLowerCase()} right now.` : 'No invoices yet.'}</div>`}
     </div>
     ${canCreate ? invoiceModal() : ''}
     <div class="modal-backdrop hidden" id="invoice-view-backdrop"><div class="modal" id="invoice-view-content"></div></div>
@@ -7283,7 +8058,7 @@ function invoiceModal(){
   <div class="modal-backdrop hidden" id="invoice-modal-backdrop">
     <div class="modal" style="max-width:600px;">
       <button class="close-x" id="invoice-modal-close">✕</button>
-      <h2>New Invoice</h2>
+      <h2 id="invoice-modal-title">New Invoice</h2>
       <div class="field">
         <label>Company logo (used on this and every future invoice)</label>
         ${state.company.logo_data_url ? `<img class="invoice-logo-preview" src="${state.company.logo_data_url}">` : ''}
@@ -7300,6 +8075,10 @@ function invoiceModal(){
           <div class="field"><label>Due date</label><input type="date" id="invoice-due-date"></div>
         </div>
         <div class="row">
+          <div class="field"><label>Customer reference</label><input type="text" id="invoice-customer-ref" maxlength="60" placeholder="From the client, or their PO number"></div>
+          <div class="field"><label>Billing period (optional)</label><input type="text" id="invoice-billing-period" maxlength="60" placeholder="e.g. 1 Oct 2026 – 31 Oct 2026"><button type="button" class="btn secondary small" id="invoice-period-fill" style="margin-top:4px;">This month</button></div>
+        </div>
+        <div class="row">
           <div class="field"><label>Currency</label><select id="invoice-currency">${CURRENCIES.map(c=>`<option value="${c}">${c}</option>`).join('')}</select></div>
           <div class="field hidden" id="invoice-exchange-rate-field"><label>Exchange rate (1 unit → ZAR)</label><input type="number" step="0.0001" id="invoice-exchange-rate" value="1"><button type="button" class="btn secondary small" id="invoice-suggest-rate" style="margin-top:4px;">Suggest rate</button></div>
         </div>
@@ -7314,31 +8093,124 @@ function invoiceModal(){
           <div class="field"><label>Stop after (optional)</label><input type="date" id="invoice-recurrence-end"></div>
         </div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th>${tracksInventory() ? '<th>Stock item</th>' : ''}<th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description <span style="font-weight:400;color:var(--muted);">and details</span></th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th>Sales account</th>${tracksInventory() ? '<th>Stock item</th>' : ''}<th></th></tr></thead>
           <tbody id="invoice-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="invoice-add-item" style="margin-top:8px;">+ Add line</button>
         <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="invoice-notes" rows="2"></textarea></div>
-        ${attachmentCaptureField('invoice-attachment-file')}
+        <h3 style="margin:14px 0 6px;">Payment terms</h3>
+        <div class="row">
+          <div class="field"><label>How the client pays</label><select id="invoice-payment-method">${paymentMethodOptions('', 'Not set')}</select></div>
+        </div>
+        <div class="field"><label>Payment terms (printed on the invoice)</label><textarea id="invoice-payment-terms" rows="3" maxlength="600" placeholder="e.g. Payment will be collected by debit order on 29 October 2026."></textarea>
+          <p style="font-size:.75rem;color:var(--muted);margin:2px 0 0;">Filled in from the client's payment method and the due date. Edit it freely; <a href="#" id="invoice-terms-reset">reset to the standard wording</a>.</p></div>
+        <h3 style="margin:14px 0 6px;">Your details on this invoice</h3>
+        <div class="field"><label>Your company address${isAdmin() ? ' (saved to Settings for every invoice)' : ''}</label><textarea id="invoice-company-address" rows="3" placeholder="Street, suburb, city, postal code" ${isAdmin() ? '' : 'readonly'}>${escHtml(state.company.address || '')}</textarea>${isAdmin() ? '' : '<p style="font-size:.75rem;color:var(--muted);margin:2px 0 0;">Management can change this in Settings.</p>'}</div>
+        <div class="field"><label>Banking details to show</label><select id="invoice-bank-account">${bankAccountOptions(null, false)}</select>
+          <p style="font-size:.75rem;color:var(--muted);margin:2px 0 0;">${(state.accounts||[]).some(a=>a.account_number) ? 'Clients see these so they can pay by EFT. Add or change accounts in Settings → Bank accounts.' : 'No banking details yet — add your account number in Settings → Bank accounts' + (isAdmin() ? '' : ' (management)') + ' and they will appear on your invoices.'}</p></div>
+        <div id="invoice-edit-wrap">${attachmentCaptureField('invoice-attachment-file')}</div>
         <div class="modal-actions">
           <button type="button" class="btn secondary" id="invoice-cancel">Cancel</button>
-          <button type="submit" class="btn">Save Invoice</button>
+          <button type="submit" class="btn secondary" data-invoice-save="draft">Save as draft</button>
+          <button type="submit" class="btn" data-invoice-save="submit" id="invoice-save-main">${canApprove() ? 'Save and approve' : 'Submit for approval'}</button>
         </div>
       </form>
     </div>
   </div>`;
 }
 
-function invoiceItemRow(vatEditable){
+// The New Invoice form doubles as "Edit draft": fields filled from the invoice and its lines.
+// Picking a client fills its customer reference, payment method and (from its credit terms) the due date,
+// without overwriting anything typed by hand; the payment-terms wording follows.
+function applyInvoiceClientDefaults(force){
+  const $ = id => document.getElementById(id);
+  const c = invoiceClient($('invoice-client') && $('invoice-client').value);
+  const ref = $('invoice-customer-ref');
+  if(ref && (force || ref.dataset.auto === '1' || !ref.value)){ ref.value = (c && c.account_ref) || ''; ref.dataset.auto = '1'; }
+  const pm = $('invoice-payment-method');
+  if(pm && (force || $('invoice-payment-terms').dataset.auto === '1')) pm.value = (c && c.payment_method) || '';
+  invoiceDueFromTerms(force);
+  refreshInvoiceTermsText(false);
+}
+function invoiceDueFromTerms(force){
+  const $ = id => document.getElementById(id);
+  const due = $('invoice-due-date'); if(!due) return;
+  if(!force && due.value && due.dataset.auto !== '1') return;
+  const c = invoiceClient($('invoice-client').value);
+  const d = c ? termsDays(c.payment_terms_days) : null;
+  const iss = $('invoice-issue-date').value;
+  if(d == null || !iss){ if(due.dataset.auto === '1') due.value = ''; return; }
+  due.value = addDaysIso(iss, d); due.dataset.auto = '1';
+}
+function refreshInvoiceTermsText(force){
+  const $ = id => document.getElementById(id);
+  const t = $('invoice-payment-terms'); if(!t) return;
+  if(!force && t.dataset.auto !== '1') return;
+  t.value = defaultPaymentTermsText($('invoice-payment-method').value, $('invoice-due-date').value, $('invoice-number').value.trim());
+  t.dataset.auto = '1';
+}
+async function openInvoiceForm(inv){
+  const backdrop = document.getElementById('invoice-modal-backdrop');
+  if(!backdrop) return;
+  state.invoiceEditId = inv ? inv.id : null;
+  const $ = id => document.getElementById(id);
+  $('invoice-modal-title').textContent = inv ? `Edit ${isDraftInvoice(inv) ? 'draft' : 'invoice'} ${inv.invoice_number}` : 'New Invoice';
+  $('invoice-number').value = inv ? inv.invoice_number : nextInvoiceNumber();
+  $('invoice-issue-date').value = inv ? inv.issue_date : todayIso();
+  $('invoice-due-date').value = inv ? (inv.due_date || '') : '';
+  if(inv) $('invoice-client').value = inv.client_id;
+  $('invoice-currency').value = inv ? (inv.currency || 'ZAR') : 'ZAR';
+  $('invoice-exchange-rate').value = inv ? String(inv.exchange_rate || 1) : '1';
+  $('invoice-exchange-rate-field').classList.toggle('hidden', $('invoice-currency').value === 'ZAR');
+  $('invoice-notes').value = inv ? (inv.notes || '') : '';
+  $('invoice-recurring').checked = !!(inv && inv.is_recurring);
+  $('invoice-recurrence-fields')?.classList.toggle('hidden', !(inv && inv.is_recurring));
+  if(inv && inv.recurrence_frequency) $('invoice-recurrence-frequency').value = inv.recurrence_frequency;
+  $('invoice-recurrence-end').value = inv ? (inv.recurrence_end_date || '') : '';
+  $('invoice-bank-account').innerHTML = bankAccountOptions(inv ? inv.bank_account_id : null, !!(inv && inv.hide_bank_details));
+  $('invoice-company-address').value = state.company.address || '';
+  $('invoice-customer-ref').value = inv ? (inv.customer_ref || '') : '';
+  $('invoice-customer-ref').dataset.auto = inv ? '' : '1';
+  $('invoice-billing-period').value = inv ? (inv.billing_period || '') : '';
+  $('invoice-payment-method').value = inv ? (inv.payment_method || '') : '';
+  $('invoice-payment-terms').value = inv ? (inv.payment_terms || '') : '';
+  $('invoice-payment-terms').dataset.auto = (!inv || !inv.payment_terms || inv.payment_terms === defaultPaymentTermsText(inv.payment_method, inv.due_date, inv.invoice_number)) ? '1' : '';
+  $('invoice-due-date').dataset.auto = inv ? '' : '1';
+  if(!inv) applyInvoiceClientDefaults(true);
+  const attach = $('invoice-attachment-file'); if(attach) attach.value = '';
+  $('invoice-edit-wrap').classList.toggle('hidden', !!inv);
+  const body = $('invoice-items-body');
+  const vatEditable = weAreVatRegistered();
+  if(inv){
+    const {data: items} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', inv.id);
+    const list = (items && items.length) ? items : [null];
+    body.innerHTML = list.map(it=>invoiceItemRowWithStock(vatEditable, {salesAccount:true, details:true, accountKey: it && it.account_key})).join('');
+    [...body.querySelectorAll('tr')].forEach((tr, i)=>{
+      const it = list[i]; if(!it) return;
+      tr.querySelector('.ii-desc').value = it.description || '';
+      const det = tr.querySelector('.ii-details'); if(det) det.value = it.details || '';
+      tr.querySelector('.ii-qty').value = it.quantity;
+      tr.querySelector('.ii-price').value = it.unit_price;
+      const vat = tr.querySelector('.ii-vat'); if(vat && !vat.disabled) vat.checked = !!it.vat_applicable;
+      const st = tr.querySelector('.ii-stock'); if(st && it.stock_item_id) st.value = it.stock_item_id;
+    });
+  } else body.innerHTML = invoiceItemRowWithStock(vatEditable, {salesAccount:true, details:true});
+  // An approver editing someone's submitted invoice keeps it submitted; drafts can be saved again as drafts.
+  $('invoice-save-main').textContent = canApprove() ? 'Save and approve' : (inv && !isDraftInvoice(inv) ? 'Save changes' : 'Submit for approval');
+  backdrop.classList.remove('hidden');
+}
+function invoiceItemRow(vatEditable, opts){
   if(vatEditable === undefined) vatEditable = true;
+  const accountCell = (opts && opts.salesAccount) ? `<td>${salesAccountSelect(opts.accountKey)}</td>` : '';
   const vatCell = vatEditable
     ? `<input type="checkbox" class="ii-vat" checked style="width:auto;">`
     : `<input type="checkbox" class="ii-vat" disabled title="Not VAT registered" style="width:auto;">`;
   return `<tr>
-    <td><input type="text" class="ii-desc" required></td>
+    <td><input type="text" class="ii-desc" required>${(opts && opts.details) ? `<input type="text" class="ii-details" placeholder="Details (optional), e.g. period or scope" style="margin-top:4px;font-size:.82rem;">` : ''}</td>
     <td><input type="number" class="ii-qty" value="1" step="0.01"></td>
     <td><input type="number" class="ii-price" value="0" step="0.01"></td>
     <td style="text-align:center;">${vatCell}</td>
+    ${accountCell}
     <td><button type="button" class="btn small danger ii-remove">✕</button></td>
   </tr>`;
 }
@@ -7385,18 +8257,29 @@ function uploadInvoiceLogo(file){
     reader.readAsDataURL(file);
   });
 }
+function invoiceExtraFields(){
+  const g = id => String((document.getElementById(id) || {}).value || '').trim();
+  return { customer_ref: g('invoice-customer-ref') || null, billing_period: g('invoice-billing-period') || null,
+    payment_method: g('invoice-payment-method') || null, payment_terms: g('invoice-payment-terms') || null };
+}
 function attachInvoiceHandlers(){
   const canCreate = hasModule('invoices');
   const backdrop = document.getElementById('invoice-modal-backdrop');
-  document.getElementById('add-invoice-btn')?.addEventListener('click', ()=>{
-    document.getElementById('invoice-number').value = nextInvoiceNumber();
-    document.getElementById('invoice-issue-date').value = new Date().toISOString().slice(0,10);
-    document.getElementById('invoice-items-body').innerHTML = invoiceItemRowWithStock(weAreVatRegistered());
-    document.getElementById('invoice-currency').value = 'ZAR';
-    document.getElementById('invoice-exchange-rate').value = '1';
-    document.getElementById('invoice-exchange-rate-field').classList.add('hidden');
-    document.getElementById('invoice-attachment-file').value = '';
-    backdrop.classList.remove('hidden');
+  document.getElementById('add-invoice-btn')?.addEventListener('click', ()=>openInvoiceForm(null));
+  document.querySelectorAll('[data-invoice-tab]').forEach(b=>b.addEventListener('click', ()=>{ state.invoiceTab = b.dataset.invoiceTab; render(); }));
+  document.getElementById('invoice-group-filter')?.addEventListener('change', e=>{ state.invoiceGroupFilter = e.target.value; render(); });
+  document.getElementById('invoice-client')?.addEventListener('change', ()=>applyInvoiceClientDefaults(false));
+  document.getElementById('invoice-issue-date')?.addEventListener('change', ()=>{ invoiceDueFromTerms(false); refreshInvoiceTermsText(false); });
+  document.getElementById('invoice-due-date')?.addEventListener('input', e=>{ e.target.dataset.auto = ''; refreshInvoiceTermsText(false); });
+  document.getElementById('invoice-due-date')?.addEventListener('change', ()=>refreshInvoiceTermsText(false));
+  document.getElementById('invoice-number')?.addEventListener('change', ()=>refreshInvoiceTermsText(false));
+  document.getElementById('invoice-payment-method')?.addEventListener('change', ()=>refreshInvoiceTermsText(true));
+  document.getElementById('invoice-payment-terms')?.addEventListener('input', e=>{ e.target.dataset.auto = ''; });
+  document.getElementById('invoice-customer-ref')?.addEventListener('input', e=>{ e.target.dataset.auto = ''; });
+  document.getElementById('invoice-terms-reset')?.addEventListener('click', e=>{ e.preventDefault(); refreshInvoiceTermsText(true); });
+  document.getElementById('invoice-period-fill')?.addEventListener('click', ()=>{
+    const freq = document.getElementById('invoice-recurring').checked ? document.getElementById('invoice-recurrence-frequency').value : 'monthly';
+    document.getElementById('invoice-billing-period').value = billingPeriodFor(document.getElementById('invoice-issue-date').value, freq);
   });
   document.getElementById('invoice-currency')?.addEventListener('change', (e)=>{
     document.getElementById('invoice-exchange-rate-field').classList.toggle('hidden', e.target.value==='ZAR');
@@ -7414,7 +8297,7 @@ function attachInvoiceHandlers(){
   document.getElementById('invoice-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('invoice-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('invoice-add-item')?.addEventListener('click', ()=>{
-    document.getElementById('invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRowWithStock(weAreVatRegistered()));
+    document.getElementById('invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRowWithStock(weAreVatRegistered(), {salesAccount:true, details:true}));
   });
   document.getElementById('invoice-recurring')?.addEventListener('change', (e)=>{
     document.getElementById('invoice-recurrence-fields').classList.toggle('hidden', !e.target.checked);
@@ -7426,7 +8309,18 @@ function attachInvoiceHandlers(){
     e.preventDefault();
     const clientId = document.getElementById('invoice-client').value;
     if(!clientId){ toast('Add a client first.'); return; }
-    const approvalStatus = canApprove() ? 'approved' : 'pending';
+    const asDraft = !!(e.submitter && e.submitter.dataset.invoiceSave === 'draft');
+    const editing = state.invoiceEditId ? state.invoices.find(i=>i.id===state.invoiceEditId) : null;
+    const approvalStatus = asDraft ? 'pending' : (canApprove() ? 'approved' : 'pending');
+    const bankSel = document.getElementById('invoice-bank-account').value;
+    const bankFields = {bank_account_id: (bankSel && bankSel !== '__none') ? bankSel : null, hide_bank_details: bankSel === '__none'};
+    const newAddress = (document.getElementById('invoice-company-address').value || '').trim();
+    if(isAdmin() && newAddress !== (state.company.address || '').trim()){
+      const {error: aErr} = await sb.from('cc_companies').update({address: newAddress || null}).eq('id', state.company.id);
+      if(!aErr){ await logActivity('update', 'company', state.company.id, 'Company address updated from an invoice'); state.company.address = newAddress || null; }
+    }
+    const extraFields = invoiceExtraFields();
+    if(editing) return saveEditedInvoice(editing, {asDraft, approvalStatus, bankFields: {...bankFields, ...extraFields}});
     const isRecurring = document.getElementById('invoice-recurring').checked;
     const issueDate = document.getElementById('invoice-issue-date').value;
     const frequency = document.getElementById('invoice-recurrence-frequency').value;
@@ -7443,6 +8337,9 @@ function attachInvoiceHandlers(){
       notes: document.getElementById('invoice-notes').value.trim() || null,
       created_by: state.user.id,
       approval_status: approvalStatus,
+      submitted_at: asDraft ? null : new Date().toISOString(),
+      ...bankFields,
+      ...extraFields,
       currency: currency,
       exchange_rate: exchangeRate,
       is_recurring: isRecurring,
@@ -7454,10 +8351,12 @@ function attachInvoiceHandlers(){
     const rows = [...document.querySelectorAll('#invoice-items-body tr')].map(tr=>({
       invoice_id: invoice.id,
       description: tr.querySelector('.ii-desc').value.trim(),
+      details: (tr.querySelector('.ii-details')?.value || '').trim() || null,
       quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
       unit_price: parseFloat(tr.querySelector('.ii-price').value)||0,
       vat_applicable: tr.querySelector('.ii-vat').checked,
-      stock_item_id: tr.querySelector('.ii-stock')?.value || null
+      stock_item_id: tr.querySelector('.ii-stock')?.value || null,
+      account_key: tr.querySelector('.ii-account') ? validSalesKey(tr.querySelector('.ii-account').value) : null
     })).filter(r=>r.description);
     if(rows.length) await sb.from('cc_invoice_items').insert(rows);
     if(approvalStatus === 'approved'){
@@ -7467,8 +8366,9 @@ function attachInvoiceHandlers(){
     const logoFile = document.getElementById('invoice-logo-input')?.files?.[0];
     if(logoFile) await uploadInvoiceLogo(logoFile);
     await uploadCapturedAttachment('invoice-attachment-file', 'invoice', invoice.id);
+    followInvoiceTo(asDraft ? 'draft' : (approvalStatus === 'pending' ? 'awaiting' : 'approved'));
     await refreshAll(); render();
-    toast(approvalStatus === 'pending' ? 'Invoice submitted for approval.' : 'Invoice created.');
+    toast(asDraft ? 'Saved as a draft — finish it any time from the Drafts tab.' : approvalStatus === 'pending' ? 'Invoice submitted for approval.' : 'Invoice created and approved.');
   });
   document.getElementById('invoice-logo-input')?.addEventListener('change', async (e)=>{
     const file = e.target.files?.[0];
@@ -7510,18 +8410,19 @@ function escHtml(v){ return String(v==null?'':v).replace(/&/g,'&amp;').replace(/
 // Self-contained HTML invoice used as the email body (inline styles only — mail clients strip the rest).
 function invoiceEmailHtml(inv, items, client, message, t){
   const cur = inv.currency;
-  const rows = (items||[]).map(it=>`<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;">${escHtml(it.description)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${escHtml(it.quantity)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtCurrency(it.unit_price, cur)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtCurrency(it.quantity*it.unit_price, cur)}</td></tr>`).join('');
+  const rows = (items||[]).map(it=>`<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;"><strong>${escHtml(it.description)}</strong>${it.details ? `<div style="color:#777;font-size:12px;">${escHtml(it.details)}</div>` : ''}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${escHtml(it.quantity)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtCurrency(it.unit_price, cur)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtCurrency(it.quantity*it.unit_price, cur)}</td></tr>`).join('');
   const co = state.company;
   return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;color:#222;">
   <div style="white-space:pre-line;margin-bottom:18px;">${escHtml(message)}</div>
   <div style="border:1px solid #ddd;border-radius:8px;padding:18px;">
-    <div style="font-size:20px;font-weight:700;">${escHtml(co.name)}</div>
+    <div style="font-size:20px;font-weight:700;">${escHtml(co.trading_as || co.name)}</div>
+    ${co.tagline ? `<div style="color:#888;font-size:12px;">${escHtml(co.tagline)}</div>` : ''}
     ${weAreVatRegistered() && co.vat_number ? `<div style="color:#666;font-size:13px;">VAT ${escHtml(co.vat_number)}</div>` : ''}
     ${co.address ? `<div style="color:#666;font-size:13px;white-space:pre-line;">${escHtml(co.address)}</div>` : ''}
     <h2 style="margin:16px 0 4px;">Invoice ${escHtml(inv.invoice_number)}</h2>
-    <div style="font-size:13px;color:#666;">Issued ${escHtml(inv.issue_date)}${inv.due_date ? ' · Due ' + escHtml(inv.due_date) : ''}</div>
-    <div style="margin:10px 0;"><strong>Bill to:</strong> ${escHtml(client ? client.name : '')}</div>
-    <table style="width:100%;border-collapse:collapse;font-size:14px;"><thead><tr style="background:#f5f5f5;"><th style="padding:6px 8px;text-align:left;">Description</th><th style="padding:6px 8px;text-align:right;">Qty</th><th style="padding:6px 8px;text-align:right;">Unit price</th><th style="padding:6px 8px;text-align:right;">Amount</th></tr></thead><tbody>${rows}</tbody></table>
+    <div style="font-size:13px;color:#666;">Issued ${escHtml(fmtShortDate(inv.issue_date))}${inv.due_date ? ' · Due ' + escHtml(fmtShortDate(inv.due_date)) : ''}${inv.billing_period ? ' · Period ' + escHtml(inv.billing_period) : ''}${(inv.customer_ref || (client && client.account_ref)) ? ' · Your ref ' + escHtml(inv.customer_ref || client.account_ref) : ''}</div>
+    <div style="margin:10px 0;"><strong>Bill to:</strong> ${escHtml(client ? client.name : '')}${client && client.address ? `<div style="white-space:pre-line;color:#666;font-size:13px;">${escHtml(client.address)}</div>` : ''}</div>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;"><thead><tr style="background:${invoiceColor()};color:${invoiceInk(invoiceColor())};"><th style="padding:6px 8px;text-align:left;">Description</th><th style="padding:6px 8px;text-align:right;">Qty</th><th style="padding:6px 8px;text-align:right;">Unit price</th><th style="padding:6px 8px;text-align:right;">Amount</th></tr></thead><tbody>${rows}</tbody></table>
     <div style="text-align:right;margin-top:12px;font-size:14px;">
       <div>Subtotal (excl. VAT): ${fmtCurrency(t.subtotal, cur)}</div>
       ${weAreVatRegistered() ? `<div>VAT (15%): ${fmtCurrency(t.vatTotal, cur)}</div>` : ''}
@@ -7529,6 +8430,8 @@ function invoiceEmailHtml(inv, items, client, message, t){
       ${t.isForeign ? `<div style="color:#666;font-size:12px;">Invoice currency ${escHtml(cur)} (booked at ${escHtml(inv.exchange_rate)} = ${fmt(t.zarTotal)})</div>` : ''}
     </div>
     ${t.payLink ? payNowEmailButton(t.payLink) : ''}
+    ${bankDetailsHtml(invoiceBankAccount(inv), inv.invoice_number, 'email')}
+    ${(inv.payment_terms || inv.payment_method) ? `<div style="margin-top:12px;padding:12px 14px;border-left:3px solid ${invoiceColor()};background:#fafafa;font-size:13px;"><div style="font-weight:700;margin-bottom:4px;">Payment terms</div><div style="white-space:pre-line;">${escHtml(inv.payment_terms || defaultPaymentTermsText(inv.payment_method, inv.due_date, inv.invoice_number))}</div></div>` : ''}
     ${inv.notes ? `<div style="margin-top:14px;font-size:13px;color:#555;white-space:pre-line;">${escHtml(inv.notes)}</div>` : ''}
   </div></div>`;
 }
@@ -7550,8 +8453,11 @@ async function openInvoiceView(invoiceId){
   const writeoffs = (state.invoiceWriteoffs||[]).filter(w=>w.invoice_id===inv.id);
   const writtenOff = round2(writeoffs.reduce((s,w)=>s+Number(w.amount||0),0));
   const creditApplied = docAllocated('invoice', inv.id);
-  const balance = Math.max(0, round2(zarTotal - totalPaid - writtenOff - creditApplied));
-  const foreignOpen = isForeign ? Math.max(0, round2(total - payments.reduce((s,p)=>s+settledForeign(p, inv),0) - writtenOff / docRate - docAllocatedForeign('invoice', inv.id))) : 0;
+  const creditNotesAgainst = invoiceCreditNotes(inv);
+  const creditedByNotes = invoiceCredited(inv);
+  const balance = Math.max(0, round2(zarTotal - totalPaid - writtenOff - creditApplied - creditedByNotes));
+  const foreignOpen = isForeign ? Math.max(0, round2(total - payments.reduce((s,p)=>s+settledForeign(p, inv),0) - writtenOff / docRate - docAllocatedForeign('invoice', inv.id) - invoiceCreditedForeign(inv))) : 0;
+  const bankAcct = invoiceBankAccount(inv);
   const canWriteOff = hasModule('invoices') && inv.approval_status === 'approved';
   const canRecordPayment = hasModule('invoices') && inv.approval_status === 'approved';
   const mailtoSubject = encodeURIComponent(`Invoice ${inv.invoice_number} from ${state.company.name}`);
@@ -7563,18 +8469,30 @@ async function openInvoiceView(invoiceId){
     <h2>${inv.invoice_number} ${approvalPill(inv)}</h2>
     <p style="color:var(--muted);margin-top:-8px;">${state.company.name}${weAreVatRegistered() && state.company.vat_number?' · VAT '+state.company.vat_number:''}</p>
     ${state.company.address ? `<p style="color:var(--muted);white-space:pre-line;font-size:.85rem;">${state.company.address}</p>` : ''}
-    <p><strong>Bill to:</strong> ${client ? client.name : '—'}${client && client.email ? ' ('+client.email+')' : ''}</p>
-    <p style="font-size:.85rem;color:var(--muted);">Issued ${inv.issue_date}${inv.due_date?' · Due '+inv.due_date:''}</p>
-    <table><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr></thead><tbody>
-      ${items.map(it=>`<tr><td>${it.description}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
+    <p style="margin-bottom:2px;"><strong>Bill to:</strong> ${client ? escHtml(client.name) : '—'}${client && client.email ? ' ('+escHtml(client.email)+')' : ''}</p>
+    ${client && client.address ? `<p style="margin-top:0;white-space:pre-line;font-size:.85rem;color:var(--muted);">${escHtml(client.address)}</p>` : ''}
+    <p style="margin:6px 0 4px;">${invoiceStagePill(inv)}</p>
+    <p style="font-size:.85rem;color:var(--muted);">Issued ${inv.issue_date}${inv.due_date?' · Due '+inv.due_date:''}${inv.billing_period ? ' · Period ' + escHtml(inv.billing_period) : ''}${(inv.customer_ref || (client && client.account_ref)) ? ' · Customer ref ' + escHtml(inv.customer_ref || client.account_ref) : ''}</p>
+    <table class="invoice-lines"><thead><tr style="background:${invoiceColor()};">${['Description','Qty','Unit Price','Amount'].map(h=>`<th style="color:${invoiceInk(invoiceColor())};">${h}</th>`).join('')}</tr></thead><tbody>
+      ${items.map(it=>`<tr><td>${escHtml(it.description)}${it.details ? `<div style="font-size:.78rem;color:var(--muted);">${escHtml(it.details)}</div>` : ''}${salesAccounts().length > 1 ? `<div style="font-size:.75rem;color:var(--muted);">${escHtml(salesAccountName(it.account_key))}</div>` : ''}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
     </tbody></table>
     <div style="text-align:right;margin-top:10px;font-size:.9rem;">
       <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
       ${weAreVatRegistered() ? `<div>VAT (15%): ${fmt(vatTotal)}</div>` : ''}
       <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmtCurrency(total, inv.currency)}${isForeign ? ` (≈ ${fmt(zarTotal)} @ ${inv.exchange_rate})` : ''}</div>
-      ${(totalPaid || writtenOff || creditApplied) ? `${totalPaid ? `<div style="color:var(--accent2);">Paid: ${fmt(totalPaid)}</div>` : ''}${creditApplied ? `<div style="color:var(--accent2);">Customer credit applied: ${fmt(creditApplied)}</div>` : ''}${writtenOff ? `<div style="color:var(--danger);">Written off as bad debt: ${fmt(writtenOff)}</div>` : ''}<div style="font-weight:700;">Balance due: ${fmt(balance)}</div>` : ''}
+      ${(totalPaid || writtenOff || creditApplied || creditedByNotes) ? `${totalPaid ? `<div style="color:var(--accent2);">Paid: ${fmt(totalPaid)}</div>` : ''}${creditApplied ? `<div style="color:var(--accent2);">Customer credit applied: ${fmt(creditApplied)}</div>` : ''}${creditedByNotes ? `<div style="color:var(--accent2);">Credit notes: ${fmt(creditedByNotes)} (${creditNotesAgainst.map(cn=>escHtml(cn.credit_note_number)).join(', ')})</div>` : ''}${writtenOff ? `<div style="color:var(--danger);">Written off as bad debt: ${fmt(writtenOff)}</div>` : ''}<div style="font-weight:700;">Balance due: ${fmt(balance)}</div>` : ''}
     </div>
     ${inv.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${inv.notes}</p>` : ''}
+    ${(inv.payment_terms || inv.payment_method) ? `<div class="bank-details" style="margin-top:12px;"><h4 style="margin:0 0 6px;">Payment terms${inv.payment_method ? ` <span style="font-weight:400;color:var(--muted);">(${escHtml(paymentMethodLabel(inv.payment_method))})</span>` : ''}</h4><div style="font-size:.85rem;white-space:pre-line;">${escHtml(inv.payment_terms || defaultPaymentTermsText(inv.payment_method, inv.due_date, inv.invoice_number))}</div></div>` : ''}
+    ${bankAcct ? bankDetailsHtml(bankAcct, inv.invoice_number) : (inv.hide_bank_details ? '' : `<p style="font-size:.8rem;color:var(--muted);margin-top:12px;">No banking details on this invoice yet${isAdmin() ? ' — add your account number in Settings → Bank accounts' : ''}.</p>`)}
+    ${(inv.approval_status !== 'approved' && (canManageDoc(inv) || canApprove())) ? `
+    <div class="panel" style="margin-top:14px;border-top:3px solid ${isDraftInvoice(inv) ? 'var(--border)' : 'var(--warn)'};">
+      <p style="margin:0 0 8px;font-size:.88rem;">${isDraftInvoice(inv) ? 'This is a <strong>draft</strong>. It does not count in your books until it is approved.' : inv.approval_status === 'rejected' ? 'This invoice was <strong>rejected</strong>' + (inv.rejection_note ? ': ' + escHtml(inv.rejection_note) : '.') + ' Edit it and submit it again.' : 'Submitted and <strong>waiting for approval</strong>.'}</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="button" class="btn small secondary" id="invoice-edit-btn">Edit</button>
+        ${isDraftInvoice(inv) && !canApprove() ? `<button type="button" class="btn small" id="invoice-submit-btn">Submit for approval</button>` : ''}
+      </div>
+    </div>` : ''}
     ${inv.approval_status === 'rejected' && inv.rejection_note ? `<p style="margin-top:8px;font-size:.85rem;color:var(--danger);">Rejected: ${inv.rejection_note}</p>` : ''}
     ${inv.approval_status === 'approved' ? `
     <div class="panel" style="margin-top:14px;">
@@ -7609,12 +8527,13 @@ async function openInvoiceView(invoiceId){
         <div class="modal-actions"><button type="submit" class="btn small">Save Payment</button></div>
       </form>` : ''}
       ${docCreditPanelHtml('invoice', inv, balance)}
+      ${(hasModule('credit_notes') && balance > 0.005) ? `<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;"><h4 style="margin:0 0 6px;">Credit note</h4><p style="font-size:.82rem;color:var(--muted);margin:0 0 6px;">Cancel all or part of this invoice — for returns, discounts or billing mistakes.</p><button type="button" class="btn secondary small" id="invoice-credit-note-btn">Credit note this invoice</button></div>` : ''}
       ${invoiceReminderPanelHtml(inv, balance)}
       ${invoicePayNowPanelHtml(inv, balance)}
     </div>` : ''}
     ${(inv.approval_status === 'pending' && canApprove()) ? `
     <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
-      <span style="font-size:.8rem;color:var(--muted);align-self:center;">This invoice needs approval:</span>
+      <span style="font-size:.8rem;color:var(--muted);align-self:center;">${isDraftInvoice(inv) ? 'Approve this draft as it is:' : 'This invoice needs approval:'}</span>
       <button class="btn small" data-approve-doc="invoice">Approve</button>
       <button class="btn small danger" data-reject-doc="invoice">Reject</button>
     </div>` : ''}
@@ -7657,6 +8576,16 @@ async function openInvoiceView(invoiceId){
   attachDocCreditHandlers('invoice', inv, ()=>openInvoiceView(inv.id));
   attachInvoiceReminderHandlers(inv, ()=>openInvoiceView(inv.id));
   attachPayNowHandlers(inv, ()=>openInvoiceView(inv.id));
+  document.getElementById('invoice-credit-note-btn')?.addEventListener('click', ()=>openCreditNoteForInvoice(inv));
+  document.getElementById('invoice-edit-btn')?.addEventListener('click', ()=>{ backdrop.classList.add('hidden'); openInvoiceForm(inv); });
+  document.getElementById('invoice-submit-btn')?.addEventListener('click', async (e)=>{
+    e.target.disabled = true;
+    const {error} = await sb.from('cc_invoices').update({submitted_at: new Date().toISOString()}).eq('id', inv.id);
+    if(error){ e.target.disabled = false; toast(error.message); return; }
+    await logActivity('update', 'invoice', inv.id, `${inv.invoice_number} submitted for approval`);
+    backdrop.classList.add('hidden'); followInvoiceTo('awaiting');
+    await refreshAll(); render(); toast('Submitted for approval.');
+  });
   document.getElementById('invoice-download-pdf')?.addEventListener('click', async ()=>{
     try{ downloadPdf(await buildInvoicePdf(inv, items, client)); }catch(e){ toast('Could not create the PDF (' + e.message + '). Use Print / Save PDF instead.'); }
   });
@@ -7766,6 +8695,7 @@ async function openInvoiceView(invoiceId){
     if(error){ toast(error.message); return; }
     await recognizeInvoiceRevenue(inv, items);
     backdrop.classList.add('hidden');
+    followInvoiceTo('approved');
     await refreshAll(); render();
     toast('Invoice approved.');
   });
@@ -7790,48 +8720,74 @@ function nextQuoteNumber(){
   const next = (nums.length ? Math.max(...nums) : 0) + 1;
   return `QUO-${year}-${String(next).padStart(3,'0')}`;
 }
-function quoteStatusPill(q){
-  return `<span class="status-pill status-${q.status}">${q.status}</span>`;
+// Quotes follow the invoice template and flow: Draft -> Sent -> the client accepts (an invoice is created
+// from the quote automatically, through the normal invoice approval) or declines (no invoice; the quote
+// stays on file with the reason). A sent quote past its expiry date shows as Expired until it is reopened.
+const QUOTE_STAGES = [
+  {key:'all', label:'All'}, {key:'draft', label:'Drafts'}, {key:'sent', label:'Sent'},
+  {key:'accepted', label:'Accepted'}, {key:'declined', label:'Declined'}, {key:'expired', label:'Expired'},
+];
+function quoteStage(q){
+  if(!q) return 'draft';
+  if(q.status === 'accepted' || q.status === 'converted') return 'accepted';
+  if(q.status === 'declined') return 'declined';
+  if(q.status === 'expired') return 'expired';
+  if(q.expiry_date && q.expiry_date < todayIso()) return 'expired';
+  return q.status === 'sent' ? 'sent' : 'draft';
 }
+function quotesInStage(key){ return key === 'all' ? state.quotes : state.quotes.filter(q=>quoteStage(q) === key); }
+function quoteStatusPill(q){
+  const st = quoteStage(q);
+  const cls = {draft:'status-draft', sent:'status-sent', accepted:'status-paid', declined:'status-overdue', expired:'status-pending'}[st];
+  const label = {draft:'Draft', sent:'Sent', accepted: q.converted_invoice_id ? 'Accepted · invoiced' : 'Accepted', declined:'Declined', expired:'Expired'}[st];
+  return `<span class="status-pill ${cls}">${label}</span>`;
+}
+function quoteEditable(q){ return ['draft','sent','expired'].includes(quoteStage(q)); }
 function renderQuotes(){
   const canCreate = hasModule('quotes');
+  const tab = QUOTE_STAGES.some(t=>t.key === state.quoteTab) ? state.quoteTab : 'all';
+  const shown = quotesInStage(tab);
   return `
     <div class="section-header" style="--accent-c:var(--c-quotes);"><h1>Quotes</h1>${canCreate ? `<button class="btn" id="add-quote-btn">+ New Quote</button>` : ''}</div>
-    <p class="section-caption">Quote a client first, then convert the accepted quote straight into an invoice — no retyping line items.</p>
+    <p class="section-caption">Quote a client on the same template as your invoices. When the client accepts, the invoice is created from the quote; a declined quote stays on file with no invoice.</p>
+    <div class="tabbar invoice-tabs" role="tablist" aria-label="Quote stages">
+      ${QUOTE_STAGES.map(t=>`<button type="button" role="tab" aria-selected="${tab===t.key}" class="btn ${tab===t.key?'':'secondary'} small" data-quote-tab="${t.key}">${t.label}${t.key==='all' ? '' : ` <span class="tab-count">${quotesInStage(t.key).length}</span>`}</button>`).join('')}
+    </div>
     <div class="panel">
-      ${state.quotes.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Expiry</th><th>Status</th><th>Total</th><th></th></tr></thead><tbody>
-        ${state.quotes.map(q=>`<tr>
-          <td>${q.quote_number}</td><td>${clientName(q.client_id)}</td><td>${q.issue_date}</td><td>${q.expiry_date||'—'}</td>
-          <td>${quoteStatusPill(q)}</td>
-          <td id="quo-total-${q.id}">…</td>
+      ${shown.length ? `<table><thead><tr><th>Number</th><th>Client</th><th>Issue Date</th><th>Valid until</th><th>Status</th><th style="text-align:right;">Total</th><th></th></tr></thead><tbody>
+        ${shown.map(q=>`<tr>
+          <td>${escHtml(q.quote_number)}</td><td>${clientName(q.client_id)}${q.customer_ref ? `<div style="font-size:.75rem;color:var(--muted);">Ref ${escHtml(q.customer_ref)}</div>` : ''}</td><td>${q.issue_date}</td><td>${q.expiry_date||'—'}</td>
+          <td>${quoteStatusPill(q)}${q.converted_invoice_id ? `<div style="font-size:.75rem;color:var(--muted);">${escHtml((state.invoices.find(i=>i.id===q.converted_invoice_id)||{}).invoice_number || '')}</div>` : ''}</td>
+          <td id="quo-total-${q.id}" style="text-align:right;">…</td>
           <td>
             <button class="btn small secondary" data-view-quote="${q.id}">View</button>
-            ${(canCreate && q.status!=='converted') ? `<button class="btn small danger" data-del-quote="${q.id}">Delete</button>` : ''}
+            ${(canCreate && quoteStage(q) !== 'accepted') ? `<button class="btn small danger" data-del-quote="${q.id}">Delete</button>` : ''}
           </td>
         </tr>`).join('')}
-      </tbody></table>` : `<div class="empty">No quotes yet.</div>`}
+      </tbody></table>` : `<div class="empty">${state.quotes.length ? 'No quotes here right now.' : 'No quotes yet.'}</div>`}
     </div>
     ${canCreate ? quoteModal() : ''}
-    <div class="modal-backdrop hidden" id="quote-view-backdrop"><div class="modal" id="quote-view-content"></div></div>
+    <div class="modal-backdrop hidden" id="quote-view-backdrop"><div class="modal" id="quote-view-content" style="max-width:680px;"></div></div>
   `;
 }
 function quoteModal(){
   return `
   <div class="modal-backdrop hidden" id="quote-modal-backdrop">
-    <div class="modal" style="max-width:600px;">
+    <div class="modal" style="max-width:640px;">
       <button class="close-x" id="quote-modal-close">✕</button>
-      <h2>New Quote</h2>
+      <h2 id="quote-modal-title">New Quote</h2>
       <form id="quote-form">
         <div class="row">
           <div class="field"><label>Quote #</label><input type="text" id="quote-number" required></div>
-          <div class="field"><label>Client</label><select id="quote-client">${state.clients.map(c=>`<option value="${c.id}">${c.name}</option>`).join('') || '<option value="">Add a client first</option>'}</select></div>
+          <div class="field"><label>Client</label><select id="quote-client">${state.clients.map(c=>`<option value="${c.id}">${escHtml(c.name)}</option>`).join('') || '<option value="">Add a client first</option>'}</select></div>
         </div>
         <div class="row">
           <div class="field"><label>Issue date</label><input type="date" id="quote-issue-date" required></div>
-          <div class="field"><label>Expiry date</label><input type="date" id="quote-expiry-date"></div>
+          <div class="field"><label>Valid until</label><input type="date" id="quote-expiry-date"></div>
+          <div class="field"><label>Customer reference</label><input type="text" id="quote-customer-ref" maxlength="60"></div>
         </div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description <span style="font-weight:400;color:var(--muted);">and details</span></th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th>Sales account</th><th></th></tr></thead>
           <tbody id="quote-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="quote-add-item" style="margin-top:8px;">+ Add line</button>
@@ -7844,19 +8800,42 @@ function quoteModal(){
     </div>
   </div>`;
 }
-function attachQuoteHandlers(){
-  const canCreate = hasModule('quotes');
-  const backdrop = document.getElementById('quote-modal-backdrop');
-  document.getElementById('add-quote-btn')?.addEventListener('click', ()=>{
-    document.getElementById('quote-number').value = nextQuoteNumber();
-    document.getElementById('quote-issue-date').value = new Date().toISOString().slice(0,10);
-    document.getElementById('quote-items-body').innerHTML = invoiceItemRow(weAreVatRegistered());
-    backdrop.classList.remove('hidden');
+async function openQuoteForm(q){
+  const backdrop = document.getElementById('quote-modal-backdrop'); if(!backdrop) return;
+  const $ = id => document.getElementById(id);
+  state.quoteEditId = q ? q.id : null;
+  $('quote-modal-title').textContent = q ? `Edit quote ${q.quote_number}` : 'New Quote';
+  $('quote-number').value = q ? q.quote_number : nextQuoteNumber();
+  $('quote-issue-date').value = q ? q.issue_date : todayIso();
+  $('quote-expiry-date').value = q ? (q.expiry_date || '') : addDaysIso(todayIso(), 30);
+  if(q) $('quote-client').value = q.client_id;
+  const c = invoiceClient($('quote-client').value);
+  $('quote-customer-ref').value = q ? (q.customer_ref || '') : ((c && c.account_ref) || '');
+  $('quote-notes').value = q ? (q.notes || '') : '';
+  const body = $('quote-items-body');
+  const vatEditable = weAreVatRegistered();
+  let items = [null];
+  if(q){ const {data} = await sb.from('cc_quote_items').select('*').eq('quote_id', q.id); if(data && data.length) items = data; }
+  body.innerHTML = items.map(it=>invoiceItemRow(vatEditable, {salesAccount:true, details:true, accountKey: it && it.account_key})).join('');
+  [...body.querySelectorAll('tr')].forEach((tr, i)=>{
+    const it = items[i]; if(!it) return;
+    tr.querySelector('.ii-desc').value = it.description || '';
+    tr.querySelector('.ii-details').value = it.details || '';
+    tr.querySelector('.ii-qty').value = it.quantity;
+    tr.querySelector('.ii-price').value = it.unit_price;
+    const v = tr.querySelector('.ii-vat'); if(v && !v.disabled) v.checked = !!it.vat_applicable;
   });
+  backdrop.classList.remove('hidden');
+}
+function attachQuoteHandlers(){
+  const backdrop = document.getElementById('quote-modal-backdrop');
+  document.querySelectorAll('[data-quote-tab]').forEach(b=>b.addEventListener('click', ()=>{ state.quoteTab = b.dataset.quoteTab; render(); }));
+  document.getElementById('add-quote-btn')?.addEventListener('click', ()=>openQuoteForm(null));
   document.getElementById('quote-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('quote-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.getElementById('quote-client')?.addEventListener('change', e=>{ const c = invoiceClient(e.target.value); document.getElementById('quote-customer-ref').value = (c && c.account_ref) || ''; });
   document.getElementById('quote-add-item')?.addEventListener('click', ()=>{
-    document.getElementById('quote-items-body').insertAdjacentHTML('beforeend', invoiceItemRow(weAreVatRegistered()));
+    document.getElementById('quote-items-body').insertAdjacentHTML('beforeend', invoiceItemRow(weAreVatRegistered(), {salesAccount:true, details:true}));
   });
   document.getElementById('quote-items-body')?.addEventListener('click', (e)=>{
     if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
@@ -7865,27 +8844,45 @@ function attachQuoteHandlers(){
     e.preventDefault();
     const clientId = document.getElementById('quote-client').value;
     if(!clientId){ toast('Add a client first.'); return; }
-    const {data: quote, error} = await sb.from('cc_quotes').insert({
-      company_id: state.company.id,
+    const editing = state.quoteEditId ? state.quotes.find(q=>q.id===state.quoteEditId) : null;
+    const fields = {
       client_id: clientId,
       quote_number: document.getElementById('quote-number').value.trim(),
       issue_date: document.getElementById('quote-issue-date').value,
       expiry_date: document.getElementById('quote-expiry-date').value || null,
-      status: 'draft',
+      customer_ref: document.getElementById('quote-customer-ref').value.trim() || null,
       notes: document.getElementById('quote-notes').value.trim() || null,
-      created_by: state.user.id
-    }).select().single();
-    if(error){ toast(error.message); return; }
-    const rows = [...document.querySelectorAll('#quote-items-body tr')].map(tr=>({
-      quote_id: quote.id,
+    };
+    const lines = [...document.querySelectorAll('#quote-items-body tr')].map(tr=>({
       description: tr.querySelector('.ii-desc').value.trim(),
+      details: (tr.querySelector('.ii-details')?.value || '').trim() || null,
       quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
       unit_price: parseFloat(tr.querySelector('.ii-price').value)||0,
-      vat_applicable: tr.querySelector('.ii-vat').checked
+      vat_applicable: tr.querySelector('.ii-vat').checked,
+      account_key: tr.querySelector('.ii-account') ? validSalesKey(tr.querySelector('.ii-account').value) : null,
     })).filter(r=>r.description);
-    if(rows.length) await sb.from('cc_quote_items').insert(rows);
+    if(!lines.length){ toast('Add at least one line.'); return; }
+    let quoteId;
+    if(editing){
+      if(!quoteEditable(editing)){ toast('An accepted or declined quote cannot be changed.'); return; }
+      const patch = {...fields};
+      if(quoteStage(editing) === 'expired' && fields.expiry_date && fields.expiry_date >= todayIso() && editing.status === 'expired') patch.status = 'sent';
+      const {error} = await sb.from('cc_quotes').update(patch).eq('id', editing.id);
+      if(error){ toast(error.message); return; }
+      const del = await sb.from('cc_quote_items').delete().eq('quote_id', editing.id);
+      if(del.error){ toast(del.error.message); return; }
+      quoteId = editing.id;
+    } else {
+      const {data: quote, error} = await sb.from('cc_quotes').insert({company_id: state.company.id, ...fields, status:'draft', created_by: state.user.id}).select().single();
+      if(error){ toast(error.message); return; }
+      quoteId = quote.id;
+    }
+    const ins = await sb.from('cc_quote_items').insert(lines.map(l=>({quote_id: quoteId, ...l})));
+    if(ins.error){ toast(ins.error.message); return; }
+    await logActivity(editing ? 'update' : 'create', 'quote', quoteId, fields.quote_number);
+    backdrop.classList.add('hidden'); state.quoteEditId = null;
     await refreshAll(); render();
-    toast('Quote created.');
+    toast(editing ? 'Quote updated.' : 'Quote created.');
   });
   document.querySelectorAll('[data-del-quote]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
@@ -7901,84 +8898,180 @@ function attachQuoteHandlers(){
   state.quotes.forEach(async (q)=>{
     const {data: items} = await sb.from('cc_quote_items').select('*').eq('quote_id', q.id);
     state.quoteItems[q.id] = items || [];
-    const total = docTotal(items);
     const el = document.getElementById('quo-total-'+q.id);
-    if(el) el.textContent = fmt(total);
+    if(el) el.textContent = fmt(docTotal(items));
   });
+}
+function quoteEmailHtml(q, items, client, message){
+  const co = state.company;
+  const t = salesDocTotals(items || [], 'ZAR');
+  const rows = (items||[]).map(it=>`<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;"><strong>${escHtml(it.description)}</strong>${it.details ? `<div style="color:#777;font-size:12px;">${escHtml(it.details)}</div>` : ''}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${escHtml(it.quantity)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmt(it.unit_price)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmt(it.quantity*it.unit_price)}</td></tr>`).join('');
+  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;color:#222;">
+  <div style="white-space:pre-line;margin-bottom:18px;">${escHtml(message)}</div>
+  <div style="border:1px solid #ddd;border-top:4px solid ${invoiceColor()};border-radius:8px;padding:18px;">
+    <div style="font-size:20px;font-weight:700;">${escHtml(co.trading_as || co.name)}</div>
+    ${co.tagline ? `<div style="color:#888;font-size:12px;">${escHtml(co.tagline)}</div>` : ''}
+    <h2 style="margin:16px 0 4px;">Quote ${escHtml(q.quote_number)}</h2>
+    <div style="font-size:13px;color:#666;">Dated ${escHtml(fmtShortDate(q.issue_date))}${q.expiry_date ? ' · Valid until ' + escHtml(fmtShortDate(q.expiry_date)) : ''}${q.customer_ref ? ' · Your ref ' + escHtml(q.customer_ref) : ''}</div>
+    <div style="margin:10px 0;"><strong>Prepared for:</strong> ${escHtml(client ? client.name : '')}</div>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;"><thead><tr style="background:${invoiceColor()};color:${invoiceInk(invoiceColor())};"><th style="padding:6px 8px;text-align:left;">Description</th><th style="padding:6px 8px;text-align:right;">Qty</th><th style="padding:6px 8px;text-align:right;">Unit price</th><th style="padding:6px 8px;text-align:right;">Amount</th></tr></thead><tbody>${rows}</tbody></table>
+    <div style="text-align:right;margin-top:12px;font-size:14px;">
+      ${weAreVatRegistered() ? `<div>Subtotal (excl. VAT): ${fmt(t.subtotal)}</div><div>VAT (15%): ${fmt(t.vat)}</div>` : ''}
+      <div style="font-size:17px;font-weight:700;margin-top:4px;">Quote total: ${fmt(t.total)}</div>
+    </div>
+    <div style="margin-top:14px;padding:12px 14px;border-left:3px solid ${invoiceColor()};background:#fafafa;font-size:13px;">To accept this quote, simply reply to this email. We will then send you the invoice.</div>
+    ${q.notes ? `<div style="margin-top:14px;font-size:13px;color:#555;white-space:pre-line;">${escHtml(q.notes)}</div>` : ''}
+  </div></div>`;
+}
+// Accepting a quote creates its invoice (approved straight away for approvers, otherwise submitted for
+// approval), with the client's due date, payment method and terms wording, and the quote's lines.
+async function createInvoiceFromQuote(q, items){
+  const issueDate = todayIso();
+  if(isPeriodLocked(issueDate)){ toast(periodLockMessage()); return null; }
+  const approvalStatus = canApprove() ? 'approved' : 'pending';
+  const qc = invoiceClient(q.client_id);
+  const qTerms = qc ? termsDays(qc.payment_terms_days) : null;
+  const qDue = qTerms == null ? null : addDaysIso(issueDate, qTerms);
+  const qNumber = nextInvoiceNumber();
+  const {data: invoice, error} = await sb.from('cc_invoices').insert({
+    company_id: state.company.id, client_id: q.client_id, invoice_number: qNumber, issue_date: issueDate, due_date: qDue,
+    status: 'draft', notes: q.notes, created_by: state.user.id, approval_status: approvalStatus, submitted_at: new Date().toISOString(),
+    customer_ref: q.customer_ref || (qc && qc.account_ref) || null, payment_method: (qc && qc.payment_method) || null,
+    payment_terms: defaultPaymentTermsText(qc && qc.payment_method, qDue, qNumber) || null,
+    currency: 'ZAR', exchange_rate: 1
+  }).select().single();
+  if(error){ toast(error.message); return null; }
+  const rows = (items||[]).map(it=>({invoice_id: invoice.id, description: it.description, details: it.details || null, quantity: it.quantity, unit_price: it.unit_price, vat_applicable: it.vat_applicable, account_key: validSalesKey(it.account_key)}));
+  if(rows.length){ const ins = await sb.from('cc_invoice_items').insert(rows); if(ins.error){ toast(ins.error.message); } }
+  if(approvalStatus === 'approved') await recognizeInvoiceRevenue(invoice, rows);
+  await logActivity('create', 'invoice', invoice.id, `${invoice.invoice_number} (from quote ${q.quote_number})`);
+  return invoice;
 }
 async function openQuoteView(quoteId){
   const q = state.quotes.find(x=>x.id===quoteId);
-  const {data: items} = await sb.from('cc_quote_items').select('*').eq('quote_id', quoteId);
-  const client = state.clients.find(c=>c.id===q.client_id);
-  const total = docTotal(items);
+  if(!q) return;
+  const {data: itemsData} = await sb.from('cc_quote_items').select('*').eq('quote_id', quoteId);
+  const items = itemsData || [];
+  const client = invoiceClient(q.client_id);
+  const t = salesDocTotals(items, 'ZAR');
   const canEdit = hasModule('quotes');
+  const stage = quoteStage(q);
+  const inv = q.converted_invoice_id ? state.invoices.find(i=>i.id===q.converted_invoice_id) : null;
   const backdrop = document.getElementById('quote-view-backdrop');
+  const open = ['draft','sent','expired'].includes(stage);
   document.getElementById('quote-view-content').innerHTML = `
     <button class="close-x" id="quote-view-close">✕</button>
-    <h2>${q.quote_number} ${quoteStatusPill(q)}</h2>
-    <p><strong>Client:</strong> ${client ? client.name : '—'}</p>
-    <p style="font-size:.85rem;color:var(--muted);">Issued ${q.issue_date}${q.expiry_date?' · Expires '+q.expiry_date:''}</p>
-    <table><thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr></thead><tbody>
-      ${items.map(it=>`<tr><td>${it.description}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
+    ${state.company.logo_data_url ? `<img class="invoice-logo-preview" src="${state.company.logo_data_url}">` : ''}
+    <h2>${escHtml(q.quote_number)} ${quoteStatusPill(q)}</h2>
+    <p style="margin-bottom:2px;"><strong>Prepared for:</strong> ${client ? escHtml(client.name) : '—'}${client && client.email ? ' (' + escHtml(client.email) + ')' : ''}</p>
+    <p style="font-size:.85rem;color:var(--muted);">Issued ${q.issue_date}${q.expiry_date ? ' · Valid until ' + q.expiry_date : ''}${q.customer_ref ? ' · Customer ref ' + escHtml(q.customer_ref) : ''}${q.sent_at ? ' · Sent ' + String(q.sent_at).slice(0,10) : ''}</p>
+    <table class="invoice-lines"><thead><tr style="background:${invoiceColor()};">${['Description','Qty','Unit Price','Amount'].map(h=>`<th style="color:${invoiceInk(invoiceColor())};">${h}</th>`).join('')}</tr></thead><tbody>
+      ${items.map(it=>`<tr><td>${escHtml(it.description)}${it.details ? `<div style="font-size:.78rem;color:var(--muted);">${escHtml(it.details)}</div>` : ''}${salesAccounts().length > 1 ? `<div style="font-size:.75rem;color:var(--muted);">${escHtml(salesAccountName(it.account_key))}</div>` : ''}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
     </tbody></table>
-    <div style="text-align:right;margin-top:10px;font-weight:700;font-size:1.1rem;">Total: ${fmt(total)}</div>
-    ${q.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);">${q.notes}</p>` : ''}
-    ${canEdit && q.status!=='converted' ? `
-    <div class="modal-actions" style="justify-content:flex-start;flex-wrap:wrap;">
-      <span style="font-size:.8rem;color:var(--muted);align-self:center;">Mark as:</span>
-      <button class="btn small secondary" data-set-quote-status="draft">Draft</button>
-      <button class="btn small secondary" data-set-quote-status="sent">Sent</button>
-      <button class="btn small secondary" data-set-quote-status="accepted">Accepted</button>
-      <button class="btn small secondary" data-set-quote-status="declined">Declined</button>
-      <button class="btn small secondary" data-set-quote-status="expired">Expired</button>
+    <div style="text-align:right;margin-top:10px;font-size:.9rem;">
+      ${weAreVatRegistered() ? `<div>Subtotal (excl. VAT): ${fmt(t.subtotal)}</div><div>VAT (15%): ${fmt(t.vat)}</div>` : ''}
+      <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Quote total: ${fmt(t.total)}</div>
+    </div>
+    ${q.notes ? `<p style="margin-top:12px;font-size:.85rem;color:var(--muted);white-space:pre-line;">${escHtml(q.notes)}</p>` : ''}
+    ${stage === 'accepted' ? `<div class="panel" style="margin-top:14px;border-top:3px solid var(--accent2);"><p style="margin:0;font-size:.88rem;">Accepted by the client${q.responded_at ? ' on ' + String(q.responded_at).slice(0,10) : ''}. ${inv ? `Invoice <strong>${escHtml(inv.invoice_number)}</strong> was created from it.` : 'No invoice has been created yet.'}</p>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">${inv ? `<button type="button" class="btn small secondary" id="quote-open-invoice">Open invoice</button>` : (hasModule('invoices') ? `<button type="button" class="btn small" id="quote-make-invoice">Create the invoice</button>` : '<span style="font-size:.8rem;color:var(--muted);">Someone with Invoices access can create the invoice from here.</span>')}</div></div>` : ''}
+    ${stage === 'declined' ? `<div class="panel" style="margin-top:14px;border-top:3px solid var(--danger);"><p style="margin:0;font-size:.88rem;">Declined by the client${q.responded_at ? ' on ' + String(q.responded_at).slice(0,10) : ''}. No invoice was created; the quote stays on file.${q.decline_reason ? `<br><span style="color:var(--muted);">Reason: ${escHtml(q.decline_reason)}</span>` : ''}</p></div>` : ''}
+    ${stage === 'expired' ? `<p style="font-size:.85rem;color:var(--warn);margin-top:12px;">This quote has passed its valid-until date. Edit it with a new date, or reopen it, before the client accepts.</p>` : ''}
+    <div class="modal-actions" style="flex-wrap:wrap;justify-content:flex-start;">
+      <button type="button" class="btn secondary" id="quote-pdf">Download PDF</button>
+      ${canEdit && open && client && client.email ? `<button type="button" class="btn secondary" id="quote-email-btn">Email to client</button>` : ''}
+      ${canEdit && stage === 'draft' ? `<button type="button" class="btn secondary" id="quote-mark-sent">Mark as sent</button>` : ''}
+      ${canEdit && open ? `<button type="button" class="btn secondary" id="quote-edit">Edit</button>` : ''}
+      ${canEdit && (stage === 'declined' || q.status === 'expired') ? `<button type="button" class="btn secondary" id="quote-reopen">Reopen</button>` : ''}
+    </div>
+    ${canEdit && open ? `
+    <div class="panel" style="margin-top:10px;">
+      <h4 style="margin:0 0 6px;">Client's answer</h4>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="button" class="btn" id="quote-accept">Client accepted — create invoice</button>
+        <button type="button" class="btn danger" id="quote-decline-btn">Client declined</button>
+      </div>
+      <form id="quote-decline-form" class="hidden" style="margin-top:8px;">
+        <div class="field"><label>Reason (optional)</label><input type="text" id="quote-decline-reason" maxlength="200" placeholder="e.g. Went with another supplier"></div>
+        <div class="modal-actions" style="justify-content:flex-start;"><button type="submit" class="btn danger small">Mark as declined</button><button type="button" class="btn secondary small" id="quote-decline-cancel">Cancel</button></div>
+      </form>
     </div>` : ''}
-    ${canEdit && q.status!=='converted' ? `
-    <div class="modal-actions">
-      <button class="btn" id="convert-quote-btn">Convert to Invoice</button>
-    </div>` : (q.status==='converted' ? `<p style="color:var(--accent2);font-size:.85rem;">Already converted to an invoice.</p>` : '')}
+    ${canEdit && open && client && client.email ? `
+    <form id="quote-email-form" class="hidden panel" style="margin-top:10px;">
+      <div class="field"><label>To</label><input type="email" id="quote-email-to" value="${escHtml(client.email)}" required></div>
+      <div class="field"><label>Subject</label><input type="text" id="quote-email-subject" value="${escHtml(`Quote ${q.quote_number} from ${state.company.trading_as || state.company.name}`)}"></div>
+      <div class="field"><label>Message</label><textarea id="quote-email-message" rows="4">${escHtml(`Hi ${client.contact_person || client.name},\n\nPlease find our quote ${q.quote_number} for ${fmt(t.total)}${q.expiry_date ? `, valid until ${fmtLongDate(q.expiry_date)}` : ''}.\n\nKind regards,\n${state.company.trading_as || state.company.name}`)}</textarea></div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:.85rem;"><input type="checkbox" id="quote-email-attach" checked style="width:auto;"> Attach the quote as a PDF</label>
+      <div class="modal-actions" style="justify-content:flex-start;"><button type="submit" class="btn small" id="quote-email-send">Send email</button><button type="button" class="btn secondary small" id="quote-email-cancel">Cancel</button></div>
+    </form>` : ''}
   `;
   backdrop.classList.remove('hidden');
+  const reopenView = async ()=>{ await refreshAll(); render(); openQuoteView(q.id); };
   document.getElementById('quote-view-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
-  document.querySelectorAll('[data-set-quote-status]').forEach(b=>{
-    b.addEventListener('click', async ()=>{
-      const {error} = await sb.from('cc_quotes').update({status:b.dataset.setQuoteStatus}).eq('id', q.id);
-      if(error){ toast(error.message); return; }
-      backdrop.classList.add('hidden');
-      await refreshAll(); render();
-      toast('Quote updated.');
-    });
-  });
-  document.getElementById('convert-quote-btn')?.addEventListener('click', async ()=>{
-    if(!hasModule('invoices')){ toast('You need the Invoices module to convert a quote.'); return; }
-    const issueDate = new Date().toISOString().slice(0,10);
-    if(isPeriodLocked(issueDate)){ toast(periodLockMessage()); return; }
-    const approvalStatus = canApprove() ? 'approved' : 'pending';
-    const {data: invoice, error} = await sb.from('cc_invoices').insert({
-      company_id: state.company.id,
-      client_id: q.client_id,
-      invoice_number: nextInvoiceNumber(),
-      issue_date: issueDate,
-      due_date: null,
-      status: 'draft',
-      notes: q.notes,
-      created_by: state.user.id,
-      approval_status: approvalStatus,
-      currency: 'ZAR',
-      exchange_rate: 1
-    }).select().single();
+  document.getElementById('quote-pdf').addEventListener('click', async ()=>{ try{ downloadPdf(await buildQuotePdf(q, items, client)); }catch(e){ toast('Could not create the PDF (' + e.message + ').'); } });
+  document.getElementById('quote-edit')?.addEventListener('click', ()=>{ backdrop.classList.add('hidden'); openQuoteForm(q); });
+  document.getElementById('quote-mark-sent')?.addEventListener('click', async ()=>{
+    const {error} = await sb.from('cc_quotes').update({status:'sent', sent_at: new Date().toISOString()}).eq('id', q.id);
     if(error){ toast(error.message); return; }
-    if(items && items.length){
-      await sb.from('cc_invoice_items').insert(items.map(it=>({
-        invoice_id: invoice.id,
-        description: it.description, quantity: it.quantity, unit_price: it.unit_price, vat_applicable: it.vat_applicable
-      })));
+    await logActivity('update', 'quote', q.id, `${q.quote_number} marked as sent`);
+    await reopenView(); toast('Marked as sent.');
+  });
+  document.getElementById('quote-reopen')?.addEventListener('click', async ()=>{
+    const {error} = await sb.from('cc_quotes').update({status:'sent', responded_at:null, decline_reason:null}).eq('id', q.id);
+    if(error){ toast(error.message); return; }
+    await logActivity('update', 'quote', q.id, `${q.quote_number} reopened`);
+    await reopenView(); toast('Quote reopened.');
+  });
+  document.getElementById('quote-open-invoice')?.addEventListener('click', ()=>{ backdrop.classList.add('hidden'); state.invoiceTab = 'all'; goToView('invoices'); openInvoiceView(inv.id); });
+  const accept = async (btn)=>{
+    btn.disabled = true;
+    let invoice = null;
+    if(hasModule('invoices')){
+      invoice = await createInvoiceFromQuote(q, items);
+      if(!invoice){ btn.disabled = false; return; }
     }
-    if(approvalStatus === 'approved') await recognizeInvoiceRevenue(invoice, items || []);
-    await sb.from('cc_quotes').update({status:'converted', converted_invoice_id: invoice.id}).eq('id', q.id);
-    await logActivity('create', 'invoice', invoice.id, `${invoice.invoice_number} (from quote ${q.quote_number})`);
-    backdrop.classList.add('hidden');
-    await refreshAll(); render();
-    toast('Quote converted to invoice '+invoice.invoice_number+'.');
+    const patch = {status:'accepted', responded_at: q.responded_at || new Date().toISOString()};
+    if(invoice) patch.converted_invoice_id = invoice.id;
+    const {error} = await sb.from('cc_quotes').update(patch).eq('id', q.id);
+    if(error){ toast(error.message); btn.disabled = false; return; }
+    await logActivity('update', 'quote', q.id, `${q.quote_number} accepted${invoice ? ' — invoice ' + invoice.invoice_number + ' created' : ''}`);
+    await reopenView();
+    toast(invoice ? `Quote accepted. Invoice ${invoice.invoice_number} ${invoice.approval_status === 'approved' ? 'created and approved' : 'created and submitted for approval'}.` : 'Quote marked as accepted. Someone with Invoices access can now create the invoice.');
+  };
+  document.getElementById('quote-accept')?.addEventListener('click', e=>{
+    if(!confirm(`Mark ${q.quote_number} as accepted${hasModule('invoices') ? ' and create the invoice for ' + fmt(t.total) : ''}?`)) return;
+    accept(e.target);
+  });
+  document.getElementById('quote-make-invoice')?.addEventListener('click', e=>accept(e.target));
+  document.getElementById('quote-decline-btn')?.addEventListener('click', ()=>document.getElementById('quote-decline-form').classList.remove('hidden'));
+  document.getElementById('quote-decline-cancel')?.addEventListener('click', ()=>document.getElementById('quote-decline-form').classList.add('hidden'));
+  document.getElementById('quote-decline-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const reason = document.getElementById('quote-decline-reason').value.trim() || null;
+    const {error} = await sb.from('cc_quotes').update({status:'declined', responded_at: new Date().toISOString(), decline_reason: reason}).eq('id', q.id);
+    if(error){ toast(error.message); return; }
+    await logActivity('update', 'quote', q.id, `${q.quote_number} declined${reason ? ': ' + reason : ''}`);
+    await reopenView(); toast('Quote marked as declined. No invoice was created.');
+  });
+  document.getElementById('quote-email-btn')?.addEventListener('click', ()=>document.getElementById('quote-email-form').classList.remove('hidden'));
+  document.getElementById('quote-email-cancel')?.addEventListener('click', ()=>document.getElementById('quote-email-form').classList.add('hidden'));
+  document.getElementById('quote-email-form')?.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const to = document.getElementById('quote-email-to').value.trim();
+    if(!to){ toast('Enter a recipient.'); return; }
+    const btn = document.getElementById('quote-email-send'); btn.disabled = true; btn.textContent = 'Sending…';
+    const html = quoteEmailHtml(q, items, client, document.getElementById('quote-email-message').value);
+    const wantPdf = document.getElementById('quote-email-attach').checked;
+    const att = wantPdf ? await pdfAttachment(()=>buildQuotePdf(q, items, client)) : null;
+    let failure = null;
+    try{
+      const {data, error} = await sb.functions.invoke('send-invoice-email', {body:{company_id: state.company.id, to, subject: document.getElementById('quote-email-subject').value.trim(), html, reply_to: companyReplyTo(), from_name: state.company.name, attachments: att ? [att] : undefined}});
+      if(error) failure = error.message || 'Could not send'; else if(data && data.error) failure = data.error === 'email_not_configured' ? 'Email sending is not set up yet.' : data.error;
+    }catch(err){ failure = err.message || 'Could not send'; }
+    if(failure){ btn.disabled = false; btn.textContent = 'Send email'; toast(failure); return; }
+    await sb.from('cc_quotes').update({status: q.status === 'expired' ? 'sent' : (q.status === 'draft' ? 'sent' : q.status), sent_at: new Date().toISOString()}).eq('id', q.id);
+    await logActivity('email', 'quote', q.id, `${q.quote_number} emailed to ${to}`);
+    await reopenView(); toast('Quote emailed to ' + to + '.' + (wantPdf && !att ? ' (The PDF could not be created, so it went without an attachment.)' : ''));
   });
 }
 
@@ -8041,14 +9134,16 @@ function creditNoteModal(){
           <div class="field"><label>Currency</label><select id="creditnote-currency">${CURRENCIES.map(c=>`<option value="${c}">${c}</option>`).join('')}</select></div>
           <div class="field hidden" id="creditnote-exchange-rate-field"><label>Exchange rate (1 unit → ZAR)</label><input type="number" step="0.0001" id="creditnote-exchange-rate" value="1"></div>
         </div>
+        <p id="creditnote-prefill-note" style="font-size:.82rem;color:var(--muted);margin:0 0 8px;"></p>
         <div class="field"><label>Reason</label><input type="text" id="creditnote-reason" placeholder="e.g. returned goods, billing correction"></div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th>Sales account</th><th></th></tr></thead>
           <tbody id="creditnote-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="creditnote-add-item" style="margin-top:8px;">+ Add line</button>
         <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="creditnote-notes" rows="2"></textarea></div>
         ${attachmentCaptureField('creditnote-attachment-file')}
+        <label id="creditnote-issue-now-wrap" class="${canApprove() ? '' : 'hidden'}" style="display:flex;gap:8px;align-items:center;font-size:.88rem;margin:8px 0;"><input type="checkbox" id="creditnote-issue-now" style="width:auto;flex:none;" checked> Issue it now (the credit counts against the invoice and the books straight away)</label>
         <div class="modal-actions">
           <button type="button" class="btn secondary" id="creditnote-cancel">Cancel</button>
           <button type="submit" class="btn">Save Credit Note</button>
@@ -8063,11 +9158,14 @@ function attachCreditNoteHandlers(){
   document.getElementById('add-creditnote-btn')?.addEventListener('click', ()=>{
     document.getElementById('creditnote-number').value = nextCreditNoteNumber();
     document.getElementById('creditnote-issue-date').value = new Date().toISOString().slice(0,10);
-    document.getElementById('creditnote-items-body').innerHTML = invoiceItemRow(weAreVatRegistered());
+    document.getElementById('creditnote-items-body').innerHTML = invoiceItemRow(weAreVatRegistered(), {salesAccount:true});
     document.getElementById('creditnote-currency').value = 'ZAR';
     document.getElementById('creditnote-exchange-rate').value = '1';
     document.getElementById('creditnote-exchange-rate-field').classList.add('hidden');
     document.getElementById('creditnote-attachment-file').value = '';
+    document.getElementById('creditnote-invoice').value = '';
+    document.getElementById('creditnote-reason').value = '';
+    const pn = document.getElementById('creditnote-prefill-note'); if(pn) pn.textContent = '';
     backdrop.classList.remove('hidden');
   });
   document.getElementById('creditnote-currency')?.addEventListener('change', (e)=>{
@@ -8076,7 +9174,7 @@ function attachCreditNoteHandlers(){
   document.getElementById('creditnote-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('creditnote-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
   document.getElementById('creditnote-add-item')?.addEventListener('click', ()=>{
-    document.getElementById('creditnote-items-body').insertAdjacentHTML('beforeend', invoiceItemRow(weAreVatRegistered()));
+    document.getElementById('creditnote-items-body').insertAdjacentHTML('beforeend', invoiceItemRow(weAreVatRegistered(), {salesAccount:true}));
   });
   document.getElementById('creditnote-items-body')?.addEventListener('click', (e)=>{
     if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
@@ -8089,6 +9187,13 @@ function attachCreditNoteHandlers(){
     const creditNoteIssueDate = document.getElementById('creditnote-issue-date').value;
     if(isPeriodLocked(creditNoteIssueDate)){ toast(periodLockMessage()); return; }
     const cnCurrency = document.getElementById('creditnote-currency').value || 'ZAR';
+    const cnInvoiceId = document.getElementById('creditnote-invoice').value;
+    const cnInvoice = cnInvoiceId ? state.invoices.find(i=>i.id===cnInvoiceId) : null;
+    if(cnInvoice && cnInvoice.approval_status === 'approved'){
+      const cnTotal = [...document.querySelectorAll('#creditnote-items-body tr')].reduce((a,tr)=>a + (parseFloat(tr.querySelector('.ii-qty').value)||1) * (parseFloat(tr.querySelector('.ii-price').value)||0), 0);
+      const owing = (cnCurrency === (cnInvoice.currency || 'ZAR')) && isForeignDoc(cnInvoice) ? foreignOpenFor('invoice', cnInvoice) : invoiceBalance(cnInvoice).balance;
+      if(cnTotal > owing + 0.005 && !confirm(`This credit note (${fmtCurrency(cnTotal, cnCurrency)}) is more than the ${fmtCurrency(owing, isForeignDoc(cnInvoice) ? cnInvoice.currency : 'ZAR')} still owing on ${cnInvoice.invoice_number}. The extra will show as a credit on the client's account. Continue?`)) return;
+    }
     const cnExchangeRate = cnCurrency==='ZAR' ? 1 : (parseFloat(document.getElementById('creditnote-exchange-rate').value) || 1);
     const {data: note, error} = await sb.from('cc_credit_notes').insert({
       company_id: state.company.id,
@@ -8097,7 +9202,7 @@ function attachCreditNoteHandlers(){
       credit_note_number: document.getElementById('creditnote-number').value.trim(),
       issue_date: creditNoteIssueDate,
       reason: document.getElementById('creditnote-reason').value.trim() || null,
-      status: 'draft',
+      status: (approvalStatus === 'approved' && document.getElementById('creditnote-issue-now')?.checked) ? 'issued' : 'draft',
       notes: document.getElementById('creditnote-notes').value.trim() || null,
       created_by: state.user.id,
       currency: cnCurrency,
@@ -8110,13 +9215,14 @@ function attachCreditNoteHandlers(){
       description: tr.querySelector('.ii-desc').value.trim(),
       quantity: parseFloat(tr.querySelector('.ii-qty').value)||1,
       unit_price: parseFloat(tr.querySelector('.ii-price').value)||0,
-      vat_applicable: tr.querySelector('.ii-vat').checked
+      vat_applicable: tr.querySelector('.ii-vat').checked,
+      account_key: tr.querySelector('.ii-account') ? validSalesKey(tr.querySelector('.ii-account').value) : null
     })).filter(r=>r.description);
     if(rows.length) await sb.from('cc_credit_note_items').insert(rows);
     await logActivity('create', 'credit_note', note.id, `${note.credit_note_number}`);
     await uploadCapturedAttachment('creditnote-attachment-file', 'credit_note', note.id);
     await refreshAll(); render();
-    toast(approvalStatus === 'pending' ? 'Credit note submitted for approval.' : 'Credit note created.');
+    toast(approvalStatus === 'pending' ? 'Credit note submitted for approval.' : (document.getElementById('creditnote-issue-now')?.checked ? 'Credit note issued.' : 'Credit note created — mark it issued when you send it.'));
   });
   document.querySelectorAll('[data-del-creditnote]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
@@ -9610,7 +10716,7 @@ function monthsInPeriod(start, end){
 function computeBudgetVsActual(start, end){
   const inRange = e => e.entry_date >= start && e.entry_date <= end;
   const months = monthsInPeriod(start, end);
-  return state.budgets.map(b=>{
+  return (state.budgets||[]).map(b=>{
     // Same basis as the ledger P&L: net of VAT, journal-created entries excluded.
     const actual = round2(state.entries
       .filter(e=>e.type===b.type && inRange(e) && (e.tags||[]).includes(b.tag) && !(e.tags||[]).includes('manual-journal'))
@@ -9650,6 +10756,10 @@ function renderBudget(rows, start, end){
         ${canEdit ? `<div style="margin-top:4px;"><button class="btn small secondary" data-del-budget="${r.id}">Remove budget line</button></div>` : ''}
       </div>`;
     }).join('') : `<div class="empty">No budget lines yet. ${canEdit?'Add one above.':'Ask management to set one up.'}</div>`}
+    ${rows.length ? `<table style="margin-top:14px;"><thead><tr><th>Budget line</th><th>Type</th><th style="text-align:right;">Budgeted</th><th style="text-align:right;">Actual</th><th style="text-align:right;">Variance</th><th style="text-align:right;">Used</th></tr></thead><tbody>
+      ${rows.map(r=>{ const variance = round2(r.type === 'revenue' ? r.actual - r.budgeted : r.budgeted - r.actual); return `<tr><td>${escHtml(r.tag)}</td><td>${r.type === 'revenue' ? 'Revenue' : 'Expense'}</td><td style="text-align:right;">${fmt(r.budgeted)}</td><td style="text-align:right;">${fmt(r.actual)}</td><td style="text-align:right;" class="${variance < 0 ? 'negative' : ''}">${fmt(variance)}</td><td style="text-align:right;">${r.pct===null ? '—' : fmtPct(r.pct)}</td></tr>`; }).join('')}
+    </tbody></table>
+    <p style="color:var(--muted);font-size:.78rem;margin:6px 0 0;">Variance is favourable when positive: under budget for expenses, over budget for revenue.</p>` : ''}
   </div>
   <p style="color:var(--muted);font-size:.8rem;">Budgeted amounts are each line's monthly figure × ${monthsInPeriod(start,end)} month(s) in the selected period. Actuals are Revenue/Expense entries in that period tagged with the matching tag, net of VAT (the same basis as the Profit &amp; Loss).</p>
   `;
@@ -9703,7 +10813,7 @@ function renderReportsInner(){
   const bsPrior = priorRange ? computeBS(priorRange.end) : null;
 
   return `
-    <div class="section-header" style="--accent-c:var(--c-reports);"><h1>Reports</h1><button class="btn secondary" onclick="window.print()">Print / Save PDF</button></div>
+    <div class="section-header" style="--accent-c:var(--c-reports);"><h1>Reports</h1><div class="header-actions">${exportButtonsHtml('report')}<button class="btn secondary small" onclick="window.print()">Print</button></div></div>
     <p class="section-caption">Formal accounting reports for the business — pick a report below.</p>
     <div class="tabbar">
       <button class="btn ${state.reportsTab==='monthly'?'':'secondary'} small" data-report-tab="monthly">Monthly Accounts</button>
@@ -9769,7 +10879,9 @@ function renderReportsInner(){
       <div style="margin-left:auto;color:var(--muted);font-size:.8rem;align-self:center;">P&amp;L: ${period.start} to ${period.end}<br>Balance sheet as of ${period.end}</div>
     </div>
     `}
+    <div id="report-body">
     ${state.reportsTab==='monthly' ? renderMonthlyAccounts() : state.reportsTab==='bs' ? renderBS(bs, bsPrior) : state.reportsTab==='tb' ? renderTB(computeLedgerTB(period.start, period.end)) : state.reportsTab==='gl' ? renderGeneralLedger(period.start, period.end) : state.reportsTab==='cf' ? renderCF(cf) : state.reportsTab==='debtors' ? renderDebtors(computeARAging()) : state.reportsTab==='creditors' ? renderCreditors(computeAPAging()) : state.reportsTab==='budget' ? renderBudget(computeBudgetVsActual(period.start, period.end), period.start, period.end) : state.reportsTab==='financials' ? renderFinancials() : state.reportsTab==='ratios' ? renderRatios(ratios, bs) : state.reportsTab==='companytax' ? renderCompanyTax() : state.reportsTab==='bankrec' ? renderBankRec(computeBankRec(period.end, state.bankRecStatement)) : state.reportsTab==='vatrec' ? renderVatRec(computeVatRec(period.start, period.end)) : state.reportsTab==='yearend' ? renderYearEnd() : state.reportsTab==='afs' ? renderAFS() : state.reportsTab==='fx' ? renderFX(period.start, period.end) : state.reportsTab==='health' ? renderHealthCheck() : renderPL(pl, plPrior)}
+    </div>
   `;
 }
 
@@ -10934,7 +12046,7 @@ function renderVat(){
   const matchingPeriod = periods.find(p=>p.start===state.vatPeriodStart && p.end===state.vatPeriodEnd);
   const v = (mode === 'alltime' || !weAreVatRegistered()) ? vatFor() : vatForPeriod(state.vatPeriodStart, state.vatPeriodEnd);
   return `
-    <h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-vat);display:inline-block;"></span>VAT</h1>
+    <div class="section-header"><h1 style="display:flex;align-items:center;gap:10px;"><span style="width:11px;height:11px;border-radius:3px;background:var(--c-vat);display:inline-block;"></span>VAT</h1><div class="header-actions">${exportButtonsHtml('vat')}</div></div>
     <p class="section-caption">VAT collected, VAT paid, and what's currently payable to SARS.</p>
     ${weAreVatRegistered() ? `
     <div class="panel">
@@ -11245,6 +12357,9 @@ const SETTINGS_DIFF_FIELDS = [
   {key:'name', label:'Company name'},
   {key:'trading_as', label:'Trading as'},
   {key:'address', label:'Address'},
+  {key:'tagline', label:'Tagline'},
+  {key:'website', label:'Website'},
+  {key:'invoice_color', label:'Invoice colour'},
   {key:'vat_registered', label:'Registered for VAT', bool:true},
   {key:'vat_number', label:'VAT number'},
   {key:'tracks_inventory', label:'Carries stock/inventory', bool:true},
@@ -11300,7 +12415,16 @@ function renderSettingsCompanyDetails(){
       <form id="company-details-form" style="display:flex;flex-direction:column;gap:12px;max-width:480px;">
         <div class="field"><label>Company name</label><input type="text" id="company-name" value="${state.company.name || ''}"></div>
         <div class="field"><label>Trading as (optional)</label><input type="text" id="company-trading-as" placeholder="If different from the registered name above" value="${state.company.trading_as || ''}"></div>
-        <div class="field"><label>Company address (for tax invoices)</label><textarea id="company-address" rows="3" placeholder="Street, suburb, city, postal code">${state.company.address || ''}</textarea></div>
+        <div class="field"><label>Company address (shown on your invoices)</label><textarea id="company-address" rows="3" placeholder="Street, suburb, city, postal code">${escHtml(state.company.address || '')}</textarea></div>
+        <div class="field"><label>Tagline (optional, under your name on invoices and quotes)</label><input type="text" id="company-tagline" maxlength="80" placeholder="e.g. Payments made simple" value="${escHtml(state.company.tagline || '')}"></div>
+        <div class="field"><label>Website (optional, in the invoice footer)</label><input type="text" id="company-website" maxlength="120" placeholder="e.g. www.yourcompany.co.za" value="${escHtml(state.company.website || '')}"></div>
+        <div class="field"><label>Invoice colour <span style="font-weight:400;color:var(--muted);">(the "Description" header row and highlights on your invoices)</span></label>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;" role="radiogroup" aria-label="Invoice colour">
+            ${INVOICE_COLOR_PRESETS.map(([hex, label])=>`<button type="button" class="color-swatch${invoiceColor() === hex ? ' selected' : ''}" data-invoice-color="${hex}" title="${label}" aria-label="${label}" aria-checked="${invoiceColor() === hex}" role="radio" style="background:${hex};"></button>`).join('')}
+            <input type="color" id="company-invoice-color" value="${invoiceColor()}" aria-label="Custom colour" style="width:42px;height:32px;padding:2px;">
+          </div>
+          <div id="invoice-color-preview" class="invoice-color-preview" style="background:${invoiceColor()};color:${invoiceInk(invoiceColor())};"><span>Description</span><span>Qty</span><span>Unit price</span><span>Amount</span></div>
+        </div>
         <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-vat-registered" style="width:auto;" ${weAreVatRegistered()?'checked':''}> Registered for VAT</label>
         <div class="field" id="company-vat-number-field" style="${weAreVatRegistered()?'':'display:none;'}"><label>VAT number</label><input type="text" id="company-vat-number" value="${state.company.vat_number || ''}"></div>
         <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="company-tracks-inventory" style="width:auto;" ${tracksInventory()?'checked':''}> This business carries stock/inventory</label>
@@ -11403,12 +12527,23 @@ function attachSettingsHandlers(){
   document.getElementById('company-uif-registered')?.addEventListener('change', (e)=>{
     document.getElementById('company-uif-ref-field').style.display = e.target.checked ? '' : 'none';
   });
+  const paintPreview = hex => {
+    const pv = document.getElementById('invoice-color-preview'); if(!pv) return;
+    pv.style.background = hex; pv.style.color = invoiceInk(hex);
+    document.querySelectorAll('[data-invoice-color]').forEach(b=>{ const on = b.dataset.invoiceColor === hex; b.classList.toggle('selected', on); b.setAttribute('aria-checked', String(on)); });
+  };
+  document.querySelectorAll('[data-invoice-color]').forEach(b=>b.addEventListener('click', ()=>{ const inp = document.getElementById('company-invoice-color'); inp.value = b.dataset.invoiceColor; paintPreview(b.dataset.invoiceColor); }));
+  document.getElementById('company-invoice-color')?.addEventListener('input', e=>paintPreview(e.target.value.toLowerCase()));
   document.getElementById('company-details-form')?.addEventListener('submit', async (e)=>{
     e.preventDefault();
     const before = { ...state.company };
     const name = document.getElementById('company-name').value.trim() || state.company.name;
     const trading_as = document.getElementById('company-trading-as').value.trim() || null;
     const address = document.getElementById('company-address').value.trim() || null;
+    const tagline = (document.getElementById('company-tagline')?.value || '').trim() || null;
+    const website = (document.getElementById('company-website')?.value || '').trim() || null;
+    const pickedColor = (document.getElementById('company-invoice-color')?.value || '').toLowerCase();
+    const invoice_color = /^#[0-9a-f]{6}$/.test(pickedColor) && pickedColor !== '#7c5cff' ? pickedColor : null;
     const vat_registered = document.getElementById('company-vat-registered').checked;
     const vat_number = vat_registered ? (document.getElementById('company-vat-number').value.trim() || null) : null;
     const registration_number = document.getElementById('company-registration-number').value.trim() || null;
@@ -11433,9 +12568,10 @@ function attachSettingsHandlers(){
       paye_reference_number, sdl_reference_number, uif_reference_number,
       contact_first_name, contact_surname, contact_email, contact_phone,
       coida_registration_number, financial_year_end_month, official_interest_rate_pct,
-      tracks_inventory, maker_checker
+      tracks_inventory, maker_checker, invoice_color, tagline, website
     }).eq('id', state.company.id);
     if(error){ toast(error.message); return; }
+    state.company.invoice_color = invoice_color; state.company.tagline = tagline; state.company.website = website;
     Object.assign(state.company, { name, trading_as, address, vat_registered, vat_number, registration_number, paye_registered, sdl_registered, uif_registered, paye_reference_number, sdl_reference_number, uif_reference_number, contact_first_name, contact_surname, contact_email, contact_phone, coida_registration_number, financial_year_end_month, official_interest_rate_pct, tracks_inventory, maker_checker });
     const diffSummary = summarizeSettingsDiff(before, state.company);
     if(diffSummary) await logActivity('update', 'company', state.company.id, diffSummary);
@@ -11664,9 +12800,9 @@ function renderScenarios(){
 function renderScenarioList(canEdit){
   const compareIds = state.scenarioCompareIds.filter(id => state.scenarios.some(s=>s.id===id));
   return `
-    <div class="section-header" style="--accent-c:var(--c-scenarios);"><h1>Scenarios</h1>${canEdit ? `<button class="btn" id="add-scenario-btn">+ New Scenario</button>` : ''}</div>
+    <div class="section-header" style="--accent-c:var(--c-scenarios);"><h1>Scenarios</h1><div class="header-actions">${state.scenarios.length ? exportButtonsHtml('scenarios') : ''}${canEdit ? `<button class="btn" id="add-scenario-btn">+ New Scenario</button>` : ''}</div></div>
     <p class="section-caption">Model what-if decisions — comparing suppliers, a loan, or your projected cash flow — before you commit.</p>
-    <div class="panel">
+    <div class="panel" id="scenario-list-body">
       <p style="color:var(--muted);font-size:.86rem;margin-top:0;">Model a what-if — a supplier option, a loan you're considering, a cash budget for the months ahead, or any other plan — as a scenario, then tick two or more to compare them side by side. Nothing here posts to your books until you say so.</p>
       ${state.scenarios.length ? `<table><thead><tr><th></th><th>Name</th><th>Category</th><th>Discount Rate</th><th>Period</th><th>Cash Flow Lines</th><th>NPV</th><th>IRR</th><th></th></tr></thead><tbody>
         ${state.scenarios.map(sc=>{
@@ -11715,10 +12851,10 @@ function renderScenarioComparison(ids){
   const bestNpv = rows.length ? Math.max(...rows.map(r=>r.npv)) : null;
   const allPeriods = [...new Set(rows.flatMap(r=>r.cfs.map(cf=>Number(cf.period_number))))].sort((a,b)=>a-b);
   return `
-    <div class="panel" style="border-top:3px solid var(--c-scenarios);">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
+    <div class="panel" style="border-top:3px solid var(--c-scenarios);" id="scenario-compare-body">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;" data-export-skip>
         <h3 style="margin-top:0;">Comparing ${rows.length} scenarios</h3>
-        <button class="btn small secondary" id="scenario-clear-compare">Clear</button>
+        <div class="header-actions">${exportButtonsHtml('compare')}<button class="btn small secondary" id="scenario-clear-compare">Clear</button></div>
       </div>
       <div class="grid" style="grid-template-columns:repeat(${rows.length},minmax(160px,1fr));">
         ${rows.map(r=>`<div class="card" style="--accent-c:var(--c-scenarios);${r.npv===bestNpv?'box-shadow:0 0 0 2px var(--c-scenarios) inset;':''}">
@@ -11862,8 +12998,9 @@ function renderScenarioDetail(sc, canEdit){
   return `
     <div class="section-header" style="--accent-c:var(--c-scenarios);">
       <h1><button class="btn small secondary" id="scenario-back-btn" style="margin-right:10px;">← Back</button>${sc.name} ${scenarioCategoryBadge(sc.category)}</h1>
-      ${canEdit ? `<button class="btn danger" data-del-scenario="${sc.id}">Delete Scenario</button>` : ''}
+      <div class="header-actions">${exportButtonsHtml('scenario')}${canEdit ? `<button class="btn danger small" data-del-scenario="${sc.id}">Delete Scenario</button>` : ''}</div>
     </div>
+    <div id="scenario-detail-body">
     <div class="grid">
       <div class="card" style="--accent-c:var(--c-scenarios);"><h3>NPV @ ${Number(sc.discount_rate).toFixed(1)}%</h3><div class="value ${npv<0?'negative':''}">${fmt(npv)}</div></div>
       <div class="card" style="--accent-c:var(--c-scenarios);"><h3>IRR (annualized)</h3><div class="value">${fmtIRR(irr)}</div></div>
@@ -11871,6 +13008,7 @@ function renderScenarioDetail(sc, canEdit){
     </div>
     ${sc.notes ? `<div class="panel"><em>${sc.notes}</em></div>` : ''}
     ${categorySection}
+    </div>
   `;
 }
 
