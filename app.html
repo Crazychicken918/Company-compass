@@ -503,6 +503,22 @@ function computePayslip(emp, opts){
 
   const periods = payPeriodsPerYear(emp.pay_frequency);
   const basic = Number(emp.salary) || 0;
+  if(emp.worker_type === 'commission'){
+    // Commission earner: paid gross, no PAYE, UIF, SDL, fringe benefits or fund deductions.
+    const grossEarnings = round2(basic + bonus + commission);
+    const totalDeductions = round2(otherDeduction);
+    return {
+      payDate, periods, age: null, workerType: 'commission',
+      basic, travelAllowance: 0, bonus, commission, grossEarnings,
+      taxableTravelPortion: 0, travelTaxablePortionRate: 0, preRetirementTaxable: 0,
+      carFringeBenefit: 0, loanFringeBenefit: 0,
+      retirementContribution: 0, retirementDeduction: 0, taxableIncomePeriod: 0,
+      annualTaxableIncome: 0, annualTaxGross: 0, rebate: 0, annualTaxAfterRebate: 0,
+      medicalContribution: 0, medicalDependants: 0, medicalCreditMonthly: 0, medicalCreditAnnual: 0, medicalCreditPeriod: 0,
+      annualTaxFinal: 0, paye: 0, uifEmployee: 0, uifEmployer: 0, uifBase: 0,
+      otherDeduction, otherDeductionNote, totalDeductions, netPay: round2(grossEarnings - totalDeductions),
+    };
+  }
   const travelAllowance = Number(emp.travel_allowance) || 0;
   const retirementContribution = Number(emp.retirement_contribution) || 0;
   const medicalContribution = Number(emp.medical_aid_contribution) || 0;
@@ -591,7 +607,7 @@ function monthlyEquivalentEmployee(e){
 // R500,000 exemption threshold).
 function computeStatutorySummary(){
   let totalPaye = 0, totalUifEmployee = 0, totalUifEmployer = 0, totalLeviablePayroll = 0;
-  state.employees.filter(e => e.active).forEach(e => {
+  state.employees.filter(e => e.active && e.worker_type !== 'commission').forEach(e => {
     const me = monthlyEquivalentEmployee(e);
     const ps = computePayslip(me, {});
     totalPaye += ps.paye;
@@ -1540,6 +1556,7 @@ async function refreshAll(){
   const quoteItemsRes = quoteIds.length ? await sb.from('cc_quote_items').select('*').in('quote_id', quoteIds) : {data:[]};
   state.quoteItems = {};
   (quoteItemsRes.data||[]).forEach(it=>{ (state.quoteItems[it.quote_id] = state.quoteItems[it.quote_id]||[]).push(it); });
+  try{ const cr = await sb.from('cc_commission_rules').select('*').eq('company_id', cid); state.commissionRules = cr.data || []; }catch(e){ state.commissionRules = []; }
   rebuildPendingItems();
 }
 
@@ -2165,7 +2182,7 @@ function computeEmp501(label, kind){
   totals.calc.total = round2(totals.calc.paye + totals.calc.uif + totals.calc.sdl);
   totals.declared.total = round2(totals.declared.paye + totals.declared.uif + totals.declared.sdl);
   totals.paid = totals.declared.total;   // marking an EMP201 submitted records its payment from the bank
-  const employees = (state.employees||[]).map(emp=>{
+  const employees = (state.employees||[]).filter(emp=>!isCommissionWorker(emp)).map(emp=>{
     const slips = inPeriod.filter(p=>p.employee_id === emp.id);
     if(!slips.length) return null;
     const t = slipTotals(slips);
@@ -3450,6 +3467,308 @@ function billingPeriodFor(issueIso, freq){
   return `${fmtShortDate(iso(a))} – ${fmtShortDate(iso(b))}`;
 }
 function invoiceClient(id){ return (state.clients || []).find(c=>c.id===id) || null; }
+
+/* ========================= COMMISSION WORKERS & COMMISSION RULES ========================= */
+// A commission-based worker is paid gross: no PAYE, UIF or SDL (an independent commission earner, not on
+// the EMP201 or IRP5). Any worker can have commission rules: per client (or general), a % of what the
+// client was invoiced in the pay period, a % of what the client paid in it, or a fixed amount; once-off
+// (paid on the next payslip, then marked used) or rolling (every payslip from the start date, until an
+// optional end date). Each payslip's cost goes to the expense account chosen for the worker (e.g. Casual Wages).
+const COMMISSION_BASES = [['invoiced', '% of what the client was invoiced'], ['received', '% of what the client paid'], ['fixed', 'Fixed amount']];
+function isCommissionWorker(e){ return !!e && e.worker_type === 'commission'; }
+function payrollExpenseAccounts(){ return chartAccountList().filter(a=>a.type === 'expense' && a.key && a.active !== false && !['DEPR','BADDEBT','DISP','FX','TAXEXP'].includes(a.key)); }
+function validPayrollKey(k){ return (k && payrollExpenseAccounts().some(a=>a.key === k)) ? k : 'PAYROLL'; }
+function payrollAccountName(k){ const a = chartAccountList().find(x=>x.key === validPayrollKey(k)); return a ? `${a.code} ${a.name}` : 'Payroll & Staff Costs'; }
+function payrollAccountOptions(selected){
+  const key = validPayrollKey(selected);
+  return payrollExpenseAccounts().map(a=>`<option value="${escHtml(a.key)}" ${a.key === key ? 'selected' : ''}>${escHtml(a.code)} ${escHtml(a.name)}</option>`).join('')
+    + (isAdmin() ? '<option value="__new">+ New expense account…</option>' : '');
+}
+function nextExpenseCode(){
+  const used = new Set(chartAccountList().map(a=>String(a.code)));
+  for(let c = 6110; c < 7000; c += 10) if(!used.has(String(c))) return String(c);
+  return '6990';
+}
+// Adds an expense account (e.g. "Casual Wages") to the chart from a payroll form. Management only.
+async function createPayrollExpenseAccount(name){
+  name = String(name || '').trim();
+  if(!name){ toast('Type a name for the account, e.g. Casual Wages.'); return null; }
+  const existing = chartAccountList().find(a=>a.type === 'expense' && a.name.toLowerCase() === name.toLowerCase());
+  if(existing) return existing.key;
+  const {data, error} = await sb.from('cc_chart_accounts').insert({company_id: state.company.id, system_key: null, code: nextExpenseCode(), name, type: 'expense', is_current: true}).select().single();
+  if(error){ toast(error.message); return null; }
+  state.chartAccounts = [...(state.chartAccounts || []), data];
+  await logActivity('create', 'chart_account', data.id, `Expense account ${data.code} ${data.name} added from Payroll`);
+  return 'C:' + data.id;
+}
+function wirePayrollAccountPicker(selectId){
+  const sel = document.getElementById(selectId); if(!sel) return;
+  const wrap = document.getElementById(selectId + '-new');
+  let last = sel.value === '__new' ? 'PAYROLL' : sel.value;
+  sel.addEventListener('change', ()=>{
+    if(sel.value === '__new'){ wrap && wrap.classList.remove('hidden'); document.getElementById(selectId + '-new-name')?.focus(); }
+    else { last = sel.value; wrap && wrap.classList.add('hidden'); }
+  });
+  document.getElementById(selectId + '-new-add')?.addEventListener('click', async ()=>{
+    const key = await createPayrollExpenseAccount(document.getElementById(selectId + '-new-name').value);
+    if(!key) return;
+    document.querySelectorAll('select[data-payroll-account]').forEach(s=>{ const v = s === sel ? key : s.value; s.innerHTML = payrollAccountOptions(v); });
+    sel.value = key; last = key; wrap.classList.add('hidden');
+    document.getElementById(selectId + '-new-name').value = '';
+    toast('Account added to your chart of accounts.');
+  });
+  document.getElementById(selectId + '-new-cancel')?.addEventListener('click', ()=>{ sel.value = last; wrap.classList.add('hidden'); });
+}
+function payrollAccountPickerHtml(id, selected, label){
+  return `<div class="field"><label>${label || 'Expense account (where this pay goes in your books)'}</label><select id="${id}" data-payroll-account>${payrollAccountOptions(selected)}</select>
+    <div class="hidden" id="${id}-new" style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;"><input type="text" id="${id}-new-name" placeholder="e.g. Casual Wages" maxlength="80" style="flex:1;min-width:160px;"><button type="button" class="btn small" id="${id}-new-add">Add account</button><button type="button" class="btn small secondary" id="${id}-new-cancel">Cancel</button></div></div>`;
+}
+// The period a payslip's commission is worked out over: the calendar month of the pay date for monthly
+// pay, otherwise the week or fortnight ending on the pay date.
+function payslipPeriodDefault(payDate, freq){
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(payDate || '')) return {start:'', end:''};
+  if(freq === 'weekly' || freq === 'biweekly') return {start: addDaysIso(payDate, freq === 'weekly' ? -6 : -13), end: payDate};
+  const y = Number(payDate.slice(0,4)), m = Number(payDate.slice(5,7));
+  return {start: `${payDate.slice(0,7)}-01`, end: new Date(Date.UTC(y, m, 0)).toISOString().slice(0,10)};
+}
+// Invoice value excluding VAT, in Rand (line prices include VAT where VAT applies).
+function docNetZAR(doc, items){
+  const rate = (doc && doc.currency && doc.currency !== 'ZAR') ? (Number(doc.exchange_rate) || 1) : 1;
+  return round2((items || []).reduce((s, it)=>s + Number(it.quantity) * Number(it.unit_price) / (it.vat_applicable ? (1 + VAT_RATE) : 1), 0) * rate);
+}
+function clientInvoicedNet(clientId, from, to){
+  const inv = (state.invoices || []).filter(i=>i.client_id === clientId && i.approval_status === 'approved' && i.issue_date >= from && i.issue_date <= to)
+    .reduce((s, i)=>s + docNetZAR(i, (state.invoiceItems || {})[i.id]), 0);
+  const cn = (state.creditNotes || []).filter(n=>n.client_id === clientId && n.approval_status === 'approved' && n.status === 'issued' && n.issue_date >= from && n.issue_date <= to)
+    .reduce((s, n)=>s + docNetZAR(n, (state.creditNoteItems || {})[n.id]), 0);
+  return round2(inv - cn);
+}
+// Money the client paid in the period, excluding the VAT share of the invoices it settled.
+function clientReceivedNet(clientId, from, to){
+  return round2((state.invoicePayments || []).filter(p=>p.payment_date >= from && p.payment_date <= to).reduce((s, p)=>{
+    const inv = (state.invoices || []).find(i=>i.id === p.invoice_id);
+    if(!inv || inv.client_id !== clientId) return s;
+    const items = (state.invoiceItems || {})[inv.id] || [];
+    const gross = docTotalZAR(inv, items);
+    const ratio = gross > 0 ? docNetZAR(inv, items) / gross : 1;
+    return s + (Number(p.amount) || 0) * ratio;
+  }, 0));
+}
+function commissionRulesFor(empId){ return (state.commissionRules || []).filter(r=>r.employee_id === empId); }
+function commissionRuleStatus(r, onDate){
+  const d = onDate || todayIso();
+  if(r.recurrence === 'once' && r.used_payslip_id){ const p = (state.payrollPayments || []).find(x=>x.id === r.used_payslip_id); return {key:'used', label: 'Paid' + (p ? ' on ' + p.pay_date : '')}; }
+  if(r.active === false) return {key:'stopped', label:'Stopped'};
+  if(r.end_date && r.end_date < d) return {key:'ended', label:'Ended ' + r.end_date};
+  if(r.start_date && r.start_date > d) return {key:'future', label:'Starts ' + r.start_date};
+  return {key:'active', label: r.recurrence === 'once' ? 'Due on the next payslip' : 'Active'};
+}
+function commissionRuleApplies(r, period){
+  if(r.active === false) return false;
+  if(r.recurrence === 'once') return !r.used_payslip_id && (!r.start_date || r.start_date <= period.end);
+  return (!r.start_date || r.start_date <= period.end) && (!r.end_date || r.end_date >= period.start);
+}
+function commissionRuleLabel(r){
+  const who = r.client_id ? clientName(r.client_id) : '';
+  const base = r.basis === 'fixed' ? '' : `${Number(r.rate)}% of ${r.basis === 'received' ? 'payments received' : 'invoiced'}`;
+  return [r.description || 'Commission', who, base].filter(Boolean).join(' · ');
+}
+// The commission lines a payslip for this worker would carry for the period.
+function computeCommissionLines(empId, period){
+  return commissionRulesFor(empId).filter(r=>commissionRuleApplies(r, period)).map(r=>{
+    let base = 0, amount = 0;
+    if(r.basis === 'fixed') amount = round2(Number(r.amount) || 0);
+    else {
+      base = r.client_id ? (r.basis === 'received' ? clientReceivedNet(r.client_id, period.start, period.end) : clientInvoicedNet(r.client_id, period.start, period.end)) : 0;
+      amount = round2(Math.max(0, base) * (Number(r.rate) || 0) / 100);
+    }
+    return {rule_id: r.id, client_id: r.client_id || null, client: r.client_id ? clientName(r.client_id) : null, description: r.description || 'Commission', basis: r.basis, rate: Number(r.rate) || 0, base: round2(base), amount, recurrence: r.recurrence};
+  });
+}
+function commissionLineText(l){
+  const head = [l.description || 'Commission', l.client].filter(Boolean).join(' — ');
+  const how = l.basis === 'fixed' ? (l.recurrence === 'once' ? 'once-off' : 'fixed') : `${l.rate}% of ${fmt(l.base)} ${l.basis === 'received' ? 'received' : 'invoiced'}`;
+  return {head, how};
+}
+function renderCommissionRulesModalBody(emp){
+  const rules = commissionRulesFor(emp.id).slice().sort((a, b)=>String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  return `
+    <p style="font-size:.82rem;color:var(--muted);margin-top:-6px;">Commission is added to ${escHtml(emp.name)}'s payslips automatically. <strong>Rolling</strong> repeats on every payslip from the start date (until the end date, if you set one). <strong>Once-off</strong> goes on the next payslip only.${isCommissionWorker(emp) ? ' Paid gross: no PAYE, UIF or SDL.' : ' It is taxed with their pay.'}</p>
+    ${rules.length ? `<table><thead><tr><th>Commission</th><th>Type</th><th style="text-align:right;">Rate / amount</th><th>Status</th><th></th></tr></thead><tbody>
+      ${rules.map(r=>{ const st = commissionRuleStatus(r); return `<tr>
+        <td>${escHtml(r.description || 'Commission')}${r.client_id ? `<div style="font-size:.75rem;color:var(--muted);">${escHtml(clientName(r.client_id))}</div>` : ''}</td>
+        <td>${r.recurrence === 'once' ? 'Once-off' : 'Rolling'}<div style="font-size:.72rem;color:var(--muted);">from ${escHtml(r.start_date || '—')}${r.end_date ? ' to ' + escHtml(r.end_date) : ''}</div></td>
+        <td style="text-align:right;">${r.basis === 'fixed' ? fmt(r.amount) : `${Number(r.rate)}% <div style="font-size:.72rem;color:var(--muted);">of ${r.basis === 'received' ? 'payments received' : 'invoiced'}</div>`}</td>
+        <td><span class="status-pill ${st.key === 'active' ? 'status-paid' : st.key === 'used' || st.key === 'ended' || st.key === 'stopped' ? 'status-draft' : 'status-pending'}">${escHtml(st.label)}</span></td>
+        <td style="white-space:nowrap;">${st.key === 'active' || st.key === 'future' ? `<button type="button" class="btn small secondary" data-edit-commission="${r.id}">Edit</button> ${r.recurrence === 'rolling' ? `<button type="button" class="btn small secondary" data-stop-commission="${r.id}">Stop</button> ` : ''}` : ''}${r.used_payslip_id ? '' : `<button type="button" class="btn small danger" data-del-commission="${r.id}">Delete</button>`}</td>
+      </tr>`; }).join('')}
+    </tbody></table>` : '<div class="empty">No commission set up yet.</div>'}
+    <form id="commission-rule-form" class="panel" style="margin-top:12px;">
+      <input type="hidden" id="commission-rule-id">
+      <h4 style="margin:0 0 8px;" id="commission-rule-form-title">Add commission</h4>
+      <div class="row">
+        <div class="field"><label>Description</label><input type="text" id="commission-desc" maxlength="80" placeholder="e.g. Sales commission, New client bonus"></div>
+        <div class="field"><label>Client (optional for fixed amounts)</label><select id="commission-client"><option value="">— No client —</option>${(state.clients || []).map(c=>`<option value="${c.id}">${escHtml(c.name)}</option>`).join('')}</select></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Worked out as</label><select id="commission-basis">${COMMISSION_BASES.map(([v, l])=>`<option value="${v}">${l}</option>`).join('')}</select></div>
+        <div class="field" id="commission-rate-field"><label>Rate (%)</label><input type="number" id="commission-rate" min="0" max="100" step="0.01" value="5"></div>
+        <div class="field hidden" id="commission-amount-field"><label>Amount (R)</label><input type="number" id="commission-amount" min="0" step="0.01" value="0"></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Type</label><select id="commission-recurrence"><option value="rolling">Rolling (every payslip)</option><option value="once">Once-off (next payslip only)</option></select></div>
+        <div class="field"><label>Start date</label><input type="date" id="commission-start"></div>
+        <div class="field" id="commission-end-field"><label>End date (optional)</label><input type="date" id="commission-end"></div>
+      </div>
+      <div class="modal-actions" style="justify-content:flex-start;"><button type="submit" class="btn small" id="commission-save">Add commission</button><button type="button" class="btn small secondary hidden" id="commission-edit-cancel">Cancel edit</button></div>
+    </form>`;
+}
+function openCommissionModal(empId){
+  const emp = state.employees.find(e=>e.id === empId); if(!emp) return;
+  const host = document.getElementById('commission-modal-content');
+  host.innerHTML = `<button class="close-x" id="commission-modal-close">✕</button><h2>Commission — ${escHtml(emp.name)}</h2>${renderCommissionRulesModalBody(emp)}`;
+  const backdrop = document.getElementById('commission-modal-backdrop');
+  backdrop.classList.remove('hidden');
+  const $ = id => document.getElementById(id);
+  const syncBasis = ()=>{
+    const fixed = $('commission-basis').value === 'fixed';
+    $('commission-rate-field').classList.toggle('hidden', fixed);
+    $('commission-amount-field').classList.toggle('hidden', !fixed);
+  };
+  const syncRec = ()=>$('commission-end-field').classList.toggle('hidden', $('commission-recurrence').value === 'once');
+  const resetForm = ()=>{
+    $('commission-rule-id').value = ''; $('commission-desc').value = ''; $('commission-client').value = '';
+    $('commission-basis').value = 'invoiced'; $('commission-rate').value = '5'; $('commission-amount').value = '0';
+    $('commission-recurrence').value = 'rolling'; $('commission-start').value = todayIso(); $('commission-end').value = '';
+    $('commission-rule-form-title').textContent = 'Add commission'; $('commission-save').textContent = 'Add commission'; $('commission-edit-cancel').classList.add('hidden');
+    syncBasis(); syncRec();
+  };
+  resetForm();
+  $('commission-basis').addEventListener('change', syncBasis);
+  $('commission-recurrence').addEventListener('change', syncRec);
+  $('commission-modal-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  $('commission-edit-cancel').addEventListener('click', resetForm);
+  const reopen = async ()=>{ await refreshAll(); render(); openCommissionModal(empId); };
+  host.querySelectorAll('[data-edit-commission]').forEach(b=>b.addEventListener('click', ()=>{
+    const r = (state.commissionRules || []).find(x=>x.id === b.dataset.editCommission); if(!r) return;
+    $('commission-rule-id').value = r.id; $('commission-desc').value = r.description || ''; $('commission-client').value = r.client_id || '';
+    $('commission-basis').value = r.basis; $('commission-rate').value = r.rate; $('commission-amount').value = r.amount;
+    $('commission-recurrence').value = r.recurrence; $('commission-start').value = r.start_date || ''; $('commission-end').value = r.end_date || '';
+    $('commission-rule-form-title').textContent = 'Edit commission'; $('commission-save').textContent = 'Save changes'; $('commission-edit-cancel').classList.remove('hidden');
+    syncBasis(); syncRec();
+  }));
+  host.querySelectorAll('[data-stop-commission]').forEach(b=>b.addEventListener('click', async ()=>{
+    const r = (state.commissionRules || []).find(x=>x.id === b.dataset.stopCommission); if(!r) return;
+    const end = addDaysIso(todayIso(), -1) < (r.start_date || '') ? r.start_date : addDaysIso(todayIso(), -1);
+    const {error} = await sb.from('cc_commission_rules').update({end_date: end}).eq('id', r.id);
+    if(error){ toast(error.message); return; }
+    await logActivity('update', 'commission_rule', r.id, `Rolling commission stopped for ${emp.name}: ${commissionRuleLabel(r)}`);
+    await reopen(); toast('Commission stopped. It stays on payslips already made.');
+  }));
+  host.querySelectorAll('[data-del-commission]').forEach(b=>b.addEventListener('click', async ()=>{
+    if(!confirm('Delete this commission?')) return;
+    const {error} = await sb.from('cc_commission_rules').delete().eq('id', b.dataset.delCommission);
+    if(error){ toast(error.message); return; }
+    await reopen();
+  }));
+  $('commission-rule-form').addEventListener('submit', async e=>{
+    e.preventDefault();
+    const basis = $('commission-basis').value, recurrence = $('commission-recurrence').value;
+    const o = {
+      description: $('commission-desc').value.trim() || null, client_id: $('commission-client').value || null, basis,
+      rate: basis === 'fixed' ? 0 : round2(parseFloat($('commission-rate').value) || 0),
+      amount: basis === 'fixed' ? round2(parseFloat($('commission-amount').value) || 0) : 0,
+      recurrence, start_date: $('commission-start').value || todayIso(), end_date: recurrence === 'once' ? null : ($('commission-end').value || null),
+    };
+    if(basis !== 'fixed' && !o.client_id){ toast('Choose the client this commission is worked out on.'); return; }
+    if(basis !== 'fixed' && !(o.rate > 0 && o.rate <= 100)){ toast('Enter a rate between 0 and 100%.'); return; }
+    if(basis === 'fixed' && !(o.amount > 0)){ toast('Enter the commission amount.'); return; }
+    if(o.end_date && o.end_date < o.start_date){ toast('The end date is before the start date.'); return; }
+    const id = $('commission-rule-id').value;
+    const {data, error} = id
+      ? await sb.from('cc_commission_rules').update(o).eq('id', id).select().single()
+      : await sb.from('cc_commission_rules').insert({company_id: state.company.id, employee_id: emp.id, ...o}).select().single();
+    if(error){ toast(error.message); return; }
+    await logActivity(id ? 'update' : 'create', 'commission_rule', (data && data.id) || id, `${id ? 'Updated' : 'Added'} ${recurrence === 'once' ? 'once-off' : 'rolling'} commission for ${emp.name}: ${commissionRuleLabel(Object.assign({}, o))}`);
+    await reopen(); toast(id ? 'Commission updated.' : 'Commission added.');
+  });
+}
+// Payslip PDF in the invoice colour: bands, company, PAYSLIP + pay date, info bar, earnings with the
+// commission lines, deductions, net pay box and the statutory note.
+async function buildPayslipPdf(emp, v, doc0){
+  const JsPDF = await ensurePdfLib();
+  const doc = doc0 || new JsPDF({unit:'mm', format:'a4'});
+  if(doc0) doc.addPage();
+  const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight(), M = 14, co = state.company || {};
+  const hex = invoiceColor(), ACCENT = hexRgb(hex), INK = hexRgb(invoiceInk(hex));
+  const ACC_TXT = invoiceInk(hex) === '#ffffff' ? ACCENT : [45, 45, 58];
+  const TINT = tintRgb(ACCENT, 0.9), GREY = [110, 112, 125], DARK = [25, 26, 35];
+  doc.setFillColor(...ACCENT); doc.rect(0, 0, W, 3.2, 'F'); doc.rect(0, H - 3.2, W, 3.2, 'F');
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.setTextColor(...DARK); doc.text(pdfText(co.trading_as || co.name || ''), M, 20);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(8.4); doc.setTextColor(...GREY);
+  const coLines = [co.address ? String(co.address).split(/\r?\n/).join(', ') : '', [co.registration_number ? 'Reg no: ' + co.registration_number : '', payeRegistered() && co.paye_reference_number && !isCommissionWorker(emp) ? 'PAYE ref: ' + co.paye_reference_number : ''].filter(Boolean).join('   ')].filter(Boolean);
+  coLines.forEach((l, i)=>doc.text(doc.splitTextToSize(pdfText(l), 120)[0], M, 26 + i * 4.2));
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(23); doc.setTextColor(...ACC_TXT); doc.text('PAYSLIP', W - M, 21, {align:'right'});
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...GREY); doc.text(pdfText(isCommissionWorker(emp) ? 'Commission statement' : 'Employee payslip'), W - M, 27, {align:'right'});
+  const info = [['Pay date', fmtShortDate(v.payDate)], ['Period', v.periodStart && v.periodEnd ? `${fmtShortDate(v.periodStart)} – ${fmtShortDate(v.periodEnd)}` : '—'], ['Name', emp.name], [isCommissionWorker(emp) ? 'Worker' : 'Position', isCommissionWorker(emp) ? 'Commission (no PAYE)' : (emp.role_title || '—')], ['Net pay', pdfMoney(v.netPay)]];
+  doc.setFillColor(...TINT); doc.roundedRect(M, 38, W - 2*M, 16, 2, 2, 'F');
+  const cw = (W - 2*M - 8) / info.length;
+  info.forEach(([k, val], i)=>{
+    const x = M + 5 + i * cw;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(6.6); doc.setTextColor(...GREY); doc.text(k.toUpperCase(), x, 44);
+    doc.setTextColor(...(i === info.length - 1 ? ACC_TXT : DARK));
+    const t = pdfText(val); let fs = 9.4; doc.setFontSize(fs); while(fs > 6.5 && doc.getTextWidth(t) > cw - 3){ fs -= 0.4; doc.setFontSize(fs); }
+    doc.text(doc.splitTextToSize(t, cw - 3)[0] || '', x, 50);
+  });
+  let y = 62;
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(8.4); doc.setTextColor(...GREY);
+  const ids = [emp.id_number ? 'ID number: ' + emp.id_number : '', emp.tax_number ? 'Tax number: ' + emp.tax_number : '', emp.start_date ? 'Start date: ' + emp.start_date : ''].filter(Boolean).join('     ');
+  if(ids){ doc.text(pdfText(ids), M, y); y += 6; }
+  const earn = [];
+  if(v.basic) earn.push([isCommissionWorker(emp) ? 'Retainer / base pay' : 'Basic salary', '', pdfMoney(v.basic)]);
+  if(v.travelAllowance) earn.push(['Travel allowance', '', pdfMoney(v.travelAllowance)]);
+  if(v.bonus) earn.push(['Bonus', '', pdfMoney(v.bonus)]);
+  (v.commissionLines || []).forEach(l=>{ const t = commissionLineText(l); earn.push([t.head, t.how, pdfMoney(l.amount)]); });
+  const extraComm = round2((Number(v.commission) || 0) - (v.commissionLines || []).reduce((s, l)=>s + (Number(l.amount) || 0), 0));
+  if(extraComm > 0.004) earn.push([(v.commissionLines || []).length ? 'Other commission' : 'Commission', '', pdfMoney(extraComm)]);
+  if(!earn.length) earn.push(['—', '', pdfMoney(0)]);
+  const table = (title, rows, totalLabel, total) => {
+    doc.autoTable({startY: y, margin:{left:M, right:M}, theme:'plain', head:[[title, '', 'Amount']], body: rows.concat([[totalLabel, '', pdfMoney(total)]]),
+      styles:{fontSize:9, cellPadding:{top:2.2, bottom:2.2, left:2.5, right:2.5}, textColor:DARK, lineColor:[226, 228, 236], lineWidth:{bottom:0.2}},
+      headStyles:{fillColor:ACCENT, textColor:INK, fontStyle:'bold', lineWidth:0},
+      columnStyles:{1:{textColor:GREY, fontSize:8}, 2:{halign:'right', cellWidth:34}},
+      didParseCell: d=>{ if(d.section === 'head' && d.column.index === 2) d.cell.styles.halign = 'right'; if(d.section === 'body' && d.row.index === rows.length) d.cell.styles.fontStyle = 'bold'; }});
+    y = doc.lastAutoTable.finalY + 6;
+  };
+  table('Earnings', earn, 'Gross earnings', v.grossEarnings);
+  const ded = [];
+  if(!isCommissionWorker(emp)){ ded.push(["PAYE (employees' tax)", '', pdfMoney(v.paye)]); ded.push(['UIF contribution', '', pdfMoney(v.uifEmployee)]); }
+  if(v.retirementContribution) ded.push(['Retirement fund', '', pdfMoney(v.retirementContribution)]);
+  if(v.medicalContribution) ded.push(['Medical aid', '', pdfMoney(v.medicalContribution)]);
+  if(v.otherDeduction) ded.push([v.otherDeductionNote || 'Other deduction', '', pdfMoney(v.otherDeduction)]);
+  if(!ded.length) ded.push(['None', '', pdfMoney(0)]);
+  table('Deductions', ded, 'Total deductions', v.totalDeductions);
+  doc.setFillColor(...ACCENT); doc.roundedRect(W - M - 82, y, 82, 11, 1.8, 1.8, 'F');
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(9.5); doc.setTextColor(...INK); doc.text('NET PAY', W - M - 78, y + 7);
+  doc.setFontSize(12.5); doc.text(pdfMoney(v.netPay), W - M - 4, y + 7.3, {align:'right'}); y += 20;
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(7.8); doc.setTextColor(...GREY);
+  const note = isCommissionWorker(emp)
+    ? 'Commission earner: paid gross. No PAYE, UIF or SDL has been deducted or declared; the worker is responsible for their own income tax.'
+    : `Employer also contributes ${pdfMoney(v.uifEmployer)} UIF this period (not deducted from pay).${v.medicalCreditMonthly ? ` PAYE is after a medical scheme fees tax credit of ${pdfMoney(v.medicalCreditMonthly)}.` : ''} Figures use SARS 2027 tax year rates.`;
+  doc.splitTextToSize(pdfText(note), W - 2*M).forEach(t=>{ doc.text(t, M, y); y += 4; });
+  doc.setDrawColor(226, 228, 236); doc.line(M, H - 19, W - M, H - 19);
+  doc.setFontSize(7.8); doc.text(pdfText([co.trading_as || co.name, co.contact_email, co.contact_phone].filter(Boolean).join('  |  ')), W / 2, H - 14, {align:'center'});
+  return {doc, filename: pdfSafeName(`Payslip_${emp.name}_${v.payDate}`) + '.pdf'};
+}
+async function buildPayslipsPdf(rows){
+  let doc = null;
+  for(const r of rows){
+    const emp = state.employees.find(e=>e.id === r.employee_id); if(!emp) continue;
+    const built = await buildPayslipPdf(emp, normalizePayslipRow(r), doc);
+    doc = built.doc;
+  }
+  return doc ? {doc, filename: pdfSafeName(`Payslips_${rows[0] ? rows[0].pay_date.slice(0,7) : todayIso()}`) + '.pdf'} : null;
+}
 
 /* ========================= BANK RULES ========================= */
 // "Anything containing FNB MONTHLY FEE is a Bank charges expense": a rule matches unmatched bank lines by
@@ -5750,6 +6069,7 @@ function addMonthsClipped(iso, k){
 // threshold — the same rule the Monthly EMP201 Tracking panel uses, so the two always agree.
 function payrollSdlApplicable(){ return !!computeStatutorySummary().sdl.applicable; }
 function payslipSdl(p, applicable){
+  if(p && p.worker_type === 'commission') return 0;   // commission earners: no SDL
   return applicable ? round2(((Number(p.basic_salary)||0) + (Number(p.travel_allowance)||0)) * SDL_RATE) : 0;
 }
 
@@ -5927,7 +6247,7 @@ function buildLedger(){
     const withheld = round2(gross - net - paye - uifEe);   // retirement, medical aid and other deductions
     const emp = (state.employees||[]).find(x=>x.id===p.employee_id);
     post(p.pay_date, 'Payroll', `Payroll paid${emp ? ' — '+emp.name : ''}`,
-      [['PAYROLL', gross + uifEr + sdl],['BANK', -net],['SARS', -(paye + uifEe + uifEr + sdl)],['PAYDED', -withheld]]);
+      [[validPayrollKey(p.expense_account_key), gross + uifEr + sdl],['BANK', -net],['SARS', -(paye + uifEe + uifEr + sdl)],['PAYDED', -withheld]]);
   });
   // EMP201 submitted and paid to SARS: clears the SARS liability from the bank.
   (state.emp201Submissions||[]).filter(r=>r.submitted).forEach(r=>{
@@ -9377,6 +9697,8 @@ function normalizePayslipCalc(calc){
     paye: calc.paye, uifEmployee: calc.uifEmployee, uifEmployer: calc.uifEmployer,
     otherDeduction: calc.otherDeduction, otherDeductionNote: calc.otherDeductionNote,
     totalDeductions: calc.totalDeductions, netPay: calc.netPay,
+    commissionLines: calc.commissionLines || [], periodStart: calc.periodStart || null, periodEnd: calc.periodEnd || null,
+    workerType: calc.workerType || 'employee', expenseAccountKey: calc.expenseAccountKey || null,
   };
 }
 function normalizePayslipRow(row){
@@ -9389,6 +9711,8 @@ function normalizePayslipRow(row){
     paye: row.paye, uifEmployee: row.uif_employee, uifEmployer: row.uif_employer,
     otherDeduction: row.other_deduction, otherDeductionNote: row.other_deduction_note,
     totalDeductions: row.deductions, netPay: row.net,
+    commissionLines: Array.isArray(row.commission_lines) ? row.commission_lines : [], periodStart: row.period_start || null, periodEnd: row.period_end || null,
+    workerType: row.worker_type || 'employee', expenseAccountKey: row.expense_account_key || null,
   };
 }
 function renderPayslipHTML(emp, v){
@@ -9397,12 +9721,13 @@ function renderPayslipHTML(emp, v){
       ${state.company.logo_data_url ? `<img class="invoice-logo-preview" src="${state.company.logo_data_url}">` : ''}
       <h3 style="margin-top:0;">Payslip — ${emp.name}</h3>
       <p style="color:var(--muted);margin-top:-8px;font-size:.85rem;">${state.company.name}${state.company.address ? ' · ' + state.company.address : ''}</p>
-      <p style="font-size:.85rem;color:var(--muted);">Pay date: ${v.payDate}${emp.role_title ? ' · ' + emp.role_title : ''}${emp.id_number ? ' · ID ' + emp.id_number : ''}</p>
+      <p style="font-size:.85rem;color:var(--muted);">Pay date: ${v.payDate}${v.periodStart && v.periodEnd ? ' · Period ' + fmtShortDate(v.periodStart) + ' – ' + fmtShortDate(v.periodEnd) : ''}${v.workerType === 'commission' ? ' · Commission earner (no PAYE)' : (emp.role_title ? ' · ' + escHtml(emp.role_title) : '')}${emp.id_number ? ' · ID ' + escHtml(emp.id_number) : ''}</p>
       <table><thead><tr><th>Earnings</th><th style="text-align:right;">Amount</th></tr></thead><tbody>
-        <tr><td>Basic Salary</td><td style="text-align:right;">${fmt(v.basic)}</td></tr>
+        ${(v.basic || v.workerType !== 'commission') ? `<tr><td>${v.workerType === 'commission' ? 'Retainer / base pay' : 'Basic Salary'}</td><td style="text-align:right;">${fmt(v.basic)}</td></tr>` : ''}
         ${v.travelAllowance ? `<tr><td>Travel Allowance</td><td style="text-align:right;">${fmt(v.travelAllowance)}</td></tr>` : ''}
         ${v.bonus ? `<tr><td>Bonus</td><td style="text-align:right;">${fmt(v.bonus)}</td></tr>` : ''}
-        ${v.commission ? `<tr><td>Commission</td><td style="text-align:right;">${fmt(v.commission)}</td></tr>` : ''}
+        ${(v.commissionLines || []).map(l=>{ const t = commissionLineText(l); return `<tr><td>${escHtml(t.head)}<div style="font-size:.75rem;color:var(--muted);">${escHtml(t.how)}</div></td><td style="text-align:right;">${fmt(l.amount)}</td></tr>`; }).join('')}
+        ${(()=>{ const extra = round2((Number(v.commission) || 0) - (v.commissionLines || []).reduce((s, l)=>s + (Number(l.amount) || 0), 0)); return extra > 0.004 ? `<tr><td>${(v.commissionLines || []).length ? 'Other commission' : 'Commission'}</td><td style="text-align:right;">${fmt(extra)}</td></tr>` : ''; })()}
         <tr style="font-weight:700;"><td>Gross Earnings</td><td style="text-align:right;">${fmt(v.grossEarnings)}</td></tr>
       </tbody></table>
       ${(v.carFringeBenefit || v.loanFringeBenefit) ? `
@@ -9411,8 +9736,8 @@ function renderPayslipHTML(emp, v){
         ${v.loanFringeBenefit ? `<tr><td>Low/no-interest loan</td><td style="text-align:right;">${fmt(v.loanFringeBenefit)}</td></tr>` : ''}
       </tbody></table>` : ''}
       <table style="margin-top:10px;"><thead><tr><th>Deductions</th><th style="text-align:right;">Amount</th></tr></thead><tbody>
-        <tr><td>PAYE (Employees' Tax)</td><td style="text-align:right;">${fmt(v.paye)}</td></tr>
-        <tr><td>UIF Contribution</td><td style="text-align:right;">${fmt(v.uifEmployee)}</td></tr>
+        ${v.workerType === 'commission' ? '' : `<tr><td>PAYE (Employees' Tax)</td><td style="text-align:right;">${fmt(v.paye)}</td></tr>
+        <tr><td>UIF Contribution</td><td style="text-align:right;">${fmt(v.uifEmployee)}</td></tr>`}
         ${v.retirementContribution ? `<tr><td>Retirement Fund Contribution</td><td style="text-align:right;">${fmt(v.retirementContribution)}</td></tr>` : ''}
         ${v.medicalContribution ? `<tr><td>Medical Aid Contribution</td><td style="text-align:right;">${fmt(v.medicalContribution)}</td></tr>` : ''}
         ${v.otherDeduction ? `<tr><td>${v.otherDeductionNote || 'Other Deduction'}</td><td style="text-align:right;">${fmt(v.otherDeduction)}</td></tr>` : ''}
@@ -9420,7 +9745,8 @@ function renderPayslipHTML(emp, v){
       </tbody></table>
       <div style="text-align:right;margin-top:10px;font-size:1.1rem;font-weight:700;">Net Pay: ${fmt(v.netPay)}</div>
       ${v.medicalCreditMonthly ? `<p style="font-size:.78rem;color:var(--muted);margin-top:10px;">Includes a medical scheme fees tax credit of ${fmt(v.medicalCreditMonthly)} already applied to reduce PAYE above.</p>` : ''}
-      <p style="font-size:.78rem;color:var(--muted);">Employer also contributes ${fmt(v.uifEmployer)} in UIF this period (not deducted from pay). Figures use SARS 2027 tax year rates — not tax advice.</p>
+      ${v.workerType === 'commission' ? `<p style="font-size:.78rem;color:var(--muted);">Commission earner: paid gross. No PAYE, UIF or SDL is deducted or declared; the worker is responsible for their own income tax.</p>` : `<p style="font-size:.78rem;color:var(--muted);">Employer also contributes ${fmt(v.uifEmployer)} in UIF this period (not deducted from pay). Figures use SARS 2027 tax year rates — not tax advice.</p>`}
+      ${v.expenseAccountKey || v.workerType === 'commission' ? `<p style="font-size:.75rem;color:var(--muted);" class="no-print">Booked to ${escHtml(payrollAccountName(v.expenseAccountKey))}.</p>` : ''}
     </div>
   `;
 }
@@ -9488,6 +9814,34 @@ function renderIRP5HTML(emp, irp){
       <p style="font-size:.75rem;color:var(--muted);margin-top:12px;">This is a simplified certificate using standard SARS IRP5 source codes for reference — it is not generated by, or submission-ready for, SARS e@syFile. Confirm all figures and codes with your accountant before using for tax filing. Employer UIF and SDL contributions are employer costs and aren't shown on the employee's own certificate.</p>
     </div>
   `;
+}
+function setPayslipPeriod(emp){
+  const d = payslipPeriodDefault(document.getElementById('payslip-date').value, emp.pay_frequency);
+  document.getElementById('payslip-period-start').value = d.start;
+  document.getElementById('payslip-period-end').value = d.end;
+  renderPayslipCommissionLines(emp);
+}
+// The commission rules that apply for the period, each with a tick box (untick to leave one off).
+function renderPayslipCommissionLines(emp){
+  const host = document.getElementById('payslip-commission-lines'); if(!host) return;
+  const period = {start: document.getElementById('payslip-period-start').value, end: document.getElementById('payslip-period-end').value};
+  const lines = period.start && period.end ? computeCommissionLines(emp.id, period) : [];
+  state.payslipCommissionDraft = lines;
+  host.innerHTML = lines.length ? `<div class="panel" style="margin:4px 0 10px;padding:10px 12px;"><h4 style="margin:0 0 6px;">Commission for this period</h4>
+    ${lines.map((l, i)=>{ const t = commissionLineText(l); return `<label style="display:flex;gap:8px;align-items:flex-start;font-size:.85rem;margin:4px 0;"><input type="checkbox" class="payslip-comm-line" data-idx="${i}" checked style="width:auto;margin-top:3px;"><span style="flex:1;">${escHtml(t.head)}<span style="color:var(--muted);"> · ${escHtml(t.how)}${l.recurrence === 'once' ? ' · once-off' : ''}</span></span><strong>${fmt(l.amount)}</strong></label>`; }).join('')}
+  </div>` : (commissionRulesFor(emp.id).length ? '<p style="font-size:.8rem;color:var(--muted);margin:2px 0 8px;">No commission falls in this period.</p>' : '');
+}
+function selectedPayslipCommissionLines(){
+  const draft = state.payslipCommissionDraft || [];
+  return [...document.querySelectorAll('.payslip-comm-line')].filter(cb=>cb.checked).map(cb=>draft[Number(cb.dataset.idx)]).filter(Boolean);
+}
+// Prints just the payslip (not the whole page) in its own window.
+function printPayslip(){
+  const el = document.querySelector('#payslip-preview .panel'); if(!el) return;
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Payslip</title><style>body{font-family:Arial,Helvetica,sans-serif;color:#222;margin:24px;} table{width:100%;border-collapse:collapse;margin-top:8px;} th,td{padding:6px 8px;border-bottom:1px solid #e5e5ee;text-align:left;font-size:13px;} th{background:${invoiceColor()};color:${invoiceInk(invoiceColor())};} .no-print{display:none;} img{max-height:60px;} p{font-size:13px;}</style></head><body>${el.innerHTML}</body></html>`;
+  const w = window.open(URL.createObjectURL(new Blob([html], {type:'text/html'})), '_blank');
+  if(!w){ toast('Your browser blocked the pop-up. Allow pop-ups for this site, or use Download PDF.'); return; }
+  try{ w.addEventListener('load', ()=>{ try{ w.focus(); w.print(); }catch(e){} }); }catch(e){}
 }
 function closePayslipModal(){
   document.getElementById('payslip-modal-backdrop').classList.add('hidden');
@@ -9586,6 +9940,7 @@ function easyFileReadiness(taxYearLabel){
   const companyChecks = easyFileCompanyChecks();
   const companyOk = companyChecks.every(c=>c.pass);
   const employeeResults = state.employees
+    .filter(emp => !isCommissionWorker(emp))
     .map(emp => ({ emp, irp: computeIRP5(emp.id, taxYearLabel) }))
     .filter(r => r.irp.count > 0)
     .map(r => {
@@ -9684,7 +10039,7 @@ function monthlyPayrollActuals(){
     byMonth[ym].paye += Number(p.paye) || 0;
     byMonth[ym].uifEmployee += Number(p.uif_employee) || 0;
     byMonth[ym].uifEmployer += Number(p.uif_employer) || 0;
-    byMonth[ym].leviablePayroll += (Number(p.basic_salary) || 0) + (Number(p.travel_allowance) || 0);
+    if(p.worker_type !== 'commission') byMonth[ym].leviablePayroll += (Number(p.basic_salary) || 0) + (Number(p.travel_allowance) || 0);
     byMonth[ym].sdl = round2(byMonth[ym].sdl + payslipSdl(p, sdlOn));
   });
   return Object.values(byMonth).sort((a,b)=> b.ym.localeCompare(a.ym));
@@ -9724,7 +10079,7 @@ function renderEmp201Panel(){
 // selected assessment year (same 1 Mar – end Feb window as the SARS individual tax year).
 function computeCoidaReturn(taxYearLabel){
   const bounds = taxYearBounds(taxYearLabel);
-  const rows = state.employees.filter(e=>e.active).map(emp=>{
+  const rows = state.employees.filter(e=>e.active && !isCommissionWorker(e)).map(emp=>{
     const paid = state.payrollPayments.filter(p=>p.employee_id===emp.id && p.paid && p.pay_date>=bounds.start && p.pay_date<=bounds.end);
     const actualEarnings = round2(paid.reduce((s,p)=> s + (Number(p.gross)||0), 0));
     const cappedEarnings = Math.min(actualEarnings, COIDA_EARNINGS_CAP_2027);
@@ -9766,7 +10121,7 @@ function renderPayroll(){
   const totalPayroll = state.employees.filter(e=>e.active).reduce((s,e)=>s+Number(e.salary),0);
   const stat = computeStatutorySummary();
   return `
-    <div class="section-header" style="--accent-c:var(--c-payroll);"><h1>Payroll</h1>${canEdit ? `<button class="btn" id="add-employee-btn">+ Add Employee</button>` : ''}</div>
+    <div class="section-header" style="--accent-c:var(--c-payroll);"><h1>Payroll</h1>${canEdit ? `<div style="display:flex;gap:8px;flex-wrap:wrap;"><button class="btn secondary" id="add-commission-worker-btn">+ Commission worker</button><button class="btn" id="add-employee-btn">+ Add Employee</button></div>` : ''}</div>
     <p class="section-caption">Employees, pay runs, leave, and their current tasks.</p>
     <div class="grid">
       <div class="card" style="--accent-c:var(--c-payroll);"><h3>Monthly Payroll (active)</h3><div class="value">${fmt(totalPayroll)}</div></div>
@@ -9774,7 +10129,7 @@ function renderPayroll(){
       <div class="card"><h3>UIF (monthly est.)</h3><div class="value">${fmt(stat.totalUifEmployee + stat.totalUifEmployer)}</div><div class="sub">${fmt(stat.totalUifEmployee)} employee + ${fmt(stat.totalUifEmployer)} employer</div></div>
       <div class="card"><h3>SDL Payable</h3><div class="value">${stat.sdl.applicable ? fmt(stat.sdl.amount) : 'R0.00'}</div><div class="sub">${stat.sdl.applicable ? 'Projected annual payroll over R500,000' : 'Exempt — projected annual payroll is at or below R500,000'}</div></div>
     </div>
-    <p style="color:var(--muted);font-size:.78rem;margin-top:-6px;">PAYE/UIF/SDL are estimates from each employee's recurring salary and allowances (once-off bonuses/commission aren't projected forward), using SARS 2027 tax year rates. Not tax advice — confirm with your accountant or SARS before filing.</p>
+    <p style="color:var(--muted);font-size:.78rem;margin-top:-6px;">Commission workers are paid gross and left out of PAYE, UIF and SDL. PAYE/UIF/SDL are estimates from each employee's recurring salary and allowances (once-off bonuses/commission aren't projected forward), using SARS 2027 tax year rates. Not tax advice — confirm with your accountant or SARS before filing.</p>
     ${isAdmin() ? `
     <div class="panel" style="border-top:3px solid var(--c-payroll);">
       <h3 style="margin-top:0;">Bulk IRP5 Export (e@syFile)</h3>
@@ -9787,11 +10142,12 @@ function renderPayroll(){
     <div class="panel">
       <h3 style="margin-top:0;">Employees</h3>
       ${state.employees.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Basic Salary</th><th>Frequency</th><th>Active</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.employees.map(e=>`<tr><td>${e.name}</td><td>${e.role_title||'—'}</td><td>${fmt(e.salary)}</td><td>${e.pay_frequency}</td><td>${e.active?'Yes':'No'}</td>
+        ${state.employees.map(e=>`<tr><td>${escHtml(e.name)}${isCommissionWorker(e) ? ' <span class="tag-pill">Commission · no PAYE</span>' : ''}${commissionRulesFor(e.id).filter(r=>['active','future'].includes(commissionRuleStatus(r).key)).length ? `<div style="font-size:.72rem;color:var(--muted);">${commissionRulesFor(e.id).filter(r=>['active','future'].includes(commissionRuleStatus(r).key)).length} commission rule(s)</div>` : ''}</td><td>${escHtml(e.role_title||'—')}</td><td>${fmt(e.salary)}</td><td>${e.pay_frequency}</td><td>${e.active?'Yes':'No'}</td>
         ${canEdit?`<td style="white-space:nowrap;">
           <button class="btn small secondary" data-edit-employee="${e.id}">Edit</button>
           <button class="btn small secondary" data-payslip-employee="${e.id}">Payslip</button>
-          <button class="btn small secondary" data-irp5-employee="${e.id}">IRP5</button>
+          <button class="btn small secondary" data-commission-employee="${e.id}">Commission</button>
+          ${isCommissionWorker(e) ? '' : `<button class="btn small secondary" data-irp5-employee="${e.id}">IRP5</button>`}
           <button class="btn small secondary" data-task-employee="${e.id}">Assign Task</button>
           <button class="btn small danger" data-del-employee="${e.id}">Delete</button>
         </td>`:''}</tr>`).join('')}
@@ -9822,10 +10178,11 @@ function renderPayroll(){
     </div>
     <div class="panel">
       <h3 style="margin-top:0;">Recent payslips</h3>
-      ${state.payrollPayments.length ? `<table><thead><tr><th>Date</th><th>Employee</th><th>Gross</th><th>PAYE</th><th>UIF (ee)</th><th>Net</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.payrollPayments.slice(0,10).map(p=>`<tr><td>${p.pay_date}</td><td>${state.employees.find(e=>e.id===p.employee_id)?.name||'—'}</td><td>${fmt(p.gross)}</td><td>${fmt(p.paye)}</td><td>${fmt(p.uif_employee)}</td><td>${fmt(p.net)}</td>
-        ${canEdit?`<td><button class="btn small secondary" data-view-payslip="${p.id}">View / Print</button></td>`:''}</tr>`).join('')}
-      </tbody></table>` : `<div class="empty">No payslips recorded yet.</div>`}
+      ${state.payrollPayments.length ? `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;"><label style="font-size:.85rem;color:var(--muted);">Print every payslip for</label><select id="payslip-pack-month" style="width:auto;">${[...new Set(state.payrollPayments.map(p=>String(p.pay_date||'').slice(0,7)).filter(Boolean))].sort().reverse().map(m=>`<option value="${m}">${MONTHS_LONG[Number(m.slice(5,7))-1]} ${m.slice(0,4)}</option>`).join('')}</select><button type="button" class="btn small secondary" id="payslip-pack-pdf">Download PDF</button></div>
+      <table><thead><tr><th>Date</th><th>Employee</th><th style="text-align:right;">Gross</th><th style="text-align:right;">Commission</th><th style="text-align:right;">PAYE</th><th style="text-align:right;">UIF (ee)</th><th style="text-align:right;">Net</th><th>Account</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${state.payrollPayments.slice(0, state.payslipsShowAll ? 1000 : 15).map(p=>`<tr><td>${p.pay_date}</td><td>${escHtml(state.employees.find(e=>e.id===p.employee_id)?.name||'—')}${p.worker_type === 'commission' ? ' <span class="tag-pill">no PAYE</span>' : ''}</td><td style="text-align:right;">${fmt(p.gross)}</td><td style="text-align:right;">${Number(p.commission) ? fmt(p.commission) : '—'}</td><td style="text-align:right;">${fmt(p.paye)}</td><td style="text-align:right;">${fmt(p.uif_employee)}</td><td style="text-align:right;">${fmt(p.net)}</td><td style="font-size:.78rem;">${escHtml(payrollAccountName(p.expense_account_key))}</td>
+        ${canEdit?`<td style="white-space:nowrap;"><button class="btn small secondary" data-view-payslip="${p.id}">View / Print</button> <button class="btn small secondary" data-pdf-payslip="${p.id}">PDF</button></td>`:''}</tr>`).join('')}
+      </tbody></table>${state.payrollPayments.length > 15 && !state.payslipsShowAll ? `<button type="button" class="btn small secondary" id="payslips-show-all" style="margin-top:8px;">Show all ${state.payrollPayments.length}</button>` : ''}` : `<div class="empty">No payslips recorded yet.</div>`}
     </div>
     ${canEdit ? `
     <div class="modal-backdrop hidden" id="employee-modal-backdrop"><div class="modal">
@@ -9838,12 +10195,19 @@ function renderPayroll(){
           <div class="field"><label>First name(s) (for IRP5)</label><input type="text" id="employee-first-names"></div>
           <div class="field"><label>Surname (for IRP5)</label><input type="text" id="employee-surname"></div>
         </div>
+        <div class="field"><label>Type of worker</label><select id="employee-worker-type">
+          <option value="employee">Employee (PAYE, UIF and SDL worked out)</option>
+          <option value="commission">Commission-based worker (paid gross, no PAYE, UIF or SDL)</option>
+        </select></div>
         <div class="field"><label>Role</label><input type="text" id="employee-role"></div>
+        ${payrollAccountPickerHtml('employee-expense-account', 'PAYROLL')}
         <div class="row">
-          <div class="field"><label>Basic Salary (R, per pay period)</label><input type="number" step="0.01" id="employee-salary" required></div>
+          <div class="field"><label id="employee-salary-label">Basic Salary (R, per pay period)</label><input type="number" step="0.01" id="employee-salary" required></div>
           <div class="field"><label>Pay frequency</label><select id="employee-frequency"><option value="monthly">Monthly</option><option value="weekly">Weekly</option><option value="biweekly">Biweekly</option></select></div>
         </div>
         <div class="field"><label>Start date</label><input type="date" id="employee-start"></div>
+        <p class="hidden" id="employee-commission-note" style="font-size:.8rem;color:var(--muted);margin:0 0 8px;">Commission workers are paid gross: no PAYE, UIF or SDL, and they are left off the EMP201, EMP501, IRP5 and COIDA returns. Set up their commission with the <strong>Commission</strong> button after saving.</p>
+        <div id="employee-tax-sections">
         <h3 style="margin-bottom:2px;">Tax &amp; statutory details</h3>
         <p style="font-size:.78rem;color:var(--muted);margin-top:0;">Used to calculate PAYE, UIF, and this employee's IRP5.</p>
         <div class="row">
@@ -9870,6 +10234,11 @@ function renderPayroll(){
           <div class="field"><label>Interest rate charged on loan (% p.a.)</label><input type="number" step="0.01" id="employee-loan-rate" value="0"></div>
         </div>
         <p style="font-size:.7rem;color:var(--muted);margin-top:-6px;">Low/no-interest loan benefit = (SARS official rate − rate charged) × balance ÷ 12, if positive. Set the SARS official rate on the Settings page under Company Details.</p>
+        </div>
+        <div class="row hidden" id="employee-commission-ids">
+          <div class="field"><label>ID number</label><input type="text" id="employee-id-number-c"></div>
+          <div class="field"><label>Tax number (if they gave one)</label><input type="text" id="employee-tax-number-c"></div>
+        </div>
         <div class="modal-actions"><button type="button" class="btn secondary" id="employee-cancel">Cancel</button><button type="submit" class="btn" id="employee-submit">Save</button></div>
       </form>
     </div></div>
@@ -9878,17 +10247,24 @@ function renderPayroll(){
       <h2 id="payslip-modal-title">Generate Payslip</h2>
       <form id="payslip-setup-form">
         <input type="hidden" id="payslip-employee-id">
-        <div class="field"><label>Pay date</label><input type="date" id="payslip-date" required></div>
+        <div class="row">
+          <div class="field"><label>Pay date</label><input type="date" id="payslip-date" required></div>
+          <div class="field"><label>Commission period from</label><input type="date" id="payslip-period-start"></div>
+          <div class="field"><label>to</label><input type="date" id="payslip-period-end"></div>
+        </div>
+        <div id="payslip-commission-lines"></div>
         <div class="row">
           <div class="field"><label>Once-off bonus (R)</label><input type="number" step="0.01" id="payslip-bonus" value="0"></div>
-          <div class="field"><label>Once-off commission (R)</label><input type="number" step="0.01" id="payslip-commission" value="0"></div>
+          <div class="field"><label>Extra commission (R)</label><input type="number" step="0.01" id="payslip-commission" value="0"></div>
         </div>
+        ${payrollAccountPickerHtml('payslip-expense-account', 'PAYROLL', 'Expense account for this payslip')}
         <div class="field"><label>Other deduction (R) — e.g. loan repayment</label><input type="number" step="0.01" id="payslip-other-deduction" value="0"></div>
         <div class="field"><label>Other deduction note (optional)</label><input type="text" id="payslip-other-note"></div>
         <div class="modal-actions"><button type="button" class="btn secondary" id="payslip-setup-cancel">Cancel</button><button type="submit" class="btn">Preview Payslip</button></div>
       </form>
       <div id="payslip-preview"></div>
     </div></div>
+    <div class="modal-backdrop hidden" id="commission-modal-backdrop"><div class="modal" id="commission-modal-content" style="max-width:720px;"></div></div>
     <div class="modal-backdrop hidden" id="leave-modal-backdrop"><div class="modal">
       <button class="close-x" id="leave-modal-close">✕</button>
       <h2 id="leave-modal-title">Manage Leave</h2>
@@ -9967,6 +10343,21 @@ function resetEmployeeForm(){
   document.getElementById('employee-loan-rate').value = '0';
   document.getElementById('employee-modal-title').textContent = 'Add Employee';
   document.getElementById('employee-submit').textContent = 'Save';
+  document.getElementById('employee-worker-type').value = 'employee';
+  document.getElementById('employee-expense-account').innerHTML = payrollAccountOptions('PAYROLL');
+  document.getElementById('employee-expense-account-new')?.classList.add('hidden');
+  document.getElementById('employee-id-number-c').value = '';
+  document.getElementById('employee-tax-number-c').value = '';
+  syncWorkerTypeFields();
+}
+function syncWorkerTypeFields(){
+  const comm = document.getElementById('employee-worker-type').value === 'commission';
+  document.getElementById('employee-tax-sections').classList.toggle('hidden', comm);
+  document.getElementById('employee-commission-note').classList.toggle('hidden', !comm);
+  document.getElementById('employee-commission-ids').classList.toggle('hidden', !comm);
+  document.getElementById('employee-salary-label').textContent = comm ? 'Retainer / base pay (R, per pay period; 0 if commission only)' : 'Basic Salary (R, per pay period)';
+  document.getElementById('employee-salary').required = !comm;
+  if(comm && document.getElementById('employee-salary').value === '') document.getElementById('employee-salary').value = '0';
 }
 function attachPayrollHandlers(){
   attachEmp501Handlers();
@@ -9975,6 +10366,16 @@ function attachPayrollHandlers(){
     resetEmployeeForm();
     empBackdrop.classList.remove('hidden');
   });
+  document.getElementById('add-commission-worker-btn')?.addEventListener('click', ()=>{
+    resetEmployeeForm();
+    document.getElementById('employee-worker-type').value = 'commission';
+    document.getElementById('employee-modal-title').textContent = 'Add Commission Worker';
+    syncWorkerTypeFields();
+    empBackdrop.classList.remove('hidden');
+  });
+  document.getElementById('employee-worker-type')?.addEventListener('change', syncWorkerTypeFields);
+  wirePayrollAccountPicker('employee-expense-account');
+  document.querySelectorAll('[data-commission-employee]').forEach(b=>b.addEventListener('click', ()=>openCommissionModal(b.dataset.commissionEmployee)));
   document.getElementById('employee-cancel')?.addEventListener('click', ()=>empBackdrop.classList.add('hidden'));
   document.getElementById('employee-modal-close')?.addEventListener('click', ()=>empBackdrop.classList.add('hidden'));
   document.querySelectorAll('[data-edit-employee]').forEach(btn=>{
@@ -10003,6 +10404,11 @@ function attachPayrollHandlers(){
       document.getElementById('employee-car-maintenance').checked = !!emp.car_has_maintenance_plan;
       document.getElementById('employee-loan-balance').value = emp.loan_balance || 0;
       document.getElementById('employee-loan-rate').value = emp.loan_interest_rate_charged || 0;
+      document.getElementById('employee-worker-type').value = emp.worker_type === 'commission' ? 'commission' : 'employee';
+      document.getElementById('employee-expense-account').innerHTML = payrollAccountOptions(emp.expense_account_key);
+      document.getElementById('employee-id-number-c').value = emp.id_number || '';
+      document.getElementById('employee-tax-number-c').value = emp.tax_number || '';
+      syncWorkerTypeFields();
       document.getElementById('employee-modal-title').textContent = 'Edit ' + emp.name;
       document.getElementById('employee-submit').textContent = 'Save Changes';
       empBackdrop.classList.remove('hidden');
@@ -10016,7 +10422,7 @@ function attachPayrollHandlers(){
       first_names: document.getElementById('employee-first-names').value.trim() || null,
       surname: document.getElementById('employee-surname').value.trim() || null,
       role_title: document.getElementById('employee-role').value.trim() || null,
-      salary: parseFloat(document.getElementById('employee-salary').value),
+      salary: parseFloat(document.getElementById('employee-salary').value) || 0,
       pay_frequency: document.getElementById('employee-frequency').value,
       start_date: document.getElementById('employee-start').value || null,
       id_number: document.getElementById('employee-id-number').value.trim() || null,
@@ -10032,7 +10438,15 @@ function attachPayrollHandlers(){
       car_has_maintenance_plan: document.getElementById('employee-car-maintenance').checked,
       loan_balance: parseFloat(document.getElementById('employee-loan-balance').value) || 0,
       loan_interest_rate_charged: parseFloat(document.getElementById('employee-loan-rate').value) || 0,
+      worker_type: document.getElementById('employee-worker-type').value === 'commission' ? 'commission' : 'employee',
+      expense_account_key: (v => v && v !== '__new' && v !== 'PAYROLL' ? validPayrollKey(v) : null)(document.getElementById('employee-expense-account').value),
     };
+    if(payload.worker_type === 'commission'){
+      // Gross-paid commission worker: none of the employee tax inputs apply.
+      Object.assign(payload, {id_number: document.getElementById('employee-id-number-c').value.trim() || null, tax_number: document.getElementById('employee-tax-number-c').value.trim() || null,
+        travel_allowance: 0, travel_logbook_qualifies: false, retirement_contribution: 0, medical_aid_contribution: 0, medical_aid_dependants: 0,
+        has_company_car: false, car_determined_value: 0, car_has_maintenance_plan: false, loan_balance: 0, loan_interest_rate_charged: 0});
+    }
     const {error} = editId
       ? await sb.from('cc_employees').update(payload).eq('id', editId)
       : await sb.from('cc_employees').insert(Object.assign({company_id: state.company.id}, payload));
@@ -10061,6 +10475,8 @@ function attachPayrollHandlers(){
       document.getElementById('payslip-commission').value = 0;
       document.getElementById('payslip-other-deduction').value = 0;
       document.getElementById('payslip-other-note').value = '';
+      document.getElementById('payslip-expense-account').innerHTML = payrollAccountOptions(emp.expense_account_key);
+      setPayslipPeriod(emp);
       document.getElementById('payslip-setup-form').classList.remove('hidden');
       document.getElementById('payslip-preview').innerHTML = '';
       payslipBackdrop.classList.remove('hidden');
@@ -10073,29 +10489,45 @@ function attachPayrollHandlers(){
       if(!row || !emp) return;
       document.getElementById('payslip-modal-title').textContent = 'Payslip — ' + emp.name;
       document.getElementById('payslip-setup-form').classList.add('hidden');
-      document.getElementById('payslip-preview').innerHTML = renderPayslipHTML(emp, normalizePayslipRow(row));
+      document.getElementById('payslip-preview').innerHTML = renderPayslipHTML(emp, normalizePayslipRow(row))
+        + `<div class="modal-actions"><button type="button" class="btn secondary" id="payslip-print-btn">Print</button><button type="button" class="btn" id="payslip-pdf-btn">Download PDF</button></div>`;
+      document.getElementById('payslip-print-btn').addEventListener('click', ()=>printPayslip());
+      document.getElementById('payslip-pdf-btn').addEventListener('click', async ()=>{ try{ downloadPdf(await buildPayslipPdf(emp, normalizePayslipRow(row))); }catch(err){ toast('Could not create the PDF (' + err.message + ').'); } });
       payslipBackdrop.classList.remove('hidden');
     });
   });
+  wirePayrollAccountPicker('payslip-expense-account');
+  const payslipEmp = ()=>state.employees.find(x=>x.id===document.getElementById('payslip-employee-id').value);
+  document.getElementById('payslip-date')?.addEventListener('change', ()=>{ const emp = payslipEmp(); if(emp) setPayslipPeriod(emp); });
+  ['payslip-period-start','payslip-period-end'].forEach(id=>document.getElementById(id)?.addEventListener('change', ()=>{ const emp = payslipEmp(); if(emp) renderPayslipCommissionLines(emp); }));
   document.getElementById('payslip-setup-cancel')?.addEventListener('click', closePayslipModal);
   document.getElementById('payslip-modal-close')?.addEventListener('click', closePayslipModal);
   document.getElementById('payslip-setup-form')?.addEventListener('submit', (e)=>{
     e.preventDefault();
     const emp = state.employees.find(x=>x.id===document.getElementById('payslip-employee-id').value);
     if(!emp) return;
+    const period = {start: document.getElementById('payslip-period-start').value, end: document.getElementById('payslip-period-end').value};
+    const lines = selectedPayslipCommissionLines();
+    const extraCommission = parseFloat(document.getElementById('payslip-commission').value) || 0;
     const calc = computePayslip(emp, {
       payDate: document.getElementById('payslip-date').value,
       bonus: parseFloat(document.getElementById('payslip-bonus').value) || 0,
-      commission: parseFloat(document.getElementById('payslip-commission').value) || 0,
+      commission: round2(extraCommission + lines.reduce((s, l)=>s + l.amount, 0)),
       otherDeduction: parseFloat(document.getElementById('payslip-other-deduction').value) || 0,
       otherDeductionNote: document.getElementById('payslip-other-note').value.trim() || null,
     });
+    calc.commissionLines = lines; calc.periodStart = period.start || null; calc.periodEnd = period.end || null;
+    calc.workerType = isCommissionWorker(emp) ? 'commission' : 'employee';
+    const acctSel = document.getElementById('payslip-expense-account').value;
+    calc.expenseAccountKey = acctSel && acctSel !== '__new' && acctSel !== 'PAYROLL' ? validPayrollKey(acctSel) : null;
     const html = renderPayslipHTML(emp, normalizePayslipCalc(calc))
-      + `<div class="modal-actions"><button type="button" class="btn secondary" id="payslip-print-btn">Print / Save PDF</button><button type="button" class="btn" id="payslip-save-btn">Save Payslip</button></div>`;
+      + `<div class="modal-actions"><button type="button" class="btn secondary" id="payslip-print-btn">Print</button><button type="button" class="btn secondary" id="payslip-pdf-btn">Download PDF</button><button type="button" class="btn" id="payslip-save-btn">Save Payslip</button></div>`;
     document.getElementById('payslip-preview').innerHTML = html;
-    document.getElementById('payslip-print-btn')?.addEventListener('click', ()=>window.print());
-    document.getElementById('payslip-save-btn')?.addEventListener('click', async ()=>{
-      const {error} = await sb.from('cc_payroll_payments').insert({
+    document.getElementById('payslip-print-btn')?.addEventListener('click', ()=>printPayslip());
+    document.getElementById('payslip-pdf-btn')?.addEventListener('click', async ()=>{ try{ downloadPdf(await buildPayslipPdf(emp, normalizePayslipCalc(calc))); }catch(err){ toast('Could not create the PDF (' + err.message + ').'); } });
+    document.getElementById('payslip-save-btn')?.addEventListener('click', async (ev)=>{
+      ev.target.disabled = true;
+      const {data: saved, error} = await sb.from('cc_payroll_payments').insert({
         employee_id: emp.id, company_id: state.company.id, pay_date: calc.payDate,
         gross: calc.grossEarnings, deductions: calc.totalDeductions, net: calc.netPay, paid: true,
         basic_salary: calc.basic, travel_allowance: calc.travelAllowance, bonus: calc.bonus, commission: calc.commission,
@@ -10103,11 +10535,30 @@ function attachPayrollHandlers(){
         retirement_deduction: calc.retirementContribution, medical_deduction: calc.medicalContribution,
         paye: calc.paye, uif_employee: calc.uifEmployee, uif_employer: calc.uifEmployer,
         medical_credit: calc.medicalCreditPeriod, other_deduction: calc.otherDeduction, other_deduction_note: calc.otherDeductionNote,
-      });
-      if(error){ toast(error.message); return; }
+        worker_type: calc.workerType, expense_account_key: calc.expenseAccountKey, commission_lines: lines.length ? lines : null,
+        period_start: calc.periodStart, period_end: calc.periodEnd,
+      }).select().single();
+      if(error){ ev.target.disabled = false; toast(error.message); return; }
+      // Once-off commission is paid now: mark it used so it never repeats.
+      const onceIds = lines.filter(l=>l.recurrence === 'once' && l.rule_id).map(l=>l.rule_id);
+      if(onceIds.length && saved) await sb.from('cc_commission_rules').update({used_payslip_id: saved.id}).in('id', onceIds);
+      await logActivity('create', 'payslip', saved ? saved.id : null, `Payslip ${calc.payDate} for ${emp.name}: net ${fmt(calc.netPay)}${calc.commission ? ', commission ' + fmt(calc.commission) : ''}`);
       closePayslipModal();
       await refreshAll(); render(); toast('Payslip saved.');
     });
+  });
+
+  document.getElementById('payslips-show-all')?.addEventListener('click', ()=>{ state.payslipsShowAll = true; render(); });
+  document.querySelectorAll('[data-pdf-payslip]').forEach(b=>b.addEventListener('click', async ()=>{
+    const row = state.payrollPayments.find(p=>p.id===b.dataset.pdfPayslip); const emp = row && state.employees.find(e=>e.id===row.employee_id);
+    if(!row || !emp) return;
+    try{ downloadPdf(await buildPayslipPdf(emp, normalizePayslipRow(row))); }catch(err){ toast('Could not create the PDF (' + err.message + ').'); }
+  }));
+  document.getElementById('payslip-pack-pdf')?.addEventListener('click', async ()=>{
+    const m = document.getElementById('payslip-pack-month').value;
+    const rows = state.payrollPayments.filter(p=>String(p.pay_date||'').slice(0,7) === m).sort((a, b)=>String(a.pay_date).localeCompare(String(b.pay_date)));
+    if(!rows.length){ toast('No payslips that month.'); return; }
+    try{ const built = await buildPayslipsPdf(rows); if(built) downloadPdf(built); }catch(err){ toast('Could not create the PDF (' + err.message + ').'); }
   });
 
   /* ---------- Leave ---------- */
