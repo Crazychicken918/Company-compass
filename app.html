@@ -304,7 +304,7 @@
         <button data-view="revenue"><span class="dot"></span>Revenue</button>
         <button data-view="expenses"><span class="dot"></span>Expenses</button>
         <button data-view="assets"><span class="dot"></span>Assets</button>
-        <button data-view="stock"><span class="dot"></span>Stock</button>
+        <button data-view="stock"><span class="dot"></span>Items</button>
         <button data-view="liabilities"><span class="dot"></span>Liabilities</button>
         <button data-view="manualjournals"><span class="dot"></span>Manual Journals</button>
         <button data-view="chartofaccounts"><span class="dot"></span>Chart of Accounts</button>
@@ -1060,7 +1060,7 @@ function canApprove(){
 }
 // Every tab in the sidebar, in nav order. Used both to render the nav and to gate access.
 const ALL_VIEWS = [
-  ['dashboard','Dashboard'], ['revenue','Revenue'], ['expenses','Expenses'], ['assets','Assets'], ['stock','Stock'],
+  ['dashboard','Dashboard'], ['revenue','Revenue'], ['expenses','Expenses'], ['assets','Assets'], ['stock','Items'],
   ['liabilities','Liabilities'], ['supplierinvoices','Supplier Invoices'], ['clients','Clients'], ['quotes','Quotes'],
   ['invoices','Invoices'], ['creditnotes','Credit Notes'], ['payroll','Payroll'], ['tasks','Tasks'],
   ['vat','VAT'], ['documents','Documents'], ['reports','Reports'], ['scenarios','Scenarios'], ['manualjournals','Manual Journals'], ['chartofaccounts','Chart of Accounts'], ['activitylog','Activity Log'], ['bankfeed','Bank Feed'], ['team','Team'], ['settings','Settings'],
@@ -1070,7 +1070,6 @@ const ALL_VIEWS = [
 // existing staff members keep behaving exactly as before unless an admin opts them in to the
 // restriction (e.g. a floor assistant who should only ever see the Tasks tab).
 function canSeeTab(view){
-  if(view === 'stock' && !tracksInventory()) return false;
   const m = state.membership;
   if(!m) return false;
   if(m.role === 'owner' || m.role === 'admin' || m.role === 'viewer') return true;
@@ -1109,7 +1108,7 @@ function roleLabel(m){
   }
   return m.role;
 }
-const MODULE_LABELS = {revenue:'Revenue', expenses:'Expenses', assets:'Assets', liabilities:'Liabilities', clients:'Clients', invoices:'Invoices', credit_notes:'Credit Notes', payroll:'Payroll', supplier_invoices:'Supplier Invoices', documents:'Documents'};
+const MODULE_LABELS = {stock:'Items', revenue:'Revenue', expenses:'Expenses', assets:'Assets', liabilities:'Liabilities', clients:'Clients', invoices:'Invoices', credit_notes:'Credit Notes', payroll:'Payroll', supplier_invoices:'Supplier Invoices', documents:'Documents'};
 function moduleLabel(k){ return MODULE_LABELS[k] || k; }
 
 /* ========================= AUTH ========================= */
@@ -2552,6 +2551,8 @@ async function buildInvoicePdf(inv, items, client){
   const settledInRand = isForeign || paid + credited > 0.005;
   const due = settledInRand ? pdfMoney(bal.balance, 'ZAR') : pdfMoney(t.total, cur);
   const totals = [];
+  const discount = invoiceDiscountTotal(items);
+  if(discount > 0.004){ totals.push(['Items', pdfMoney(round2(t.total + discount), cur)]); totals.push([invoiceDiscountLabel(inv), '-' + pdfMoney(discount, cur)]); }
   if(vatReg){ totals.push(['Subtotal (excl. VAT)', pdfMoney(t.subtotal, cur)]); totals.push(['VAT (15%)', pdfMoney(t.vat, cur)]); }
   else totals.push(['Subtotal', pdfMoney(t.total, cur)]);
   totals.push(['Total', pdfMoney(t.total, cur), true]);
@@ -2566,7 +2567,7 @@ async function buildInvoicePdf(inv, items, client){
     title: vatReg ? 'TAX INVOICE' : 'INVOICE', number: inv.invoice_number, currency: cur, client,
     info: [['Invoice date', fmtShortDate(inv.issue_date)], ['Due date', inv.due_date ? fmtShortDate(inv.due_date) : 'On receipt'],
       ['Billing period', inv.billing_period || '—'], ['Customer ref', inv.customer_ref || (client && client.account_ref) || '—'], ['Amount due', due]],
-    items, totals, boxLabel: 'BALANCE DUE', boxValue: due,
+    items: invoiceLineItems(items), totals, boxLabel: 'BALANCE DUE', boxValue: due,
     leftCard: bankRows.length ? {title:'Our banking details', rows: bankRows.map(([k, v])=>[k === 'Account holder' ? 'Account name' : k, v])} : null,
     rightCard: terms ? {title:'Payment terms', text: terms} : null,
     notes: inv.notes, filename: `Invoice_${inv.invoice_number}`,
@@ -3353,7 +3354,11 @@ function bankAccountOptions(selectedId, hide){
 // "Credit note this invoice": the Credit Notes page opens with a credit note filled in from the invoice.
 async function openCreditNoteForInvoice(inv){
   const {data: items} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', inv.id);
-  state.creditNotePrefill = {invoice: inv, items: items || [], balance: invoiceBalance(inv).balance};
+  const lines = invoiceLineItems(items), gross = (items || []).reduce((s, it)=>s + Number(it.quantity) * Number(it.unit_price), 0);
+  const linesGross = lines.reduce((s, it)=>s + Number(it.quantity) * Number(it.unit_price), 0);
+  const factor = linesGross > 0 && invoiceDiscountItems(items).length ? gross / linesGross : 1;
+  const prefill = factor === 1 ? lines : lines.map(it=>Object.assign({}, it, {unit_price: round2(Number(it.unit_price) * factor)}));
+  state.creditNotePrefill = {invoice: inv, items: prefill, balance: invoiceBalance(inv).balance};
   document.getElementById('invoice-view-backdrop')?.classList.add('hidden');
   goToView('creditnotes');
 }
@@ -3768,6 +3773,80 @@ async function buildPayslipsPdf(rows){
     doc = built.doc;
   }
   return doc ? {doc, filename: pdfSafeName(`Payslips_${rows[0] ? rows[0].pay_date.slice(0,7) : todayIso()}`) + '.pdf'} : null;
+}
+
+
+/* ========================= INVOICE DISCOUNTS ========================= */
+// A discount is chosen on the invoice (a % of the invoice, or a Rand amount) and stored as negative
+// "discount" lines, one per sales account and VAT treatment, shared out in proportion to the lines. So
+// totals, VAT, balances, reminders, Pay-now and every report already include it; screens and the PDF
+// show it as one "Discount" line under the items instead of as item lines.
+function invoiceLineItems(items){ return (items || []).filter(it=>!it.is_discount); }
+function invoiceDiscountItems(items){ return (items || []).filter(it=>it.is_discount); }
+function invoiceDiscountTotal(items){ return round2(-invoiceDiscountItems(items).reduce((s, it)=>s + Number(it.quantity) * Number(it.unit_price), 0)); }
+function invoiceDiscountLabel(inv){
+  const v = Number(inv && inv.discount_value) || 0;
+  return inv && inv.discount_type === 'percent' && v ? `Discount (${v}%)` : 'Discount';
+}
+// rows: the invoice's own lines. Returns the negative discount lines to add, or [] for no discount.
+function buildDiscountLines(rows, type, value){
+  const v = Number(value) || 0;
+  if(!type || v <= 0) return [];
+  const groups = {};
+  (rows || []).forEach(r=>{
+    const gross = (Number(r.quantity) || 0) * (Number(r.unit_price) || 0);
+    if(gross <= 0) return;
+    const key = (r.account_key || 'REV') + '|' + (r.vat_applicable ? 1 : 0);
+    (groups[key] = groups[key] || {account_key: r.account_key || null, vat_applicable: !!r.vat_applicable, gross: 0}).gross += gross;
+  });
+  const list = Object.values(groups);
+  const total = round2(list.reduce((s, g)=>s + g.gross, 0));
+  if(total <= 0) return [];
+  const discount = round2(type === 'percent' ? total * Math.min(v, 100) / 100 : Math.min(v, total));
+  const label = type === 'percent' ? `Discount (${v}%)` : 'Discount';
+  let left = discount;
+  return list.map((g, i)=>{
+    const amt = i === list.length - 1 ? round2(left) : round2(discount * g.gross / total);
+    left = round2(left - amt);
+    return {description: label, details: null, quantity: 1, unit_price: -amt, vat_applicable: g.vat_applicable, account_key: g.account_key, stock_item_id: null, is_discount: true};
+  }).filter(l=>l.unit_price < 0);
+}
+// The discount picked on the invoice form: {type, value} or null.
+function invoiceFormDiscount(){
+  const on = document.getElementById('invoice-discount-on');
+  if(!on || !on.checked) return null;
+  const type = document.getElementById('invoice-discount-type').value === 'amount' ? 'amount' : 'percent';
+  const value = round2(parseFloat(document.getElementById('invoice-discount-value').value) || 0);
+  return value > 0 ? {type, value} : null;
+}
+function invoiceFormRows(){
+  return [...document.querySelectorAll('#invoice-items-body tr')].map(tr=>({
+    description: tr.querySelector('.ii-desc').value.trim(), quantity: parseFloat(tr.querySelector('.ii-qty').value) || 1,
+    unit_price: parseFloat(tr.querySelector('.ii-price').value) || 0, vat_applicable: tr.querySelector('.ii-vat').checked,
+    account_key: tr.querySelector('.ii-account') ? validSalesKey(tr.querySelector('.ii-account').value) : null,
+  })).filter(r=>r.description);
+}
+// Checks the discount and returns an error message, or ''.
+function invoiceDiscountProblem(rows, d){
+  if(!d) return '';
+  const total = round2((rows || []).reduce((s, r)=>s + r.quantity * r.unit_price, 0));
+  if(d.type === 'percent' && d.value > 100) return 'A discount cannot be more than 100%.';
+  if(d.type === 'amount' && d.value > total + 0.005) return `The discount (${fmt(d.value)}) is more than the invoice lines (${fmt(total)}).`;
+  return '';
+}
+function refreshInvoiceDiscountPreview(){
+  const el = document.getElementById('invoice-discount-preview'); if(!el) return;
+  const on = document.getElementById('invoice-discount-on').checked;
+  document.getElementById('invoice-discount-fields').classList.toggle('hidden', !on);
+  const unit = document.getElementById('invoice-discount-unit');
+  if(unit) unit.textContent = document.getElementById('invoice-discount-type').value === 'amount' ? 'R' : '%';
+  if(!on){ el.textContent = ''; return; }
+  const rows = invoiceFormRows(), d = invoiceFormDiscount();
+  const total = round2(rows.reduce((s, r)=>s + r.quantity * r.unit_price, 0));
+  const problem = invoiceDiscountProblem(rows, d);
+  const disc = d && !problem ? -round2(buildDiscountLines(rows, d.type, d.value).reduce((s, l)=>s + l.unit_price, 0)) : 0;
+  el.style.color = problem ? 'var(--danger)' : 'var(--muted)';
+  el.textContent = problem || (d ? `Lines ${fmt(total)} less discount ${fmt(disc)} = ${fmt(round2(total - disc))}` : 'Enter the discount.');
 }
 
 /* ========================= BANK RULES ========================= */
@@ -6158,17 +6237,22 @@ function buildLedger(){
         post(e.entry_date, 'Depreciation', e.description, [['DEPR', gross],['FA_DEP', -gross]]);
       } else if(tags.includes('cost-of-sales') && tags.includes('stock')){
         // Automatic cost of sales when stock is sold: relieves the inventory asset (no cash moves).
-        post(e.entry_date, 'Cost of Sales', e.description, [['COS', net],['VAT', vat],['INV', -gross]]);
+        post(e.entry_date, 'Cost of Sales', e.description, [[validCosKey(e.account_key), net],['VAT', vat],['INV', -gross]]);
       } else {
         const key = tags.includes('liability-payment') ? 'INT' : (e.expense_category === 'cost_of_sales' ? 'COS' : 'OPEX');
         if(e.source_supplier_invoice_id){
           // Lines linked to a stock item go to the inventory asset, not to expense — the cost reaches
           // the P&L only when the stock is sold (Cost of Sales above), so it is never expensed twice.
+          // Lines for a service or non-stock item with its own cost-of-sales account go to that account.
           const billItems = (state.supplierInvoiceItems||{})[e.source_supplier_invoice_id] || [];
           const billTotal = docTotal(billItems);
-          const stockGross = billItems.filter(it=>it.stock_item_id).reduce((a,it)=>a+(Number(it.quantity)||0)*(Number(it.unit_price)||0), 0);
-          const stockNet = (billTotal > 0 && stockGross > 0) ? round2(net * Math.min(1, stockGross / billTotal)) : 0;
-          post(e.entry_date, 'Supplier Invoice', e.description, [['INV', stockNet],[key, net - stockNet],['VAT', vat],['AP', -gross]]);
+          const lineTarget = it=>{ const si = it.stock_item_id && (state.stockItems||[]).find(s=>s.id===it.stock_item_id); if(!si) return key; if(isStockItem(si)) return 'INV'; return si.cos_account_key ? validCosKey(si.cos_account_key) : key; };
+          const byTarget = {};
+          billItems.forEach(it=>{ const g = (Number(it.quantity)||0)*(Number(it.unit_price)||0); if(g > 0){ const t = lineTarget(it); byTarget[t] = (byTarget[t]||0) + g; } });
+          const targets = Object.keys(byTarget).filter(t=>t !== key);
+          let left = net; const split = [];
+          if(billTotal > 0) targets.forEach(t=>{ const amt = round2(net * Math.min(1, byTarget[t] / billTotal)); split.push([t, amt]); left = round2(left - amt); });
+          post(e.entry_date, 'Supplier Invoice', e.description, [...split, [key, left],['VAT', vat],['AP', -gross]]);
         }
         else post(e.entry_date, 'Expense', e.description, [[key, net],['VAT', vat],['BANK', -gross]], e.id);
       }
@@ -7123,7 +7207,7 @@ function supplierInvoiceModal(){
           <option value="cost_of_sales">Cost of Sales (COS)</option>
         </select></div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th>${tracksInventory() ? '<th>Stock item</th>' : ''}<th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description</th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th>${itemColumnOn() ? '<th>Item</th>' : ''}<th></th></tr></thead>
           <tbody id="supplier-invoice-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="supplier-invoice-add-item" style="margin-top:8px;">+ Add line</button>
@@ -7262,6 +7346,7 @@ function attachSupplierInvoiceHandlers(){
   document.getElementById('supplier-invoice-add-item')?.addEventListener('click', ()=>{
     document.getElementById('supplier-invoice-items-body').insertAdjacentHTML('beforeend', invoiceItemRowWithStock());
   });
+  document.getElementById('supplier-invoice-items-body')?.addEventListener('change', (e)=>{ if(e.target.classList.contains('ii-stock')) applyItemToRow(e.target.closest('tr'), false); });
   document.getElementById('supplier-invoice-items-body')?.addEventListener('click', (e)=>{
     if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
   });
@@ -7596,26 +7681,109 @@ async function openSupplierCreditNoteView(noteId){
 }
 
 /* ========================= STOCK ========================= */
+/* ========================= ITEMS (PRODUCTS & SERVICES) ========================= */
+// The Items list holds what the business sells: services, non-stock products and stock products. Each
+// item has a selling price and revenue account (filled in on an invoice line when the item is picked),
+// and a cost price and cost-of-sales account. A stock item's cost goes to its cost-of-sales account
+// when it is sold (from inventory); a service or non-stock item's cost-of-sales account is used when
+// it is picked on a supplier bill line. Cost-of-sales accounts are COS itself plus any expense account
+// numbered 5xxx, so they sit under Cost of Sales (gross profit) in the P&L.
+const ITEM_TYPES = [['service', 'Service'], ['non_stock', 'Non-stock product'], ['stock', 'Stock product (tracks quantity)']];
+function itemTypeLabel(t){ const f = ITEM_TYPES.find(x=>x[0] === (t || 'stock')); return f ? f[1].replace(' (tracks quantity)', '') : 'Stock product'; }
+function isStockItem(it){ return !!it && (it.item_type || 'stock') === 'stock'; }
+function activeItems(){ return (state.stockItems || []).filter(i=>i.active !== false); }
+function itemColumnOn(){ return tracksInventory() || activeItems().length > 0; }
+function isCosAccount(a){ return !!a && a.type === 'expense' && (a.key === 'COS' || (!a.system && /^5/.test(String(a.code || '')))); }
+function cosAccounts(){ return chartAccountList().filter(a=>a.key && a.active !== false && isCosAccount(a)); }
+function validCosKey(k){ return (k && cosAccounts().some(a=>a.key === k)) ? k : 'COS'; }
+function accountNameFor(k){ const a = chartAccountList().find(x=>x.key === k); return a ? `${a.code} ${a.name}` : '—'; }
+function itemAccountOptions(kind, selected){
+  const list = kind === 'revenue' ? salesAccounts() : cosAccounts();
+  const key = kind === 'revenue' ? validSalesKey(selected) : validCosKey(selected);
+  return list.map(a=>`<option value="${escHtml(a.key)}" ${a.key === key ? 'selected' : ''}>${escHtml(a.code)} ${escHtml(a.name)}</option>`).join('')
+    + (isAdmin() ? `<option value="__new">+ New ${kind === 'revenue' ? 'revenue' : 'cost-of-sales'} account…</option>` : '');
+}
+function nextAccountCode(start){
+  const used = new Set(chartAccountList().map(a=>String(a.code)));
+  for(let c = start; c < start + 900; c += 10) if(!used.has(String(c))) return String(c);
+  return String(start + 890);
+}
+async function createItemAccount(kind, name){
+  name = String(name || '').trim();
+  if(!name){ toast(kind === 'revenue' ? 'Type a name, e.g. Sales – Consulting.' : 'Type a name, e.g. COS – Materials.'); return null; }
+  const type = kind === 'revenue' ? 'revenue' : 'expense';
+  const existing = chartAccountList().find(a=>a.type === type && a.name.toLowerCase() === name.toLowerCase() && (kind === 'revenue' || isCosAccount(a)));
+  if(existing) return existing.key;
+  const code = nextAccountCode(kind === 'revenue' ? 4100 : 5100);
+  const {data, error} = await sb.from('cc_chart_accounts').insert({company_id: state.company.id, system_key: null, code, name, type, is_current: true}).select().single();
+  if(error){ toast(error.message); return null; }
+  state.chartAccounts = [...(state.chartAccounts || []), data];
+  await logActivity('create', 'chart_account', data.id, `${kind === 'revenue' ? 'Revenue' : 'Cost-of-sales'} account ${data.code} ${data.name} added from Items`);
+  return 'C:' + data.id;
+}
+function wireItemAccountPicker(kind){
+  const id = kind === 'revenue' ? 'item-revenue-account' : 'item-cos-account';
+  const sel = document.getElementById(id); if(!sel) return;
+  const wrap = document.getElementById(id + '-new');
+  let last = sel.value === '__new' ? (kind === 'revenue' ? 'REV' : 'COS') : sel.value;
+  sel.addEventListener('change', ()=>{ if(sel.value === '__new') wrap.classList.remove('hidden'); else { last = sel.value; wrap.classList.add('hidden'); } });
+  document.getElementById(id + '-new-cancel').addEventListener('click', ()=>{ sel.value = last; wrap.classList.add('hidden'); });
+  document.getElementById(id + '-new-add').addEventListener('click', async ()=>{
+    const key = await createItemAccount(kind, document.getElementById(id + '-new-name').value);
+    if(!key) return;
+    sel.innerHTML = itemAccountOptions(kind, key); sel.value = key; last = key;
+    wrap.classList.add('hidden'); document.getElementById(id + '-new-name').value = '';
+    toast('Account added to your chart of accounts.');
+  });
+}
+function itemAccountPickerHtml(kind, label){
+  const id = kind === 'revenue' ? 'item-revenue-account' : 'item-cos-account';
+  return `<div class="field"><label>${label}</label><select id="${id}">${itemAccountOptions(kind, null)}</select>
+    <div class="hidden" id="${id}-new" style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;"><input type="text" id="${id}-new-name" maxlength="80" placeholder="${kind === 'revenue' ? 'e.g. Sales – Consulting' : 'e.g. COS – Materials'}" style="flex:1;min-width:160px;"><button type="button" class="btn small" id="${id}-new-add">Add account</button><button type="button" class="btn small secondary" id="${id}-new-cancel">Cancel</button></div></div>`;
+}
 function renderStock(){
   const canEdit = hasModule('stock');
+  const f = state.itemTypeFilter || '';
+  const list = (state.stockItems || []).filter(i=>!f || (i.item_type || 'stock') === f);
   return `
-    <div class="section-header" style="--accent-c:var(--c-stock);"><h1>Stock</h1>${canEdit ? `<button class="btn" id="add-stock-btn">+ Add Stock Item</button>` : ''}</div>
-    <p class="section-caption">Items you keep on hand. Link a line item to one of these on an Invoice (selling) or a Supplier Invoice (buying) to keep quantity and cost of sales in sync automatically.</p>
+    <div class="section-header" style="--accent-c:var(--c-stock);"><h1>Items</h1>${canEdit ? `<button class="btn" id="add-stock-btn">+ Add Item</button>` : ''}</div>
+    <p class="section-caption">The products and services you sell. Each one carries its selling price and revenue account, and its cost and cost-of-sales account, so picking it on an invoice or a supplier bill books the right accounts${tracksInventory() ? ', and stock products keep their quantity on hand up to date' : ''}.</p>
     <div class="panel">
-      ${state.stockItems.length ? `<table><thead><tr><th>Name</th><th>SKU</th><th>Unit Cost</th><th>Qty on Hand</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
-        ${state.stockItems.map(s=>`<tr><td>${s.name}</td><td>${s.sku||'—'}</td><td>${fmt(s.unit_cost)}</td><td>${s.qty_on_hand}</td>${canEdit?`<td><button class="btn small secondary" data-edit-stock="${s.id}">Edit</button> <button class="btn small danger" data-del-stock="${s.id}">Delete</button></td>`:''}</tr>`).join('')}
-      </tbody></table>` : `<div class="empty">No stock items yet.</div>`}
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;"><label style="font-size:.85rem;color:var(--muted);">Show</label><select id="item-type-filter" style="width:auto;"><option value="">All items</option>${ITEM_TYPES.map(([v, l])=>`<option value="${v}" ${v === f ? 'selected' : ''}>${l.replace(' (tracks quantity)', 's').replace(/([^s])$/, '$1s')}</option>`).join('')}</select></div>
+      ${list.length ? `<table><thead><tr><th>Item</th><th>Type</th><th style="text-align:right;">Selling price</th><th>Revenue account</th><th style="text-align:right;">Cost</th><th>Cost-of-sales account</th><th style="text-align:right;">On hand</th>${canEdit?'<th></th>':''}</tr></thead><tbody>
+        ${list.map(s=>`<tr${s.active === false ? ' style="opacity:.55;"' : ''}><td>${escHtml(s.name)}${s.sku ? `<div style="font-size:.72rem;color:var(--muted);">${escHtml(s.sku)}</div>` : ''}${s.active === false ? '<div style="font-size:.72rem;color:var(--muted);">Inactive</div>' : ''}</td><td>${itemTypeLabel(s.item_type)}</td>
+          <td style="text-align:right;">${Number(s.sale_price) ? fmt(s.sale_price) : '—'}</td><td style="font-size:.8rem;">${escHtml(accountNameFor(validSalesKey(s.revenue_account_key)))}</td>
+          <td style="text-align:right;">${Number(s.unit_cost) ? fmt(s.unit_cost) : '—'}</td><td style="font-size:.8rem;">${escHtml(accountNameFor(validCosKey(s.cos_account_key)))}</td>
+          <td style="text-align:right;">${isStockItem(s) ? s.qty_on_hand : '—'}</td>
+          ${canEdit?`<td style="white-space:nowrap;"><button class="btn small secondary" data-edit-stock="${s.id}">Edit</button> <button class="btn small danger" data-del-stock="${s.id}">Delete</button></td>`:''}</tr>`).join('')}
+      </tbody></table>` : `<div class="empty">${(state.stockItems || []).length ? 'No items of this type.' : 'No items yet. Add the services and products you sell.'}</div>`}
     </div>
     ${canEdit ? `
-    <div class="modal-backdrop hidden" id="stock-modal-backdrop"><div class="modal">
+    <div class="modal-backdrop hidden" id="stock-modal-backdrop"><div class="modal" style="max-width:620px;">
       <button class="close-x" id="stock-modal-close">✕</button>
-      <h2 id="stock-modal-title">Add Stock Item</h2>
+      <h2 id="stock-modal-title">Add Item</h2>
       <form id="stock-form">
         <input type="hidden" id="stock-edit-id">
-        <div class="field"><label>Name</label><input type="text" id="stock-name" required></div>
-        <div class="field"><label>SKU (optional)</label><input type="text" id="stock-sku"></div>
-        <div class="field"><label>Unit cost (R)</label><input type="number" step="0.01" id="stock-unit-cost" value="0" required></div>
-        <div class="field"><label>Quantity on hand</label><input type="number" step="0.01" id="stock-qty" value="0" required></div>
+        <div class="row">
+          <div class="field"><label>Type</label><select id="item-type">${ITEM_TYPES.filter(([v])=>v !== 'stock' || tracksInventory()).map(([v, l])=>`<option value="${v}">${l}</option>`).join('')}</select></div>
+          <div class="field"><label>Name</label><input type="text" id="stock-name" required maxlength="120"></div>
+          <div class="field"><label>Code / SKU (optional)</label><input type="text" id="stock-sku" maxlength="40"></div>
+        </div>
+        <div class="field"><label>Detail line on invoices (optional)</label><input type="text" id="item-description" maxlength="200" placeholder="e.g. Monthly subscription, billed in advance"></div>
+        <h4 style="margin:10px 0 4px;">Selling</h4>
+        <div class="row">
+          <div class="field"><label>Selling price (R)</label><input type="number" step="0.01" min="0" id="item-sale-price" value="0"></div>
+          <div class="field" style="justify-content:flex-end;"><label style="display:flex;align-items:center;gap:6px;font-weight:500;"><input type="checkbox" id="item-sale-vat" style="width:auto;" checked> Price includes VAT</label></div>
+        </div>
+        ${itemAccountPickerHtml('revenue', 'Revenue account')}
+        <h4 style="margin:10px 0 4px;">Cost</h4>
+        <div class="row">
+          <div class="field"><label id="stock-unit-cost-label">Cost price (R, excl. VAT)</label><input type="number" step="0.01" min="0" id="stock-unit-cost" value="0"></div>
+          <div class="field" id="stock-qty-field"><label>Quantity on hand</label><input type="number" step="0.01" id="stock-qty" value="0"></div>
+        </div>
+        ${itemAccountPickerHtml('cos', 'Cost-of-sales account')}
+        <p style="font-size:.76rem;color:var(--muted);margin:-4px 0 8px;" id="item-cos-hint"></p>
+        <label style="display:flex;align-items:center;gap:6px;font-weight:500;"><input type="checkbox" id="item-active" style="width:auto;" checked> Active (offered on invoices and bills)</label>
         <div class="modal-actions"><button type="button" class="btn secondary" id="stock-cancel">Cancel</button><button type="submit" class="btn">Save</button></div>
       </form>
     </div></div>` : ''}
@@ -7623,57 +7791,96 @@ function renderStock(){
 }
 function attachStockHandlers(){
   const backdrop = document.getElementById('stock-modal-backdrop');
+  const $ = id => document.getElementById(id);
+  document.getElementById('item-type-filter')?.addEventListener('change', e=>{ state.itemTypeFilter = e.target.value; render(); });
+  const syncType = ()=>{
+    const t = $('item-type').value;
+    $('stock-qty-field').classList.toggle('hidden', t !== 'stock');
+    $('item-cos-hint').textContent = t === 'stock'
+      ? 'When this item is sold, its cost moves from Inventory to this account.'
+      : 'Used when you pick this item on a supplier bill, so what you pay for it lands in this account.';
+  };
   function resetStockForm(){
-    document.getElementById('stock-edit-id').value = '';
-    document.getElementById('stock-name').value = '';
-    document.getElementById('stock-sku').value = '';
-    document.getElementById('stock-unit-cost').value = '0';
-    document.getElementById('stock-qty').value = '0';
-    document.getElementById('stock-modal-title').textContent = 'Add Stock Item';
+    $('stock-edit-id').value = ''; $('stock-name').value = ''; $('stock-sku').value = ''; $('item-description').value = '';
+    $('item-type').value = tracksInventory() ? 'stock' : 'service';
+    $('item-sale-price').value = '0'; $('item-sale-vat').checked = weAreVatRegistered();
+    $('item-revenue-account').innerHTML = itemAccountOptions('revenue', null); $('item-cos-account').innerHTML = itemAccountOptions('cos', null);
+    $('stock-unit-cost').value = '0'; $('stock-qty').value = '0'; $('item-active').checked = true;
+    $('stock-modal-title').textContent = 'Add Item';
+    syncType();
   }
-  document.getElementById('add-stock-btn')?.addEventListener('click', ()=>{
+  if(!$('stock-form')) return;
+  $('item-type').addEventListener('change', syncType);
+  wireItemAccountPicker('revenue'); wireItemAccountPicker('cos');
+  $('add-stock-btn')?.addEventListener('click', ()=>{ resetStockForm(); backdrop.classList.remove('hidden'); });
+  $('stock-cancel').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  $('stock-modal-close').addEventListener('click', ()=>backdrop.classList.add('hidden'));
+  document.querySelectorAll('[data-edit-stock]').forEach(btn=>btn.addEventListener('click', ()=>{
+    const s = state.stockItems.find(x=>x.id===btn.dataset.editStock); if(!s) return;
     resetStockForm();
+    if(![...$('item-type').options].some(o=>o.value === (s.item_type || 'stock'))) $('item-type').insertAdjacentHTML('beforeend', `<option value="stock">Stock product (tracks quantity)</option>`);
+    $('stock-edit-id').value = s.id; $('item-type').value = s.item_type || 'stock';
+    $('stock-name').value = s.name; $('stock-sku').value = s.sku || ''; $('item-description').value = s.description || '';
+    $('item-sale-price').value = s.sale_price || 0; $('item-sale-vat').checked = s.sale_vat !== false;
+    $('item-revenue-account').innerHTML = itemAccountOptions('revenue', s.revenue_account_key);
+    $('item-cos-account').innerHTML = itemAccountOptions('cos', s.cos_account_key);
+    $('stock-unit-cost').value = s.unit_cost || 0; $('stock-qty').value = s.qty_on_hand || 0; $('item-active').checked = s.active !== false;
+    $('stock-modal-title').textContent = 'Edit ' + s.name;
+    syncType();
     backdrop.classList.remove('hidden');
-  });
-  document.getElementById('stock-cancel')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
-  document.getElementById('stock-modal-close')?.addEventListener('click', ()=>backdrop.classList.add('hidden'));
-  document.querySelectorAll('[data-edit-stock]').forEach(btn=>{
-    btn.addEventListener('click', ()=>{
-      const s = state.stockItems.find(x=>x.id===btn.dataset.editStock);
-      if(!s) return;
-      document.getElementById('stock-edit-id').value = s.id;
-      document.getElementById('stock-name').value = s.name;
-      document.getElementById('stock-sku').value = s.sku || '';
-      document.getElementById('stock-unit-cost').value = s.unit_cost;
-      document.getElementById('stock-qty').value = s.qty_on_hand;
-      document.getElementById('stock-modal-title').textContent = 'Edit Stock Item';
-      backdrop.classList.remove('hidden');
-    });
-  });
-  document.getElementById('stock-form')?.addEventListener('submit', async (e)=>{
+  }));
+  $('stock-form').addEventListener('submit', async (e)=>{
     e.preventDefault();
-    const editId = document.getElementById('stock-edit-id').value;
+    const editId = $('stock-edit-id').value;
+    const type = $('item-type').value;
+    const rev = $('item-revenue-account').value, cos = $('item-cos-account').value;
     const payload = {
-      name: document.getElementById('stock-name').value.trim(),
-      sku: document.getElementById('stock-sku').value.trim() || null,
-      unit_cost: parseFloat(document.getElementById('stock-unit-cost').value) || 0,
-      qty_on_hand: parseFloat(document.getElementById('stock-qty').value) || 0
+      item_type: type, name: $('stock-name').value.trim(), sku: $('stock-sku').value.trim() || null,
+      description: $('item-description').value.trim() || null,
+      sale_price: round2(parseFloat($('item-sale-price').value) || 0), sale_vat: $('item-sale-vat').checked,
+      revenue_account_key: rev && rev !== '__new' && rev !== 'REV' ? validSalesKey(rev) : null,
+      cos_account_key: cos && cos !== '__new' && cos !== 'COS' ? validCosKey(cos) : null,
+      unit_cost: round2(parseFloat($('stock-unit-cost').value) || 0),
+      qty_on_hand: type === 'stock' ? (parseFloat($('stock-qty').value) || 0) : 0,
+      active: $('item-active').checked,
     };
     const {error} = editId
       ? await sb.from('cc_stock_items').update(payload).eq('id', editId)
       : await sb.from('cc_stock_items').insert({...payload, company_id: state.company.id});
     if(error){ toast(error.message); return; }
+    await logActivity(editId ? 'update' : 'create', 'item', editId || null, `${editId ? 'Updated' : 'Added'} item ${payload.name} (${itemTypeLabel(type)})`);
     backdrop.classList.add('hidden');
     await refreshAll(); render();
-    toast('Stock item saved.');
+    toast('Item saved.');
   });
   document.querySelectorAll('[data-del-stock]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
-      if(!confirm('Delete this stock item?')) return;
+      if(!confirm('Delete this item? Invoices and bills that used it keep their lines.')) return;
       await sb.from('cc_stock_items').delete().eq('id', btn.dataset.delStock);
       await refreshAll(); render();
     });
   });
+}
+// Picking an item on an invoice line fills the description, detail line, selling price, VAT and revenue
+// account; on a supplier bill line it fills the description and cost price.
+function applyItemToRow(tr, selling){
+  const sel = tr.querySelector('.ii-stock'); if(!sel) return;
+  const it = (state.stockItems || []).find(s=>s.id === sel.value); if(!it) return;
+  const set = (cls, v)=>{ const el = tr.querySelector(cls); if(el) el.value = v; };
+  set('.ii-desc', it.name);
+  if(selling){
+    set('.ii-details', it.description || '');
+    set('.ii-price', Number(it.sale_price) || 0);
+    const vat = tr.querySelector('.ii-vat'); if(vat && !vat.disabled) vat.checked = it.sale_vat !== false;
+    const acct = tr.querySelector('.ii-account'); if(acct) acct.value = validSalesKey(it.revenue_account_key);
+  } else {
+    const vat = tr.querySelector('.ii-vat');
+    // Cost price is excl. VAT; bill lines are VAT-inclusive where VAT applies.
+    set('.ii-price', round2((Number(it.unit_cost) || 0) * (vat && vat.checked && !vat.disabled ? 1 + VAT_RATE : 1)));
+  }
+}
+function itemSelectHtml(){
+  return `<select class="ii-stock" aria-label="Item"><option value="">— none —</option>${activeItems().map(s=>`<option value="${s.id}">${escHtml(s.name)}${isStockItem(s) ? '' : ' · ' + escHtml(itemTypeLabel(s.item_type).toLowerCase())}</option>`).join('')}</select>`;
 }
 // A line item row with an extra "Stock item" column — used only on Invoices (selling, decrements
 // qty and posts cost of sales) and Supplier Invoices (buying, increments qty). Quotes, customer
@@ -7684,8 +7891,7 @@ function invoiceItemRowWithStock(vatEditable, opts){
   const vatCell = vatEditable
     ? `<input type="checkbox" class="ii-vat" checked style="width:auto;">`
     : `<input type="checkbox" class="ii-vat" disabled title="Not VAT registered" style="width:auto;">`;
-  const stockOptions = state.stockItems.map(s=>`<option value="${s.id}">${s.name}</option>`).join('');
-  const stockCell = tracksInventory() ? `<td><select class="ii-stock"><option value="">— none —</option>${stockOptions}</select></td>` : '';
+  const stockCell = itemColumnOn() ? `<td>${itemSelectHtml()}</td>` : '';
   return `<tr>
     <td><input type="text" class="ii-desc" required>${(opts && opts.details) ? `<input type="text" class="ii-details" placeholder="Details (optional), e.g. period or scope" style="margin-top:4px;font-size:.82rem;">` : ''}</td>
     <td><input type="number" class="ii-qty" value="1" step="0.01"></td>
@@ -7702,7 +7908,7 @@ async function applyStockSaleMovements(items, dateStr, docLabel){
   for(const it of (items||[])){
     if(!it.stock_item_id) continue;
     const stockItem = state.stockItems.find(s=>s.id===it.stock_item_id);
-    if(!stockItem) continue;
+    if(!stockItem || !isStockItem(stockItem)) continue;   // services and non-stock items have no quantity or inventory
     const qty = Number(it.quantity) || 0;
     await sb.from('cc_stock_items').update({qty_on_hand: Number(stockItem.qty_on_hand) - qty}).eq('id', stockItem.id);
     const cost = round2(qty * Number(stockItem.unit_cost || 0));
@@ -7716,6 +7922,7 @@ async function applyStockSaleMovements(items, dateStr, docLabel){
         tags: ['cost-of-sales','stock'],
         vat_applicable: false,
         expense_category: 'cost_of_sales',
+        account_key: stockItem.cos_account_key ? validCosKey(stockItem.cos_account_key) : null,
         created_by: state.user.id
       });
     }
@@ -7727,7 +7934,7 @@ async function applyStockPurchaseMovements(items){
   for(const it of (items||[])){
     if(!it.stock_item_id) continue;
     const stockItem = state.stockItems.find(s=>s.id===it.stock_item_id);
-    if(!stockItem) continue;
+    if(!stockItem || !isStockItem(stockItem)) continue;
     const qty = Number(it.quantity) || 0;
     await sb.from('cc_stock_items').update({qty_on_hand: Number(stockItem.qty_on_hand) + qty}).eq('id', stockItem.id);
   }
@@ -8246,6 +8453,7 @@ async function generateDueRecurringInvoices(){
       submitted_at: new Date().toISOString(),
       customer_ref: src.customer_ref || null,
       payment_method: src.payment_method || null,
+      discount_type: src.discount_type || null, discount_value: src.discount_value || null,
       billing_period: (src.billing_period && src.billing_period === billingPeriodFor(src.issue_date, src.recurrence_frequency)) ? billingPeriodFor(src.recurrence_next_date, src.recurrence_frequency) : (src.billing_period || null),
       payment_terms: (src.payment_terms && src.payment_terms === defaultPaymentTermsText(src.payment_method, src.due_date, src.invoice_number)) ? defaultPaymentTermsText(src.payment_method, newDue, newNumber) : (src.payment_terms || null),
       bank_account_id: src.bank_account_id || null, hide_bank_details: !!src.hide_bank_details,
@@ -8265,7 +8473,8 @@ async function generateDueRecurringInvoices(){
         quantity: it.quantity,
         unit_price: it.unit_price,
         vat_applicable: it.vat_applicable,
-        account_key: it.account_key || null
+        account_key: it.account_key || null,
+        is_discount: !!it.is_discount
       })));
     }
     if(approvalStatus === 'approved'){
@@ -8319,6 +8528,8 @@ async function saveEditedInvoice(inv, o){
     account_key: tr.querySelector('.ii-account') ? validSalesKey(tr.querySelector('.ii-account').value) : null,
   })).filter(r=>r.description);
   if(!rows.length){ toast('Add at least one line.'); return; }
+  const editDisc = invoiceFormDiscount();
+  if(editDisc) buildDiscountLines(rows, editDisc.type, editDisc.value).forEach(l=>rows.push(Object.assign({invoice_id: inv.id}, l)));
   const {error} = await sb.from('cc_invoices').update(patch).eq('id', inv.id);
   if(error){ toast(error.message); return; }
   const del = await sb.from('cc_invoice_items').delete().eq('invoice_id', inv.id);
@@ -8451,10 +8662,18 @@ function invoiceModal(){
           <div class="field"><label>Stop after (optional)</label><input type="date" id="invoice-recurrence-end"></div>
         </div>
         <h3 style="margin-bottom:6px;">Line items</h3>
-        <table class="invoice-items-table"><thead><tr><th>Description <span style="font-weight:400;color:var(--muted);">and details</span></th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th>Sales account</th>${tracksInventory() ? '<th>Stock item</th>' : ''}<th></th></tr></thead>
+        <table class="invoice-items-table"><thead><tr><th>Description <span style="font-weight:400;color:var(--muted);">and details</span></th><th style="width:100px;">Qty</th><th style="width:100px;">Unit Price</th><th style="width:60px;">VAT</th><th>Sales account</th>${itemColumnOn() ? '<th>Item</th>' : ''}<th></th></tr></thead>
           <tbody id="invoice-items-body"></tbody>
         </table>
         <button type="button" class="btn secondary small" id="invoice-add-item" style="margin-top:8px;">+ Add line</button>
+        <div class="panel" style="margin:10px 0 0;padding:10px 12px;" id="invoice-discount-panel">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:600;"><input type="checkbox" id="invoice-discount-on" style="width:auto;"> Apply a discount</label>
+          <div class="row hidden" id="invoice-discount-fields" style="margin-top:6px;align-items:flex-end;">
+            <div class="field"><label>Discount as</label><select id="invoice-discount-type"><option value="percent">% of the invoice</option><option value="amount">Rand amount</option></select></div>
+            <div class="field"><label>Discount (<span id="invoice-discount-unit">%</span>)</label><input type="number" id="invoice-discount-value" min="0" step="0.01" placeholder="e.g. 10"></div>
+          </div>
+          <div id="invoice-discount-preview" style="font-size:.82rem;margin-top:4px;"></div>
+        </div>
         <div class="field" style="margin-top:12px;"><label>Notes</label><textarea id="invoice-notes" rows="2"></textarea></div>
         <h3 style="margin:14px 0 6px;">Payment terms</h3>
         <div class="row">
@@ -8540,7 +8759,8 @@ async function openInvoiceForm(inv){
   const body = $('invoice-items-body');
   const vatEditable = weAreVatRegistered();
   if(inv){
-    const {data: items} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', inv.id);
+    const {data: allItems} = await sb.from('cc_invoice_items').select('*').eq('invoice_id', inv.id);
+    const items = invoiceLineItems(allItems);
     const list = (items && items.length) ? items : [null];
     body.innerHTML = list.map(it=>invoiceItemRowWithStock(vatEditable, {salesAccount:true, details:true, accountKey: it && it.account_key})).join('');
     [...body.querySelectorAll('tr')].forEach((tr, i)=>{
@@ -8553,6 +8773,10 @@ async function openInvoiceForm(inv){
       const st = tr.querySelector('.ii-stock'); if(st && it.stock_item_id) st.value = it.stock_item_id;
     });
   } else body.innerHTML = invoiceItemRowWithStock(vatEditable, {salesAccount:true, details:true});
+  $('invoice-discount-on').checked = !!(inv && inv.discount_type && Number(inv.discount_value) > 0);
+  $('invoice-discount-type').value = (inv && inv.discount_type === 'amount') ? 'amount' : 'percent';
+  $('invoice-discount-value').value = inv && inv.discount_value ? inv.discount_value : '';
+  refreshInvoiceDiscountPreview();
   // An approver editing someone's submitted invoice keeps it submitted; drafts can be saved again as drafts.
   $('invoice-save-main').textContent = canApprove() ? 'Save and approve' : (inv && !isDraftInvoice(inv) ? 'Save changes' : 'Submit for approval');
   backdrop.classList.remove('hidden');
@@ -8618,7 +8842,8 @@ function uploadInvoiceLogo(file){
 function invoiceExtraFields(){
   const g = id => String((document.getElementById(id) || {}).value || '').trim();
   return { customer_ref: g('invoice-customer-ref') || null, billing_period: g('invoice-billing-period') || null,
-    payment_method: g('invoice-payment-method') || null, payment_terms: g('invoice-payment-terms') || null };
+    payment_method: g('invoice-payment-method') || null, payment_terms: g('invoice-payment-terms') || null,
+    ...(d => ({discount_type: d ? d.type : null, discount_value: d ? d.value : null}))(invoiceFormDiscount()) };
 }
 function attachInvoiceHandlers(){
   const canCreate = hasModule('invoices');
@@ -8626,6 +8851,10 @@ function attachInvoiceHandlers(){
   document.getElementById('add-invoice-btn')?.addEventListener('click', ()=>openInvoiceForm(null));
   document.querySelectorAll('[data-invoice-tab]').forEach(b=>b.addEventListener('click', ()=>{ state.invoiceTab = b.dataset.invoiceTab; render(); }));
   document.getElementById('invoice-group-filter')?.addEventListener('change', e=>{ state.invoiceGroupFilter = e.target.value; render(); });
+  ['invoice-discount-on','invoice-discount-type'].forEach(id=>document.getElementById(id)?.addEventListener('change', refreshInvoiceDiscountPreview));
+  document.getElementById('invoice-discount-value')?.addEventListener('input', refreshInvoiceDiscountPreview);
+  document.getElementById('invoice-items-body')?.addEventListener('input', refreshInvoiceDiscountPreview);
+  document.getElementById('invoice-items-body')?.addEventListener('change', refreshInvoiceDiscountPreview);
   document.getElementById('invoice-client')?.addEventListener('change', ()=>applyInvoiceClientDefaults(false));
   document.getElementById('invoice-issue-date')?.addEventListener('change', ()=>{ invoiceDueFromTerms(false); refreshInvoiceTermsText(false); });
   document.getElementById('invoice-due-date')?.addEventListener('input', e=>{ e.target.dataset.auto = ''; refreshInvoiceTermsText(false); });
@@ -8660,6 +8889,7 @@ function attachInvoiceHandlers(){
   document.getElementById('invoice-recurring')?.addEventListener('change', (e)=>{
     document.getElementById('invoice-recurrence-fields').classList.toggle('hidden', !e.target.checked);
   });
+  document.getElementById('invoice-items-body')?.addEventListener('change', (e)=>{ if(e.target.classList.contains('ii-stock')){ applyItemToRow(e.target.closest('tr'), true); refreshInvoiceDiscountPreview(); } });
   document.getElementById('invoice-items-body')?.addEventListener('click', (e)=>{
     if(e.target.classList.contains('ii-remove')) e.target.closest('tr').remove();
   });
@@ -8677,6 +8907,8 @@ function attachInvoiceHandlers(){
       const {error: aErr} = await sb.from('cc_companies').update({address: newAddress || null}).eq('id', state.company.id);
       if(!aErr){ await logActivity('update', 'company', state.company.id, 'Company address updated from an invoice'); state.company.address = newAddress || null; }
     }
+    const discountProblem = invoiceDiscountProblem(invoiceFormRows(), invoiceFormDiscount());
+    if(discountProblem){ toast(discountProblem); return; }
     const extraFields = invoiceExtraFields();
     if(editing) return saveEditedInvoice(editing, {asDraft, approvalStatus, bankFields: {...bankFields, ...extraFields}});
     const isRecurring = document.getElementById('invoice-recurring').checked;
@@ -8716,6 +8948,8 @@ function attachInvoiceHandlers(){
       stock_item_id: tr.querySelector('.ii-stock')?.value || null,
       account_key: tr.querySelector('.ii-account') ? validSalesKey(tr.querySelector('.ii-account').value) : null
     })).filter(r=>r.description);
+    const newDisc = invoiceFormDiscount();
+    if(newDisc) buildDiscountLines(rows, newDisc.type, newDisc.value).forEach(l=>rows.push(Object.assign({invoice_id: invoice.id}, l)));
     if(rows.length) await sb.from('cc_invoice_items').insert(rows);
     if(approvalStatus === 'approved'){
       await recognizeInvoiceRevenue(invoice, rows);
@@ -8768,7 +9002,7 @@ function escHtml(v){ return String(v==null?'':v).replace(/&/g,'&amp;').replace(/
 // Self-contained HTML invoice used as the email body (inline styles only — mail clients strip the rest).
 function invoiceEmailHtml(inv, items, client, message, t){
   const cur = inv.currency;
-  const rows = (items||[]).map(it=>`<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;"><strong>${escHtml(it.description)}</strong>${it.details ? `<div style="color:#777;font-size:12px;">${escHtml(it.details)}</div>` : ''}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${escHtml(it.quantity)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtCurrency(it.unit_price, cur)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtCurrency(it.quantity*it.unit_price, cur)}</td></tr>`).join('');
+  const rows = invoiceLineItems(items).map(it=>`<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;"><strong>${escHtml(it.description)}</strong>${it.details ? `<div style="color:#777;font-size:12px;">${escHtml(it.details)}</div>` : ''}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${escHtml(it.quantity)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtCurrency(it.unit_price, cur)}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtCurrency(it.quantity*it.unit_price, cur)}</td></tr>`).join('');
   const co = state.company;
   return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;color:#222;">
   <div style="white-space:pre-line;margin-bottom:18px;">${escHtml(message)}</div>
@@ -8782,6 +9016,7 @@ function invoiceEmailHtml(inv, items, client, message, t){
     <div style="margin:10px 0;"><strong>Bill to:</strong> ${escHtml(client ? client.name : '')}${client && client.address ? `<div style="white-space:pre-line;color:#666;font-size:13px;">${escHtml(client.address)}</div>` : ''}</div>
     <table style="width:100%;border-collapse:collapse;font-size:14px;"><thead><tr style="background:${invoiceColor()};color:${invoiceInk(invoiceColor())};"><th style="padding:6px 8px;text-align:left;">Description</th><th style="padding:6px 8px;text-align:right;">Qty</th><th style="padding:6px 8px;text-align:right;">Unit price</th><th style="padding:6px 8px;text-align:right;">Amount</th></tr></thead><tbody>${rows}</tbody></table>
     <div style="text-align:right;margin-top:12px;font-size:14px;">
+      ${invoiceDiscountItems(items).length ? `<div>Items: ${fmtCurrency(round2(t.total + invoiceDiscountTotal(items)), cur)}</div><div>${escHtml(invoiceDiscountLabel(inv))}: -${fmtCurrency(invoiceDiscountTotal(items), cur)}</div>` : ''}
       <div>Subtotal (excl. VAT): ${fmtCurrency(t.subtotal, cur)}</div>
       ${weAreVatRegistered() ? `<div>VAT (15%): ${fmtCurrency(t.vatTotal, cur)}</div>` : ''}
       <div style="font-size:17px;font-weight:700;margin-top:4px;">Total due: ${fmtCurrency(t.total, cur)}</div>
@@ -8832,9 +9067,10 @@ async function openInvoiceView(invoiceId){
     <p style="margin:6px 0 4px;">${invoiceStagePill(inv)}</p>
     <p style="font-size:.85rem;color:var(--muted);">Issued ${inv.issue_date}${inv.due_date?' · Due '+inv.due_date:''}${inv.billing_period ? ' · Period ' + escHtml(inv.billing_period) : ''}${(inv.customer_ref || (client && client.account_ref)) ? ' · Customer ref ' + escHtml(inv.customer_ref || client.account_ref) : ''}</p>
     <table class="invoice-lines"><thead><tr style="background:${invoiceColor()};">${['Description','Qty','Unit Price','Amount'].map(h=>`<th style="color:${invoiceInk(invoiceColor())};">${h}</th>`).join('')}</tr></thead><tbody>
-      ${items.map(it=>`<tr><td>${escHtml(it.description)}${it.details ? `<div style="font-size:.78rem;color:var(--muted);">${escHtml(it.details)}</div>` : ''}${salesAccounts().length > 1 ? `<div style="font-size:.75rem;color:var(--muted);">${escHtml(salesAccountName(it.account_key))}</div>` : ''}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
+      ${invoiceLineItems(items).map(it=>`<tr><td>${escHtml(it.description)}${it.details ? `<div style="font-size:.78rem;color:var(--muted);">${escHtml(it.details)}</div>` : ''}${salesAccounts().length > 1 ? `<div style="font-size:.75rem;color:var(--muted);">${escHtml(salesAccountName(it.account_key))}</div>` : ''}</td><td>${it.quantity}</td><td>${fmt(it.unit_price)}</td><td>${fmt(it.quantity*it.unit_price)}</td></tr>`).join('')}
     </tbody></table>
     <div style="text-align:right;margin-top:10px;font-size:.9rem;">
+      ${invoiceDiscountItems(items).length ? `<div>Items: ${fmtCurrency(round2(total + invoiceDiscountTotal(items)), inv.currency)}</div><div style="color:var(--accent2);">${escHtml(invoiceDiscountLabel(inv))}: −${fmtCurrency(invoiceDiscountTotal(items), inv.currency)}</div>` : ''}
       <div>Subtotal (excl. VAT): ${fmt(subtotal)}</div>
       ${weAreVatRegistered() ? `<div>VAT (15%): ${fmt(vatTotal)}</div>` : ''}
       <div style="font-weight:700;font-size:1.1rem;margin-top:4px;">Total: ${fmtCurrency(total, inv.currency)}${isForeign ? ` (≈ ${fmt(zarTotal)} @ ${inv.exchange_rate})` : ''}</div>
@@ -10877,7 +11113,7 @@ function computePL(start, end){
     const net = r.debit - r.credit;
     if(a.type === 'revenue') revenue -= net;
     else if(a.type === 'expense'){
-      if(a.key === 'COS') cos += net;
+      if(isCosAccount(a)) cos += net;
       else if(a.key === 'PAYROLL') payrollCost += net;
       else if(a.key === 'TAXEXP') incomeTax += net;
       else opex += net;
@@ -11929,7 +12165,7 @@ async function removeTaxProvision(fyEnd){
 function expenseLineItems(start, end){
   const t = ledgerTotals(ledgerLines(), start, end, l=>l.source==='Year-End Close');
   const out = {};
-  chartAccountList().filter(a=>a.key && a.type==='expense' && a.key!=='COS' && a.key!=='TAXEXP').forEach(a=>{
+  chartAccountList().filter(a=>a.key && a.type==='expense' && !isCosAccount(a) && a.key!=='TAXEXP').forEach(a=>{
     const r = t[a.key]; if(!r) return;
     const v = round2(r.debit - r.credit);
     if(Math.abs(v) >= 0.005) out[a.key] = {name:a.name, amount:v};
@@ -12705,7 +12941,7 @@ function renderTeam(){
           <label>Modules this staff member can add &amp; edit</label>
           <div class="perm-box">
             <label><input type="checkbox" class="member-module" value="revenue"> Revenue</label>
-          ${tracksInventory() ? `<label><input type="checkbox" class="member-module" value="stock"> Stock</label>` : ''}
+          <label><input type="checkbox" class="member-module" value="stock"> Items${tracksInventory() ? ' &amp; Stock' : ''}</label>
           <label><input type="checkbox" class="member-module" value="expenses"> Expenses</label>
           <label><input type="checkbox" class="member-module" value="assets"> Assets</label>
           <label><input type="checkbox" class="member-module" value="liabilities"> Liabilities</label>
@@ -12731,7 +12967,7 @@ function renderTeam(){
         <div class="field hidden" id="member-tabs-restrict-field">
           <label style="display:flex;align-items:center;gap:8px;font-weight:500;"><input type="checkbox" id="member-restrict-tabs" style="width:auto;"> Restrict which tabs this member can see</label>
           <div class="perm-box hidden" id="member-tabs-box">
-            ${ALL_VIEWS.filter(([k])=>k!=='stock'||tracksInventory()).map(([k,l])=>`<label><input type="checkbox" class="member-tab" value="${k}"> ${l}</label>`).join('')}
+            ${ALL_VIEWS.map(([k,l])=>`<label><input type="checkbox" class="member-tab" value="${k}"> ${l}</label>`).join('')}
           </div>
           <p style="font-size:.76rem;color:var(--muted);margin:4px 0 0;">Unchecked = this member sees every tab, same as today. Tick the box and pick tabs to limit them — e.g. Tasks only for a floor assistant.</p>
         </div>
